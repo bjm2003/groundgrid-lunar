@@ -1,0 +1,22 @@
+# --- catkin / ROS build artifacts ---
+build/
+devel/
+install/
+logs/
+.catkin_workspace
+.catkin_tools/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# NOTE: config/motion_primitives.dat is intentionally tracked (generated but
+# committed so the planner can load it without a build step).

@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="config" default="$(find groundgrid)/config/lunar_system.yaml" />
+    <arg name="point_cloud_topic" default="/sensors/velodyne_points" />
+    <arg name="odometry_topic" default="/localization/odometry/filtered_map" />
+    <arg name="cmd_vel_topic" default="/cmd_vel" />
+
+    <rosparam command="load" file="$(arg config)" />
+
+    <node pkg="groundgrid" type="groundgrid_node" name="groundgrid" output="screen">
+        <param name="point_cloud_topic" value="$(arg point_cloud_topic)" />
+        <param name="odometry_topic" value="$(arg odometry_topic)" />
+    </node>
+    <node pkg="groundgrid" type="lunar_traversability_node"
+          name="lunar_traversability" output="screen" />
+    <node pkg="groundgrid" type="state_lattice_planner_node"
+          name="state_lattice_planner" output="screen" />
+    <node pkg="groundgrid" type="lunar_path_follower_node"
+          name="lunar_path_follower" output="screen">
+        <remap from="/cmd_vel" to="$(arg cmd_vel_topic)" />
+    </node>
+</launch>

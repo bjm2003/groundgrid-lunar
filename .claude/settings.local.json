@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(xargs grep -l \"odometry\\\\|pose\")",
+      "Bash(g++ -std=c++17 -Iinclude src/SkidSteerModel.cpp src/skidsteer_selfcheck.cpp -o /tmp/skidsteer_selfcheck)",
+      "Bash(/tmp/skidsteer_selfcheck)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(g++ -std=c++17 -Iinclude src/SkidSteerModel.cpp src/MotionPrimitiveLibrary.cpp src/generate_motion_primitives.cpp -o /tmp/genprim)",
+      "Bash(/tmp/genprim config/lunar_system.yaml /tmp/motion_primitives.dat)",
+      "Read(//tmp/**)",
+      "Bash(/tmp/genprim config/lunar_system.yaml config/motion_primitives.dat)",
+      "Bash(g++ -std=c++17 -Iinclude -O2 src/SkidSteerModel.cpp src/MotionPrimitiveLibrary.cpp src/skidsteer_selfcheck.cpp -o /tmp/selfcheck)",
+      "Bash(/tmp/selfcheck)",
+      "Bash(g++ -std=c++17 -Iinclude -O2 src/SkidSteerModel.cpp src/MotionPrimitiveLibrary.cpp src/generate_motion_primitives.cpp -o /tmp/genmp)",
+      "Bash(command -v gh)",
+      "Bash(gh --version)",
+      "Bash(command -v git)",
+      "Bash(git --version)"
+    ]
+  }
+}

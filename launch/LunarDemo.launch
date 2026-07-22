@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="rviz" default="true" />
+    <param name="/use_sim_time" value="false" />
+    <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" output="screen">
+        <param name="cloud_spacing" value="0.20" />
+        <param name="noise_std" value="0.001" />
+    </node>
+    <include file="$(find groundgrid)/launch/LunarSystem.launch" />
+    <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find groundgrid)/rviz/groundgrid.rviz" output="screen" />
+</launch>

@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!--
+  Standalone launch file that runs only the slope raster saver. Use this when
+  the GroundGrid node is already running (e.g. on another machine or in
+  another terminal) and you just want to dump the slope outputs to disk.
+
+  The saver implements the export side of the slope-aware extension that
+  follows TS-SatMVSNet (arXiv:2501.01049). It subscribes to:
+    /groundgrid/slope_raster   (sensor_msgs/Image, 32FC1, units=deg)
+    /groundgrid/slope_grid     (nav_msgs/OccupancyGrid)
+
+  Usage:
+    roslaunch groundgrid save_slope_raster.launch \
+        output_dir:=/path/to/output clip_deg:=45.0 grid_max_deg:=50.0
+-->
+<launch>
+    <arg name="output_dir" default="/tmp/groundgrid_slope" doc="Directory to write slope rasters to." />
+    <arg name="clip_deg"   default="45.0" doc="Slope clip in degrees for 8-bit visualisations." />
+    <arg name="grid_max_deg" default="50.0" doc="Maximum slope represented by /groundgrid/slope_grid value 100." />
+    <arg name="subsample"  default="1" doc="Save every Nth incoming frame (1 = save all)." />
+    <arg name="save_geotiff" default="true" />
+    <arg name="save_png"     default="true" />
+    <arg name="save_color"   default="true" />
+
+    <node pkg="groundgrid"
+          name="save_slope_raster"
+          type="save_slope_raster.py"
+          output="screen">
+        <param name="output_dir"   value="$(arg output_dir)" />
+        <param name="clip_deg"     value="$(arg clip_deg)" />
+        <param name="grid_max_deg" value="$(arg grid_max_deg)" />
+        <param name="subsample"    value="$(arg subsample)" />
+        <param name="save_geotiff" value="$(arg save_geotiff)" />
+        <param name="save_png"     value="$(arg save_png)" />
+        <param name="save_color"   value="$(arg save_color)" />
+    </node>
+</launch>

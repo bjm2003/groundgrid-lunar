@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!-- Skid-steer identification harness (tech point 1). Launches the simulator with a
+     known injected slip "ground truth", then runs identify_skidsteer.py which commands
+     an excitation sequence and recovers the parameters, printing the recovery error.
+     No planner/follower are started so the identifier drives /cmd_vel directly. -->
+<launch>
+    <param name="/use_sim_time" value="false" />
+
+    <!-- Injected ground-truth slip (overrides the identity defaults in the sim). -->
+    <arg name="alpha_v" default="0.90" />
+    <arg name="alpha_w" default="0.85" />
+    <arg name="x_icr" default="0.15" />
+    <arg name="slope_slip_gain" default="0.30" />
+    <arg name="slope_grade_gain" default="0.40" />
+
+    <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" output="screen">
+        <param name="alpha_v" value="$(arg alpha_v)" />
+        <param name="alpha_w" value="$(arg alpha_w)" />
+        <param name="x_icr" value="$(arg x_icr)" />
+        <param name="slope_slip_gain" value="$(arg slope_slip_gain)" />
+        <param name="slope_grade_gain" value="$(arg slope_grade_gain)" />
+    </node>
+
+    <node pkg="groundgrid" type="identify_skidsteer.py" name="identify_skidsteer"
+          output="screen" required="true">
+        <param name="output" value="$(find groundgrid)/config/skid_steer_model.yaml" />
+    </node>
+</launch>

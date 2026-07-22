@@ -1,0 +1,78 @@
+groundgrid:
+  map_dimension: 60.0
+  map_resolution: 0.15
+  map_frame: map
+  base_frame: base_link
+  sensor_frame: velodyne
+  point_cloud_topic: /sensors/velodyne_points
+  odometry_topic: /localization/odometry/filtered_map
+  thread_count: 8
+  minimum_distance_factor: 0.005
+  distance_factor: 0.0005
+  slope_enable: true
+  height_correction_enable: true
+  height_correction_iterations: 1
+  slope_aware_tolerance_enable: true
+  slope_max_traversable_deg: 20.0
+
+lunar_traversability:
+  input_topic: /groundgrid/grid_map
+  grid_map_topic: /terrain/grid_map
+  costmap_topic: /terrain/costmap
+  max_longitudinal_slope_deg: 20.0
+  max_roughness: 0.08
+  max_step_height: 0.20
+  min_ground_confidence: 0.0
+  max_observation_age: 1.0
+  min_obstacle_height: 0.10
+  min_obstacle_confidence: 0.45
+
+state_lattice_planner:
+  map_frame: map
+  base_frame: base_link
+  heading_bins: 16
+  primitive_length: 0.45
+  heuristic_weight: 1.2
+  reverse_cost: 1.3
+  rotation_cost: 1.5
+  max_planning_time: 1.0
+  footprint_length: 1.8
+  footprint_width: 1.5
+  max_longitudinal_slope_deg: 20.0
+  max_lateral_slope_deg: 15.0
+  # A/B switch: false = legacy ideal-arc primitives (transition()),
+  # true = dynamics-feasible motion primitive library (requires motion_primitive_file).
+  use_dynamics_primitives: false
+  motion_primitive_file: motion_primitives.dat
+
+lunar_path_follower:
+  map_frame: map
+  base_frame: base_link
+  lookahead: 0.8
+  max_linear_speed: 1.39   # ~5 km/h operating domain (indicator 10); capped by planned v-profile
+  max_angular_speed: 0.8
+  goal_position_tolerance: 0.25
+  goal_yaw_tolerance: 0.174532925
+  path_timeout: 1.0
+
+# Skid-steer slip dynamics (ICR model). Shared by the motion primitive generator,
+# the planner (feasibility / cost) and the follower (feed-forward). These are the
+# "dynamics constraint parameter set" required by the comparison experiments; they
+# are overwritten by scripts/identify_skidsteer.py once identification is run.
+skid_steer_model:
+  x_icr: 0.0               # ICR longitudinal offset [m]
+  alpha_v: 1.0             # longitudinal slip efficiency (effective v = alpha_v * v_cmd)
+  alpha_w: 1.0             # yaw slip efficiency (effective w = alpha_w * w_cmd)
+  slope_slip_gain: 0.0     # lateral downslope drift per unit lateral gradient
+  slope_grade_gain: 0.0    # longitudinal slowdown per unit uphill gradient
+  v_max: 1.39              # operational max linear speed [m/s] (~5 km/h, indicator 10)
+  w_max: 0.8               # max yaw rate [rad/s]
+  a_max: 0.6               # max linear acceleration [m/s^2]
+  alpha_max: 1.2           # max yaw acceleration [rad/s^2]
+  kappa_max: 1.0           # max path curvature [1/m]
+  # primitive generation
+  horizon: 0.9             # integration horizon per primitive [s]
+  dt: 0.05                 # integration step [s]
+  curvature_samples: 3     # turn levels per side (excludes straight)
+  enable_reverse: true
+  enable_in_place: true
