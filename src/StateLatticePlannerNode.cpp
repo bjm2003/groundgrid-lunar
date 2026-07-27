@@ -259,13 +259,34 @@ private:
               std_msgs::Float32MultiArray& vel_profile) {
         path.poses.clear(); vel_profile.data.clear();
         State start, goal;
-        if(!poseToState(start_pose,start) || !poseToState(goal_pose,goal)) return false;
+        if(!poseToState(start_pose,start)) {
+            ROS_WARN_THROTTLE(1.0, "plan: start pose not in map (frame='%s', x=%.2f y=%.2f)",
+                              start_pose.header.frame_id.c_str(),
+                              start_pose.pose.position.x, start_pose.pose.position.y);
+            return false;
+        }
+        if(!poseToState(goal_pose,goal)) {
+            ROS_WARN_THROTTLE(1.0, "plan: goal pose not in map (frame='%s', x=%.2f y=%.2f)",
+                              goal_pose.header.frame_id.c_str(),
+                              goal_pose.pose.position.x, goal_pose.pose.position.y);
+            return false;
+        }
         float dummy;
         grid_map::Position sp, gp;
         map_.getPosition(grid_map::Index(start.x,start.y),sp);
         map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy) ||
-           !footprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) return false;
+        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy)) {
+            ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
+                              "(lethal/unknown terrain or slope over limit under the vehicle)",
+                              sp.x(), sp.y(), yawForBin(start.t));
+            return false;
+        }
+        if(!footprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
+            ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f "
+                              "(pick a goal on clear, observed terrain)",
+                              gp.x(), gp.y(), yawForBin(goal.t));
+            return false;
+        }
 
         const bool use_dynamics = use_dynamics_primitives_ && !primitive_lib_.empty();
         const int rows=map_.getSize()(0), cols=map_.getSize()(1), count=rows*cols*bins_;
@@ -278,11 +299,12 @@ private:
         g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
         const auto begin=std::chrono::steady_clock::now();
         int reached=-1;
+        int expanded=0;
         while(!open.empty()) {
             if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) break;
             const int ck=open.top().key; open.pop();
             if(closed[ck]) continue;
-            closed[ck]=1;
+            closed[ck]=1; ++expanded;
             const State cur=stateFromKey(ck,cols);
             if(cur.t==goal.t && heuristic(cur,goal)<=goal_tolerance_) { reached=ck; break; }
             if(use_dynamics) {
@@ -319,7 +341,14 @@ private:
                 }
             }
         }
-        if(reached<0) return false;
+        if(reached<0) {
+            const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+            ROS_WARN_THROTTLE(1.0, "plan: search exhausted without reaching goal "
+                              "(mode=%s, expanded=%d nodes, %.3fs, goal_bin=%d, goal_tol=%.2f). "
+                              "Start footprints ok, so this is search/goal-tolerance, not the start.",
+                              use_dynamics?"dynamics":"arcs", expanded, elapsed, goal.t, goal_tolerance_);
+            return false;
+        }
         path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
 
         if(use_dynamics) {
