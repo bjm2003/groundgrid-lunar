@@ -154,7 +154,12 @@ private:
         return true;
     }
 
-    bool footprintValid(double x, double y, double yaw, float& cost) const {
+    // When allow_unknown is true, unobserved cells (NaN terrain_cost / slope, or off-map)
+    // are tolerated instead of failing the check. Used only for the start footprint: the
+    // vehicle is physically sitting on its current pose and its body occludes the ground
+    // directly beneath it, so those cells are never observed. Genuinely lethal cells
+    // (terrain_cost >= 100) and cells whose measured slope exceeds the limit are still rejected.
+    bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false) const {
         cost = 0.0f; int samples = 0;
         const double r = map_.getResolution();
         for(double lx = -footprint_length_/2; lx <= footprint_length_/2 + 1e-6; lx += r) {
@@ -162,11 +167,21 @@ private:
                 const double wx = x + std::cos(yaw)*lx - std::sin(yaw)*ly;
                 const double wy = y + std::sin(yaw)*lx + std::cos(yaw)*ly;
                 grid_map::Index idx;
-                if(!map_.getIndex(grid_map::Position(wx, wy), idx)) return false;
+                if(!map_.getIndex(grid_map::Position(wx, wy), idx)) {
+                    if(allow_unknown) continue;
+                    return false;
+                }
                 const float c = map_.at("terrain_cost", idx);
-                if(!std::isfinite(c) || c >= 100.0f) return false;
+                if(!std::isfinite(c)) {
+                    if(allow_unknown) continue;
+                    return false;
+                }
+                if(c >= 100.0f) return false;
                 const float gx = map_.at("slope_x", idx), gy = map_.at("slope_y", idx);
-                if(!std::isfinite(gx) || !std::isfinite(gy)) return false;
+                if(!std::isfinite(gx) || !std::isfinite(gy)) {
+                    if(allow_unknown) continue;
+                    return false;
+                }
                 const double longitudinal = std::atan(std::abs(gx*std::cos(yaw) + gy*std::sin(yaw))) * 180.0/M_PI;
                 const double lateral = std::atan(std::abs(-gx*std::sin(yaw) + gy*std::cos(yaw))) * 180.0/M_PI;
                 if(longitudinal > max_long_slope_ || lateral > max_lat_slope_) return false;
@@ -275,9 +290,10 @@ private:
         grid_map::Position sp, gp;
         map_.getPosition(grid_map::Index(start.x,start.y),sp);
         map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy)) {
+        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,/*allow_unknown=*/true)) {
             ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
-                              "(lethal/unknown terrain or slope over limit under the vehicle)",
+                              "(a LETHAL cell or over-limit slope lies under the vehicle; "
+                              "unobserved cells are tolerated at the start)",
                               sp.x(), sp.y(), yawForBin(start.t));
             return false;
         }
