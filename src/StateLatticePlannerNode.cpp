@@ -39,6 +39,7 @@ public:
         pnh_.param("reverse_cost", reverse_cost_, 1.3);
         pnh_.param("rotation_cost", rotation_cost_, 1.5);
         pnh_.param("max_planning_time", max_planning_time_, 1.0);
+        pnh_.param("max_map_age", max_map_age_, 3.0);
         pnh_.param("goal_position_tolerance", goal_tolerance_, 0.30);
         pnh_.param("footprint_length", footprint_length_, 1.8);
         pnh_.param("footprint_width", footprint_width_, 1.5);
@@ -127,7 +128,7 @@ private:
     void timerCallback(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(!have_map_ || !have_goal_) return;
-        if((ros::Time::now() - map_stamp_).toSec() > 1.0) {
+        if((ros::Time::now() - map_stamp_).toSec() > max_map_age_) {
             publishStatus("stale_map"); return;
         }
         if(!replan_requested_ && !last_path_.poses.empty()) replan_requested_ = true;
@@ -424,7 +425,7 @@ private:
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
     bool have_map_=false,have_goal_=false,replan_requested_=false;
-    int bins_; double primitive_length_,heuristic_weight_,reverse_cost_,rotation_cost_,max_planning_time_,goal_tolerance_;
+    int bins_; double primitive_length_,heuristic_weight_,reverse_cost_,rotation_cost_,max_planning_time_,max_map_age_,goal_tolerance_;
     double footprint_length_,footprint_width_,max_long_slope_,max_lat_slope_;
     std::string map_frame_,base_frame_;
     bool use_dynamics_primitives_=false; std::string motion_primitive_file_;

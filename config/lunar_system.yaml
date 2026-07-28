@@ -36,6 +36,9 @@ state_lattice_planner:
   reverse_cost: 1.3
   rotation_cost: 1.5
   max_planning_time: 1.0
+  # Reject the map only if its stamp is older than this. Perception (groundgrid)
+  # runs ~1.1s/frame, so a 1s gate marked every map stale; 3s leaves headroom.
+  max_map_age: 3.0
   footprint_length: 1.8
   footprint_width: 1.5
   max_longitudinal_slope_deg: 20.0
