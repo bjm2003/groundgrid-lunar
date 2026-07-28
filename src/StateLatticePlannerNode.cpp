@@ -95,6 +95,37 @@ private:
         grid_map::GridMapRosConverter::fromMessage(*msg, map_);
         map_stamp_ = msg->info.header.stamp;
         have_map_ = map_.exists("terrain_cost") && map_.exists("slope_x") && map_.exists("slope_y");
+        if(have_map_) buildTraversabilityCache();
+    }
+
+    // Flatten the per-cell traversability inputs into contiguous arrays so the footprint
+    // check reads plain floats instead of doing a string-keyed grid_map layer lookup on
+    // every one of its ~143 samples. slopemag is the yaw-independent slope magnitude used
+    // by the gentle-slope fast path in footprintValid; gx/gy are kept for the rare steep
+    // cells that still need the direction-dependent longitudinal/lateral check. Indexing
+    // matches grid_map: lin = idx(0)*cols + idx(1), where idx comes from map_.getIndex().
+    void buildTraversabilityCache() {
+        const int rows = map_.getSize()(0), cols = map_.getSize()(1);
+        cell_cols_ = cols;
+        const size_t n = static_cast<size_t>(rows) * cols;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        cell_cost_.assign(n, nan);
+        cell_gx_.assign(n, nan);
+        cell_gy_.assign(n, nan);
+        cell_slopemag_.assign(n, nan);
+        const auto& cost = map_["terrain_cost"];
+        const auto& sx = map_["slope_x"];
+        const auto& sy = map_["slope_y"];
+        for(int i = 0; i < rows; ++i) {
+            for(int j = 0; j < cols; ++j) {
+                const size_t lin = static_cast<size_t>(i) * cols + j;
+                cell_cost_[lin] = cost(i, j);
+                const float gx = sx(i, j), gy = sy(i, j);
+                cell_gx_[lin] = gx; cell_gy_[lin] = gy;
+                if(std::isfinite(gx) && std::isfinite(gy))
+                    cell_slopemag_[lin] = static_cast<float>(std::atan(std::hypot(gx, gy)) * 180.0 / M_PI);
+            }
+        }
     }
 
     void goalCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
@@ -160,32 +191,40 @@ private:
     // vehicle is physically sitting on its current pose and its body occludes the ground
     // directly beneath it, so those cells are never observed. Genuinely lethal cells
     // (terrain_cost >= 100) and cells whose measured slope exceeds the limit are still rejected.
+    // Reads the flattened traversability cache; behaviour is identical to a direct grid_map
+    // scan, but cells whose slope magnitude is already within the (stricter) lateral limit
+    // skip the direction-dependent slope trig entirely.
     bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false) const {
         cost = 0.0f; int samples = 0;
         const double r = map_.getResolution();
+        const double cyaw = std::cos(yaw), syaw = std::sin(yaw);
         for(double lx = -footprint_length_/2; lx <= footprint_length_/2 + 1e-6; lx += r) {
             for(double ly = -footprint_width_/2; ly <= footprint_width_/2 + 1e-6; ly += r) {
-                const double wx = x + std::cos(yaw)*lx - std::sin(yaw)*ly;
-                const double wy = y + std::sin(yaw)*lx + std::cos(yaw)*ly;
+                const double wx = x + cyaw*lx - syaw*ly;
+                const double wy = y + syaw*lx + cyaw*ly;
                 grid_map::Index idx;
                 if(!map_.getIndex(grid_map::Position(wx, wy), idx)) {
                     if(allow_unknown) continue;
                     return false;
                 }
-                const float c = map_.at("terrain_cost", idx);
+                const size_t lin = static_cast<size_t>(idx(0)) * cell_cols_ + idx(1);
+                const float c = cell_cost_[lin];
                 if(!std::isfinite(c)) {
                     if(allow_unknown) continue;
                     return false;
                 }
                 if(c >= 100.0f) return false;
-                const float gx = map_.at("slope_x", idx), gy = map_.at("slope_y", idx);
-                if(!std::isfinite(gx) || !std::isfinite(gy)) {
+                const float sm = cell_slopemag_[lin];
+                if(!std::isfinite(sm)) {
                     if(allow_unknown) continue;
                     return false;
                 }
-                const double longitudinal = std::atan(std::abs(gx*std::cos(yaw) + gy*std::sin(yaw))) * 180.0/M_PI;
-                const double lateral = std::atan(std::abs(-gx*std::sin(yaw) + gy*std::cos(yaw))) * 180.0/M_PI;
-                if(longitudinal > max_long_slope_ || lateral > max_lat_slope_) return false;
+                if(sm > max_lat_slope_) {  // steep cell: fall back to the directional check
+                    const float gx = cell_gx_[lin], gy = cell_gy_[lin];
+                    const double longitudinal = std::atan(std::abs(gx*cyaw + gy*syaw)) * 180.0/M_PI;
+                    const double lateral = std::atan(std::abs(-gx*syaw + gy*cyaw)) * 180.0/M_PI;
+                    if(longitudinal > max_long_slope_ || lateral > max_lat_slope_) return false;
+                }
                 cost += c; ++samples;
             }
         }
@@ -430,6 +469,7 @@ private:
     std::string map_frame_,base_frame_;
     bool use_dynamics_primitives_=false; std::string motion_primitive_file_;
     MotionPrimitiveLibrary primitive_lib_;
+    std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
 };
 
 } // namespace groundgrid
