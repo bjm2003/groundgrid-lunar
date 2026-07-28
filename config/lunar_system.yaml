@@ -32,7 +32,9 @@ state_lattice_planner:
   base_frame: base_link
   heading_bins: 16
   primitive_length: 0.45
-  heuristic_weight: 1.2
+  # Weighted-A* inflation. >1 trades path optimality for far fewer expansions, so
+  # distant goals are reached within the planning budget. Bounded suboptimality ~2x.
+  heuristic_weight: 2.0
   reverse_cost: 1.3
   rotation_cost: 1.5
   max_planning_time: 1.0

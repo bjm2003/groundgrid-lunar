@@ -277,7 +277,14 @@ private:
 
         const double dyaw = turn * 2.0 * M_PI / bins_;
         const double yaw1 = yaw0 + dyaw;
-        const int n = std::max(2, static_cast<int>(std::ceil(primitive_length_/(map_.getResolution()*0.5))));
+        // Collision-check the swept footprint at a coarse spacing. The footprint
+        // (footprint_length_) is several times longer than one primitive step, so
+        // consecutive footprints overlap heavily and the already-validated parent
+        // footprint covers the rear; a spacing of half a body length is safe. Add
+        // samples only if the heading sweeps more than ~11 deg across the step.
+        const int n = std::max({1,
+                                static_cast<int>(std::ceil(primitive_length_/(footprint_length_*0.5))),
+                                static_cast<int>(std::ceil(std::abs(dyaw)/0.2))});
         float terrain_sum = 0.0f;
         for(int i=1; i<=n; ++i) {
             const double q = static_cast<double>(i)/n;
