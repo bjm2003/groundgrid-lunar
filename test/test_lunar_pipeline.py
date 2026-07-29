@@ -33,10 +33,12 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from std_msgs.msg import Float32MultiArray, String
 
-# Half the diagonal of the 1.8 x 1.5 m body. Using the diagonal rather than the half
-# width is the conservative side: it under-reports clearance for a rover that happens to
-# be side-on to the hazard, and never over-reports it.
-BODY_HALF_DIAG = math.hypot(0.9, 0.75)
+# The body, from state_lattice_planner/footprint_{length,width}. Clearance is measured
+# against this rectangle rather than its circumscribed circle: the circle sits 0.42 m
+# outside the body broadside, which is more margin than the planner is obliged to leave,
+# so it reports collisions for poses the planner correctly considers safe.
+FOOTPRINT_LENGTH = 1.8
+FOOTPRINT_WIDTH = 1.5
 
 # Open terrain well clear of the simulator's rocks (0,-2), (8,-5), (-3,5) and of the
 # crater at (5,2). A closed loop, so repeating it returns the rover to where it started
@@ -106,6 +108,11 @@ STRICT_SCENARIOS = ("mixed", "flat")
 
 REACH_TOLERANCE = 0.5
 NOMINAL_STATUSES = ("success", "success_snapped")
+
+
+def _yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 def _stats(values):
@@ -222,17 +229,29 @@ class LunarPipelineTest(unittest.TestCase):
         return min(math.hypot(p.pose.position.x - x, p.pose.position.y - y)
                    for p in path.poses)
 
-    def _clearance(self, x, y):
-        """Gap between the body and the nearest ground-truth hazard footprint.
+    def _clearance(self, x, y, yaw):
+        """Gap between the body rectangle and the nearest ground-truth hazard footprint.
 
-        Negative means the body overlaps a hazard, which is the collision criterion.
+        Negative means the hazard circle overlaps the body, which is the collision
+        criterion. A hazard whose centre lies under the body reads as -radius, so the
+        depth of the negative number distinguishes "clipped the skirt" from "parked on
+        top of it".
         """
         with self.lock:
             obstacles = self.obstacles
         if not obstacles:
             return None
-        return min(math.hypot(x - ox, y - oy) - radius
-                   for ox, oy, radius, _h in obstacles) - BODY_HALF_DIAG
+        cyaw, syaw = math.cos(yaw), math.sin(yaw)
+        gaps = []
+        for ox, oy, radius, _h in obstacles:
+            dx, dy = ox - x, oy - y
+            # Hazard centre in the body frame, then the distance from it to the rectangle.
+            px = cyaw * dx + syaw * dy
+            py = -syaw * dx + cyaw * dy
+            ex = max(abs(px) - FOOTPRINT_LENGTH / 2.0, 0.0)
+            ey = max(abs(py) - FOOTPRINT_WIDTH / 2.0, 0.0)
+            gaps.append(math.hypot(ex, ey) - radius)
+        return min(gaps)
 
     def _reset_trial_state(self):
         with self.lock:
@@ -285,7 +304,7 @@ class LunarPipelineTest(unittest.TestCase):
             if ct is not None:
                 sq_err += ct * ct
                 n_err += 1
-            gap = self._clearance(fx, fy)
+            gap = self._clearance(fx, fy, _yaw_of(final.pose.pose.orientation))
             if gap is not None:
                 clearances.append(gap)
             if math.hypot(fx - gx, fy - gy) < REACH_TOLERANCE:
