@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Lightweight deterministic lunar terrain and differential-rover simulator."""
+"""Lightweight deterministic lunar terrain and differential-rover simulator.
+
+The terrain is selected by the `~scenario` parameter. `mixed` is the original
+hand-tuned map and is the regression baseline, so its coefficients must not drift.
+The other four are the typical-terrain classes the task book asks the comparison
+experiments to cover, and their parameters are derived from the traversability
+thresholds in config/lunar_system.yaml rather than picked by eye -- a scenario
+whose features all fall below the lethal thresholds would measure nothing.
+"""
 
 import math
 import threading
@@ -11,15 +19,101 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs import point_cloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Float32MultiArray, Header, MultiArrayDimension
+
+
+def _dense_rocks():
+    """Jittered grid of boulders with a corridor that provably admits a solution.
+
+    The 4.0 m pitch is derived, not tuned. Worst-case two neighbours each jitter 0.3 m
+    towards each other, leaving 3.4 m between centres. Perception smears a boulder over
+    its 3-cell step-height window, so the effective lethal radius is about 0.5 + 0.3 m,
+    leaving a 1.8 m gap against a 1.5 m body -- tight, but a solution always exists. A
+    field that could close up entirely would make 规划成功率 measure the layout instead
+    of the planner. The jitter is seeded so two runs are comparable.
+    """
+    rng = np.random.default_rng(7)
+    rocks = []
+    for ix in range(4):
+        for iy in range(3):
+            jx, jy = rng.uniform(-0.3, 0.3, 2)
+            rocks.append((-6.0 + 4.0*ix + jx, -10.0 + 4.0*iy + jy, 0.5, 0.5))
+    return rocks
+
+
+# crater tuple: (x, y, radius, depth, rim_height, sharpness, hazard_radius)
+# rock tuple:   (x, y, radius, height)
+SCENARIOS = {
+    # Byte-for-byte the terrain every earlier measurement was taken on.
+    "mixed": {
+        "base": (0.025, 0.15, 0.12),          # tilt_x, sine_amp, sine_k (in y)
+        "ripple": (0.05, 0.7, 0.5),           # amp, kx, ky
+        # hazard_radius 2.0 is where the bowl wall passes the 20 deg limit
+        # (|dz/dr| = 1.8*4r^3/3.2^4*exp(-(r/3.2)^4) reaches tan20 near r=1.85);
+        # the 3.2 in the profile is the shape radius, which is much wider.
+        "craters": [(5.0, 2.0, 3.2, 1.8, 0.55, 4, 2.0)],
+        "rocks": [(0.0, -2.0, 0.65, 0.55),
+                  (8.0, -5.0, 0.9, 0.75),
+                  (-3.0, 5.0, 0.5, 0.40)],
+        "start": (-10.0, -6.0, 0.0),
+    },
+    # 平坦区域: everywhere traversable. The baseline for 路径长度偏差 -- the detour
+    # ratio here should be ~0, which is the only direct evidence of search optimality.
+    "flat": {
+        "base": (0.01, 0.02, 0.10),
+        "ripple": (0.03, 0.4, 0.35),
+        "craters": [],
+        "rocks": [],
+        "start": (-10.0, -6.0, 0.0),
+    },
+    # 密集障碍区: the main test of 避障成功率.
+    "dense": {
+        "base": (0.01, 0.03, 0.10),
+        "ripple": (0.03, 0.4, 0.35),
+        "craters": [],
+        "rocks": _dense_rocks(),
+        "start": (-10.0, -6.0, 0.0),
+    },
+    # 大坡度起伏区: amp*k = 1.2*0.35 = 0.42 -> 22.8 deg, straddling the 20 deg limit,
+    # so some slopes are climbable and some are not and routing actually matters.
+    "slope": {
+        "base": (0.15, 0.30, 0.09),
+        "ripple": (1.2, 0.35, 0.28),
+        "craters": [],
+        "rocks": [],
+        "start": (-10.0, -6.0, 0.0),
+    },
+    # 负障碍物集中区: super-Gaussian (sharpness 6) gives near-vertical walls, well over
+    # the 0.20 m step limit measured across a 3-cell 0.15 m window. Note the perception
+    # stack cannot tell a pit from a boulder -- GroundSegmentation computes step_height
+    # as an unsigned max-min -- so this scenario measures avoidance, not classification.
+    "negative": {
+        "base": (0.01, 0.04, 0.10),
+        "ripple": (0.03, 0.4, 0.35),
+        "craters": [(-4.0, -3.0, 1.5, 1.2, 0.0, 6, 1.5),
+                    (-1.0, -6.5, 1.6, 1.2, 0.0, 6, 1.6),
+                    (2.0, -3.5, 1.4, 1.0, 0.0, 6, 1.4),
+                    (-5.5, -8.5, 1.5, 1.1, 0.0, 6, 1.5),
+                    (1.0, -9.0, 1.5, 1.2, 0.0, 6, 1.5)],
+        "rocks": [],
+        "start": (-10.0, -6.0, 0.0),
+    },
+}
 
 
 class LunarSurfaceSim:
     def __init__(self):
         self.lock = threading.Lock()
-        self.x = float(rospy.get_param("~initial_x", -10.0))
-        self.y = float(rospy.get_param("~initial_y", -6.0))
-        self.yaw = float(rospy.get_param("~initial_yaw", 0.0))
+        name = rospy.get_param("~scenario", "mixed")
+        if name not in SCENARIOS:
+            rospy.logwarn("unknown scenario '%s', falling back to 'mixed'", name)
+            name = "mixed"
+        self.scenario_name = name
+        self.scenario = SCENARIOS[name]
+        sx, sy, syaw = self.scenario["start"]
+        self.x = float(rospy.get_param("~initial_x", sx))
+        self.y = float(rospy.get_param("~initial_y", sy))
+        self.yaw = float(rospy.get_param("~initial_yaw", syaw))
         self.v = self.w = 0.0
         self.sensor_height = float(rospy.get_param("~sensor_height", 1.0))
         self.cloud_radius = float(rospy.get_param("~cloud_radius", 25.0))
@@ -39,37 +133,65 @@ class LunarSurfaceSim:
         self.rng = np.random.default_rng(42)
         self.cloud_pub = rospy.Publisher("/sensors/velodyne_points", PointCloud2, queue_size=1)
         self.odom_pub = rospy.Publisher("/localization/odometry/filtered_map", Odometry, queue_size=1)
+        self.obstacle_pub = rospy.Publisher("/lunar_sim/obstacles", Float32MultiArray,
+                                            queue_size=1, latch=True)
         self.cmd_sub = rospy.Subscriber("/cmd_vel", Twist, self.on_cmd, queue_size=1)
         self.br = tf.TransformBroadcaster()
         self.last = rospy.Time.now()
+        self.publish_obstacles()
+        rospy.loginfo("lunar_surface_sim: scenario=%s rocks=%d craters=%d start=(%.1f,%.1f)",
+                      name, len(self.scenario["rocks"]), len(self.scenario["craters"]),
+                      self.x, self.y)
         rospy.Timer(rospy.Duration(0.02), self.update)
         rospy.Timer(rospy.Duration(0.20), self.publish_cloud)
 
-    @staticmethod
-    def terrain(x, y):
-        base = 0.025 * x + 0.15 * np.sin(0.12 * y)
-        crater_r = np.hypot(x - 5.0, y - 2.0)
-        crater = -1.8 * np.exp(-(crater_r / 3.2) ** 4)
-        rim = 0.55 * np.exp(-((crater_r - 3.8) / 0.65) ** 2)
-        ripple = 0.05 * np.sin(0.7 * x) * np.sin(0.5 * y)
-        return base + crater + rim + ripple
+    def publish_obstacles(self):
+        """Ground-truth hazard footprints, latched, four floats each: x, y, radius, height.
 
-    @staticmethod
-    def rocks(x, y):
+        These are what the metrics harness measures 安全距离 and collisions against.
+        Using ground truth rather than the published costmap keeps "did the planner avoid
+        the obstacle" separate from "did perception see it".
+
+        `radius` is the hazard radius, not the shape radius: for a boulder the two coincide,
+        but for a bowl the lethal ring is where the wall exceeds the slope limit, well inside
+        the radius that defines the bowl's profile. Height is signed so a consumer can tell a
+        pit from a boulder even though the perception stack cannot.
+        """
+        data = []
+        for rx, ry, radius, h in self.scenario["rocks"]:
+            data += [rx, ry, radius, h]
+        for cx, cy, _r, depth, _rim, _sharp, hazard_r in self.scenario["craters"]:
+            data += [cx, cy, hazard_r, -depth]
+        msg = Float32MultiArray()
+        msg.layout.dim = [MultiArrayDimension(label="obstacle", size=len(data) // 4,
+                                              stride=len(data)),
+                          MultiArrayDimension(label="xyrh", size=4, stride=4)]
+        msg.data = data
+        self.obstacle_pub.publish(msg)
+
+    def terrain(self, x, y):
+        tilt, sine_amp, sine_k = self.scenario["base"]
+        r_amp, r_kx, r_ky = self.scenario["ripple"]
+        z = tilt*x + sine_amp*np.sin(sine_k*y) + r_amp*np.sin(r_kx*x)*np.sin(r_ky*y)
+        for cx, cy, radius, depth, rim_h, sharpness, _hazard_r in self.scenario["craters"]:
+            r = np.hypot(x - cx, y - cy)
+            z = z - depth*np.exp(-(r/radius)**sharpness)
+            if rim_h:
+                z = z + rim_h*np.exp(-((r - (radius + 0.6))/0.65)**2)
+        return z
+
+    def rocks(self, x, y):
         height = np.zeros_like(x)
-        for rx, ry, radius, h in [(0.0, -2.0, 0.65, 0.55),
-                                  (8.0, -5.0, 0.9, 0.75),
-                                  (-3.0, 5.0, 0.5, 0.40)]:
+        for rx, ry, radius, h in self.scenario["rocks"]:
             d = np.hypot(x-rx, y-ry)
             height = np.maximum(height, h*np.clip(1.0-d/radius, 0.0, 1.0))
         return height
 
-    @classmethod
-    def terrain_gradient(cls, x, y, eps=0.05):
-        gx = (cls.terrain(np.array(x+eps), np.array(y)) -
-              cls.terrain(np.array(x-eps), np.array(y))) / (2.0*eps)
-        gy = (cls.terrain(np.array(x), np.array(y+eps)) -
-              cls.terrain(np.array(x), np.array(y-eps))) / (2.0*eps)
+    def terrain_gradient(self, x, y, eps=0.05):
+        gx = (self.terrain(np.array(x+eps), np.array(y)) -
+              self.terrain(np.array(x-eps), np.array(y))) / (2.0*eps)
+        gy = (self.terrain(np.array(x), np.array(y+eps)) -
+              self.terrain(np.array(x), np.array(y-eps))) / (2.0*eps)
         return float(gx), float(gy)
 
     def on_cmd(self, msg):

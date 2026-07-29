@@ -1,13 +1,22 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- CI runs the short sweep; a review run uses n_trials:=10 for tighter statistics.
-         The limit has to cover n_trials x 4 easy goals plus 3 hard ones, each with its
-         own drive-to-goal timeout, so it is far above the old single-goal budget. -->
+    <!-- CI runs the short sweep; a review run uses n_trials:=10, which is what the task
+         book asks for ("每种场景重复≥10次"). The limit has to cover n_trials x the
+         scenario's goal tour, each goal with its own drive-to-goal timeout. -->
     <arg name="n_trials" default="3"/>
-    <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" />
+    <!-- Terrain class: mixed (regression baseline) | flat | dense | slope | negative.
+         One rostest invocation exercises one scenario; scripts/run_planner_experiments.py
+         loops over all of them. -->
+    <arg name="scenario" default="mixed"/>
+    <arg name="metrics_out" default=""/>
+    <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim">
+        <param name="scenario" value="$(arg scenario)"/>
+    </node>
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
-          time-limit="900">
+          time-limit="3600">
         <param name="n_trials" value="$(arg n_trials)"/>
+        <param name="scenario" value="$(arg scenario)"/>
+        <param name="metrics_out" value="$(arg metrics_out)"/>
     </test>
 </launch>
