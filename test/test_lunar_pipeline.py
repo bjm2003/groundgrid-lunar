@@ -31,11 +31,20 @@ EASY_GOALS = [(-7.0, -6.0, 0.0),
               (-10.0, -9.0, math.pi),
               (-10.0, -6.0, math.pi / 2)]
 
-# Deliberately hard: hard against a rock, inside the occlusion shadow behind that same
-# rock (unobserved cells, so the goal footprint is invalid until it is snapped), and on
-# the crater rim where the slope limit bites.
+# Deliberately hard, in increasing order of severity.
+#   1. Hard against the (0,-2) rock, and 2. inside that rock's occlusion shadow: the goal
+#      footprint sits on lethal or unobserved cells, and snapping alone should resolve both
+#      without ever entering recovery.
+#   3. Dead centre of the largest rock (8,-5): it stands 0.75m over a 0.9m radius, so the
+#      nearest pose whose 1.8x1.5m footprint clears it is further than the nominal 1.5m snap
+#      radius but well inside the radius Relax doubles that to. This is the goal that makes
+#      避障恢复率 measurable -- without a hard-but-reachable case the metric has no
+#      denominator and goes unasserted.
+#   4. Inside the crater bowl at (5,2): over the slope limit with no solution at all, so the
+#      correct outcome is escalating to Abort rather than retrying forever.
 HARD_GOALS = [(-1.2, -2.0, 0.0),
               (0.9, -1.6, 0.0),
+              (8.0, -5.0, 0.0),
               (3.0, 0.0, math.pi / 4)]
 
 EASY_TIMEOUT = 25.0
