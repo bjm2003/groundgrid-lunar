@@ -32,7 +32,7 @@ class StateLatticePlannerNode {
         bool operator<(const QueueNode& other) const { return f > other.f; }
     };
     enum class PlannerMode { Nominal, Recovery, Aborted };
-    enum class RecoveryAction { None, Relax, Abort };
+    enum class RecoveryAction { None, Relax, Rotate, BackOut, Abort };
 
 public:
     StateLatticePlannerNode() : nh_(), pnh_("~"), tf_listener_(tf_buffer_) {
@@ -65,10 +65,16 @@ public:
         pnh_.param("recovery_step_timeout", recovery_step_timeout_, 2.0);
         pnh_.param("recovery_confirm_count", recovery_confirm_count_, 2);
         pnh_.param("min_recovery_interval", min_recovery_interval_, 3.0);
+        pnh_.param("recovery_rotate_step", recovery_rotate_step_, 0.6);
+        pnh_.param("recovery_backout_distance", recovery_backout_distance_, 1.0);
 
-        // Escalation ladder, tried in order. Abort is the terminal rung: retrying a
-        // hopeless goal forever burns CPU and makes the success-rate metric meaningless.
-        ladder_ = { RecoveryAction::Relax, RecoveryAction::Abort };
+        // Escalation ladder, tried in order: cheapest and safest first. Relax and Abort
+        // command no motion at all; Rotate turns in place; BackOut is the only rung that
+        // drives the vehicle, and only over ground it has already crossed. Abort is the
+        // terminal rung -- retrying a hopeless goal forever burns CPU and makes the
+        // success-rate metric meaningless.
+        ladder_ = { RecoveryAction::Relax, RecoveryAction::Rotate,
+                    RecoveryAction::BackOut, RecoveryAction::Abort };
 
         // Shared dynamics envelope: the arc-mode velocity profile has to honour the same
         // limits the offline primitive library was generated under, otherwise the A/B
@@ -127,6 +133,8 @@ private:
     }
     static const char* actionName(RecoveryAction a) {
         switch(a) { case RecoveryAction::Relax: return "relax";
+                    case RecoveryAction::Rotate: return "rotate";
+                    case RecoveryAction::BackOut: return "backout";
                     case RecoveryAction::Abort: return "abort";
                     default: return "none"; }
     }
@@ -156,6 +164,7 @@ private:
         recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
         best_goal_dist_ = std::numeric_limits<double>::infinity();
         last_progress_time_ = ros::Time::now();
+        last_valid_path_.poses.clear();
     }
 
     void mapCallback(const grid_map_msgs::GridMapConstPtr& msg) {
@@ -227,6 +236,75 @@ private:
         return true;
     }
 
+    // Turn in place towards the goal bearing. Answers the case where the current heading
+    // simply has no valid outgoing primitive but a slightly different one does, which is
+    // what "stuck close to an obstacle" usually looks like on a skid-steer.
+    bool recoveryRotate(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
+                        std_msgs::Float32MultiArray& vel) {
+        const double x = start.pose.position.x, y = start.pose.position.y;
+        const double yaw = tf2::getYaw(start.pose.orientation);
+        double delta = wrap(std::atan2(goal_.pose.position.y - y, goal_.pose.position.x - x) - yaw);
+        // Already pointing at the goal: probe by turning anyway, since the blockage is
+        // evidently not a heading error in the obvious direction.
+        if(std::abs(delta) < 1e-2) delta = recovery_rotate_step_;
+        delta = std::clamp(delta, -recovery_rotate_step_, recovery_rotate_step_);
+        const double target_yaw = wrap(yaw + delta);
+        float cost;
+        // allow_unknown for the same reason the start check uses it: the body occludes the
+        // ground beneath itself, so those cells are never observed. Lethal cells and
+        // over-slope cells are still rejected.
+        if(!footprintValid(x, y, target_yaw, cost, true)) return false;
+
+        path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
+        path.poses.clear();
+        for(int i = 0; i < 2; ++i) {
+            geometry_msgs::PoseStamped pose; pose.header = path.header;
+            pose.pose.position.x = x; pose.pose.position.y = y;
+            tf2::Quaternion q; q.setRPY(0, 0, i == 0 ? yaw : target_yaw);
+            pose.pose.orientation = tf2::toMsg(q);
+            path.poses.push_back(pose);
+        }
+        buildVelocityProfile(path, vel);
+        return true;
+    }
+
+    // Retreat along the last path that actually planned, which by construction is ground the
+    // vehicle has already traversed. Poses keep their forward orientation so the follower's
+    // own reverse detection makes the rover back up rather than turn around in place.
+    bool recoveryBackOut(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
+                         std_msgs::Float32MultiArray& vel) {
+        if(last_valid_path_.poses.size() < 2) return false;
+        const double x = start.pose.position.x, y = start.pose.position.y;
+        size_t nearest = 0; double nearest_d = std::numeric_limits<double>::infinity();
+        for(size_t i = 0; i < last_valid_path_.poses.size(); ++i) {
+            const auto& p = last_valid_path_.poses[i].pose.position;
+            const double d = std::hypot(p.x - x, p.y - y);
+            if(d < nearest_d) { nearest_d = d; nearest = i; }
+        }
+        path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
+        path.poses.clear();
+        geometry_msgs::PoseStamped first = start; first.header = path.header;
+        path.poses.push_back(first);
+        double travelled = 0.0;
+        for(size_t i = nearest; i-- > 0;) {
+            const auto& src = last_valid_path_.poses[i];
+            // The map has moved on since this path was planned, and this is the only recovery
+            // that puts the vehicle into space it cannot currently see -- so re-check every
+            // pose strictly (no allow_unknown) and abandon the rung on the first rejection.
+            float cost;
+            if(!footprintValid(src.pose.position.x, src.pose.position.y,
+                               tf2::getYaw(src.pose.orientation), cost)) return false;
+            const auto& prev = path.poses.back().pose.position;
+            travelled += std::hypot(src.pose.position.x - prev.x, src.pose.position.y - prev.y);
+            geometry_msgs::PoseStamped pose = src; pose.header = path.header;
+            path.poses.push_back(pose);
+            if(travelled >= recovery_backout_distance_) break;
+        }
+        if(path.poses.size() < 2) return false;
+        buildVelocityProfile(path, vel);
+        return true;
+    }
+
     // One rung of the escalation ladder. Returns whether it produced a usable path.
     bool runRecovery(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
                      std_msgs::Float32MultiArray& vel) {
@@ -242,6 +320,10 @@ private:
                 goal_tolerance_ = saved_tol; max_snap_distance_ = saved_snap;
                 return ok;
             }
+            case RecoveryAction::Rotate:
+                return recoveryRotate(start, path, vel);
+            case RecoveryAction::BackOut:
+                return recoveryBackOut(start, path, vel);
             case RecoveryAction::Abort:
                 mode_ = PlannerMode::Aborted; have_goal_ = false;
                 ROS_WARN("plan: giving up on this goal after %d failed attempts; send a new goal",
@@ -300,6 +382,9 @@ private:
         if(ok) {
             consecutive_failures_ = 0;
             last_path_ = path;
+            // Only genuine plans seed the back-out buffer: retreating along a previous
+            // recovery manoeuvre would just replay the manoeuvre that already failed.
+            if(!in_recovery) last_valid_path_ = path;
             path_pub_.publish(path); vel_pub_.publish(vel);
             if(mode_ == PlannerMode::Recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
@@ -828,11 +913,13 @@ private:
     std::vector<RecoveryAction> ladder_;
     int recovery_fail_threshold_, recovery_confirm_count_;
     double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
+    double recovery_rotate_step_, recovery_backout_distance_;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
     int recovery_events_=0, recovery_successes_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
     double last_plan_ms_ = 0.0;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
+    nav_msgs::Path last_valid_path_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;

@@ -72,6 +72,12 @@ state_lattice_planner:
   recovery_step_timeout: 2.0      # s per escalation rung before escalating
   recovery_confirm_count: 2       # consecutive successes needed to leave recovery
   min_recovery_interval: 3.0      # s of nominal operation required between recoveries
+  # Escalation rungs that command motion. The rotate probe is deliberately smaller than a
+  # heading bin pair so it changes the outgoing primitive set without a large blind sweep;
+  # the back-out distance is roughly one body length, enough to leave a pinch point but
+  # short enough that it stays on ground the rover just drove over.
+  recovery_rotate_step: 0.6       # rad of in-place turn per rotate attempt
+  recovery_backout_distance: 1.0  # m retraced along the last successful path
 
 lunar_path_follower:
   map_frame: map
