@@ -23,22 +23,19 @@ from std_msgs.msg import Float32MultiArray, Header, MultiArrayDimension
 
 
 def _dense_rocks():
-    """Jittered grid of boulders with a corridor that provably admits a solution.
+    """Jittered 4x3 grid of boulders with corridors that provably admit a solution.
 
-    The 4.0 m pitch is derived, not tuned. Worst-case two neighbours each jitter 0.3 m
-    towards each other, leaving 3.4 m between centres. Perception smears a boulder over
-    its 3-cell step-height window, so the effective lethal radius is about 0.5 + 0.3 m,
-    leaving a 1.8 m gap against a 1.5 m body -- tight, but a solution always exists. A
-    field that could close up entirely would make 规划成功率 measure the layout instead
-    of the planner. The jitter is seeded so two runs are comparable.
+    The 4.0 m pitch is derived, not tuned. The offsets are written out rather than drawn
+    from an RNG so the layout can be checked by reading it: the closest two centres are
+    3.52 m apart, perception smears a boulder over its 3-cell step-height window so the
+    effective lethal radius is about 0.5 + 0.3 m, and that leaves a 1.92 m gap against a
+    1.5 m body -- tight, but never closed. A field that could seal shut would make
+    规划成功率 measure the layout instead of the planner.
     """
-    rng = np.random.default_rng(7)
-    rocks = []
-    for ix in range(4):
-        for iy in range(3):
-            jx, jy = rng.uniform(-0.3, 0.3, 2)
-            rocks.append((-6.0 + 4.0*ix + jx, -10.0 + 4.0*iy + jy, 0.5, 0.5))
-    return rocks
+    return [(-6.25, -9.78, 0.5, 0.5), (-5.72, -6.19, 0.5, 0.5), (-6.18, -1.75, 0.5, 0.5),
+            (-1.78, -10.24, 0.5, 0.5), (-2.21, -5.80, 0.5, 0.5), (-1.73, -2.22, 0.5, 0.5),
+            (2.19, -9.75, 0.5, 0.5), (1.76, -6.26, 0.5, 0.5), (2.24, -1.79, 0.5, 0.5),
+            (5.75, -10.18, 0.5, 0.5), (6.22, -5.77, 0.5, 0.5), (5.80, -2.20, 0.5, 0.5)]
 
 
 # crater tuple: (x, y, radius, depth, rim_height, sharpness, hazard_radius)
@@ -66,22 +63,28 @@ SCENARIOS = {
         "rocks": [],
         "start": (-10.0, -6.0, 0.0),
     },
-    # 密集障碍区: the main test of 避障成功率.
+    # 密集障碍区: the main test of 避障成功率. The start is west of the field and on the
+    # y=-8.0 corridor centreline, so the rover begins outside the boulders and has to
+    # thread them rather than starting already boxed in.
     "dense": {
         "base": (0.01, 0.03, 0.10),
         "ripple": (0.03, 0.4, 0.35),
         "craters": [],
         "rocks": _dense_rocks(),
-        "start": (-10.0, -6.0, 0.0),
+        "start": (-11.0, -8.0, 0.0),
     },
     # 大坡度起伏区: amp*k = 1.2*0.35 = 0.42 -> 22.8 deg, straddling the 20 deg limit,
-    # so some slopes are climbable and some are not and routing actually matters.
+    # so some slopes are climbable and some are not and routing actually matters. That
+    # also means the start cannot be the shared (-10,-6): the gradient there is 0.541
+    # (28.4 deg), outside the limit, and the rover would be unable to move at all. The
+    # start sits in the largest passable component instead (x -5..5, y -12..1), at a
+    # point measuring 15.2 deg.
     "slope": {
         "base": (0.15, 0.30, 0.09),
         "ripple": (1.2, 0.35, 0.28),
         "craters": [],
         "rocks": [],
-        "start": (-10.0, -6.0, 0.0),
+        "start": (0.0, -5.5, 0.0),
     },
     # 负障碍物集中区: super-Gaussian (sharpness 6) gives near-vertical walls, well over
     # the 0.20 m step limit measured across a 3-cell 0.15 m window. Note the perception

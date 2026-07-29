@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Turn the per-scenario metric JSON into one Markdown table for the report.
+
+Reads whatever `run_planner_experiments.py` left in --in-dir and prints two tables --
+rates, then distributions as `mean ± sd [min, max]` -- plus the limitations that have to
+travel with the numbers. Nothing is recomputed here; the test node is the single place
+where a metric is defined, so the table cannot drift from what was asserted.
+
+    rosrun groundgrid summarize_planner_metrics.py > planner_metrics.md
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import sys
+
+SCENARIO_ORDER = ["mixed", "flat", "dense", "slope", "negative"]
+
+SCENARIO_LABEL = {"mixed": "mixed 综合", "flat": "flat 平坦区域",
+                  "dense": "dense 密集障碍区", "slope": "slope 大坡度起伏区",
+                  "negative": "negative 负障碍集中区"}
+
+RATE_ROWS = [("规划成功率 (巡回)", "plan_success_tour"),
+             ("规划成功率 (含难目标)", "plan_success_all"),
+             ("到达率", "reach_rate"),
+             ("避障成功率", "obstacle_avoidance"),
+             ("近障恢复率", "near_obstacle_recovery"),
+             ("资源占用超标率", "cpu_overrun"),
+             ("异常发生率", "anomaly"),
+             ("输出达标率", "output_conformance")]
+
+STAT_ROWS = [("规划耗时 (ms)", "plan_ms"),
+             ("路径长度偏差", "detour_ratio"),
+             ("规划路径长度 (m)", "path_len_m"),
+             ("实际行驶长度 (m)", "driven_m"),
+             ("轨迹跟踪误差 RMSE (m)", "tracking_rmse_m"),
+             ("安全距离均值 (m)", "clearance_mean_m"),
+             ("安全距离最小值 (m)", "clearance_min_m"),
+             ("CPU 占用 (%)", "cpu_pct"),
+             ("常驻内存 RSS (MB)", "rss_mb")]
+
+LIMITATIONS = """\
+## 已知局限
+
+- **仿真无雷达遮挡**：`lunar_surface_sim.publish_cloud` 对每个采样点直接求高程，没有射线
+  求交，因此坑内壁与石头背面对感知全程可见。负障碍场景因此偏简单，真实 LiDAR 下的自
+  遮挡留待「视场外/已路过障碍记忆」一项处理。
+- **感知无法区分坑与石**：`GroundSegmentation` 的 `step_height` 是窗口内的无符号极差，
+  `obstacle_height` 只取正向，所以负障碍场景测的是「凹陷能否被当成障碍避开」，不是
+  「能否被识别为凹陷」。
+- **资源占用只含规划器**：CPU/RSS 由规划节点读 `/proc/self/*` 自报。感知节点（约
+  1.05 s/帧，才是 CPU 大头）不在这组数字里。
+- **地图是以车为中心的 60 m 滚动窗口**，固定坐标的远距目标离开窗口后会被正确拒绝；
+  公里级路点需要全局地图落地后重测。
+"""
+
+
+def load(in_dir):
+    runs = {}
+    for path in sorted(glob.glob(os.path.join(in_dir, "planner_metrics_*.json"))):
+        try:
+            with open(path) as handle:
+                report = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print("skipping %s: %s" % (path, exc), file=sys.stderr)
+            continue
+        runs[report.get("scenario", os.path.basename(path))] = report
+    return runs
+
+
+def fmt_rate(value):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "n/a"
+    return "%.3f" % value
+
+
+def fmt_stat(stat):
+    if not stat or not stat.get("n"):
+        return "n/a"
+    return "%.2f ± %.2f [%.2f, %.2f]" % (stat["mean"], stat["sd"], stat["min"], stat["max"])
+
+
+def table(header, rows, columns):
+    lines = ["| %s | %s |" % (header, " | ".join(columns)),
+             "|---|%s" % ("---|" * len(columns))]
+    lines += ["| %s | %s |" % (label, " | ".join(cells)) for label, cells in rows]
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--in-dir", default=os.path.expanduser("~/.ros"))
+    args = parser.parse_args()
+
+    runs = load(args.in_dir)
+    if not runs:
+        print("no planner_metrics_*.json in %s; run run_planner_experiments.py first"
+              % args.in_dir, file=sys.stderr)
+        return 1
+    order = [s for s in SCENARIO_ORDER if s in runs] + \
+            [s for s in sorted(runs) if s not in SCENARIO_ORDER]
+    columns = [SCENARIO_LABEL.get(s, s) for s in order]
+
+    print("# 规划模块对比验证实验\n")
+    print("| 场景 | %s |" % " | ".join(columns))
+    print("|---|%s" % ("---|" * len(columns)))
+    print("| 试验次数 | %s |" % " | ".join(
+        str(runs[s].get("counts", {}).get("trials", "?")) for s in order))
+    print("| 碰撞次数 | %s |" % " | ".join(
+        str(runs[s].get("counts", {}).get("collisions", "?")) for s in order))
+    print("\n## 比率指标\n")
+    print(table("指标",
+                [(label, [fmt_rate(runs[s].get("rates", {}).get(key)) for s in order])
+                 for label, key in RATE_ROWS], columns))
+    print("\n## 分布指标（均值 ± 标准差 [最小, 最大]）\n")
+    print(table("指标",
+                [(label, [fmt_stat(runs[s].get("metrics", {}).get(key)) for s in order])
+                 for label, key in STAT_ROWS], columns))
+    budgets = {runs[s].get("cpu_budget_pct") for s in order}
+    print("\nCPU 预算：%s%%（超标率的判定阈值）\n"
+          % "/".join(str(b) for b in sorted(b for b in budgets if b is not None)))
+    print(LIMITATIONS)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

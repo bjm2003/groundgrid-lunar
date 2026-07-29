@@ -4,15 +4,25 @@
 Two things are measured here. `test_closed_loop` is the A/B regression guard for the
 ideal-arc vs. dynamics-primitive comparison (复核复算): planning latency, tracking RMSE
 against the published path, and the velocity profile the follower feeds forward from.
-`test_metrics_over_trials` drives a fixed tour of goals repeatedly and reports the three
-numbers the task book asks for -- 规划成功率, 避障恢复率 and 规划耗时 -- with mean,
-standard deviation and extremes, which a single run of a single goal cannot produce.
+`test_metrics_over_trials` drives a fixed tour of goals repeatedly over one terrain class
+and reports the full metric set the task book asks for -- 规划成功率, 避障成功率,
+近障恢复率, 规划耗时, 路径长度偏差, 轨迹跟踪误差, 安全距离, 资源占用超标率,
+异常发生率, 输出达标率 -- each with mean, standard deviation and extremes, which a
+single run of a single goal cannot produce.
 
-The goal tour is deterministic rather than random so two runs are comparable. It is
-also absolute in the map frame: the rover is never teleported between trials, so each
-trial legitimately starts wherever the previous one finished.
+The terrain class comes from `~scenario` and must match the one `lunar_surface_sim` was
+launched with; `scripts/run_planner_experiments.py` sweeps all five. The goal tour is
+deterministic rather than random so two runs are comparable, and it is a closed loop in
+the map frame -- the rover is never teleported between trials, so the Nth repetition is
+not systematically harder than the first.
+
+安全距离 and collisions are measured against the simulator's ground-truth hazard list on
+`/lunar_sim/obstacles`, not against the published costmap, which keeps "did the planner
+avoid the obstacle" separate from "did perception see it".
 """
+import json
 import math
+import os
 import statistics
 import threading
 import unittest
@@ -22,6 +32,11 @@ import rostest
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from std_msgs.msg import Float32MultiArray, String
+
+# Half the diagonal of the 1.8 x 1.5 m body. Using the diagonal rather than the half
+# width is the conservative side: it under-reports clearance for a rover that happens to
+# be side-on to the hazard, and never over-reports it.
+BODY_HALF_DIAG = math.hypot(0.9, 0.75)
 
 # Open terrain well clear of the simulator's rocks (0,-2), (8,-5), (-3,5) and of the
 # crater at (5,2). A closed loop, so repeating it returns the rover to where it started
@@ -37,44 +52,128 @@ EASY_GOALS = [(-7.0, -6.0, 0.0),
 #      without ever entering recovery.
 #   3. Dead centre of the largest rock (8,-5): it stands 0.75m over a 0.9m radius, so the
 #      nearest pose whose 1.8x1.5m footprint clears it is further than the nominal 1.5m snap
-#      radius but well inside the radius Relax doubles that to. This is the goal that makes
-#      避障恢复率 measurable -- without a hard-but-reachable case the metric has no
-#      denominator and goes unasserted.
+#      radius but well inside the radius Relax doubles that to.
 #   4. Inside the crater bowl at (5,2): over the slope limit with no solution at all, so the
 #      correct outcome is escalating to Abort rather than retrying forever.
+# Goal 2 is the one that actually feeds the 近障恢复率 denominator (measured: it is the
+# only goal that walks the full no_path -> recovery_relax -> success chain), so it must
+# not be dropped when this list is edited.
 HARD_GOALS = [(-1.2, -2.0, 0.0),
               (0.9, -1.6, 0.0),
               (8.0, -5.0, 0.0),
               (3.0, 0.0, math.pi / 4)]
 
-EASY_TIMEOUT = 25.0
-HARD_TIMEOUT = 35.0
+# Corridor intersections of the 4.0 m boulder grid: the columns sit near x = -6,-2,2,6 and
+# the rows near y = -10,-6,-2, so x = -4,0,4 and y = -8,-4 are the gaps. Every waypoint
+# below clears the nearest boulder by ~0.5 m after the body diagonal, and the longest leg
+# is 8.9 m, which keeps a 10-repetition sweep inside the rostest time limit.
+DENSE_GOALS = [(-4.0, -8.0, 0.0),
+               (4.0, -4.0, math.pi / 4),
+               (-4.0, -4.0, math.pi),
+               (-11.0, -8.0, math.pi)]
+
+# Inside the largest passable component of the slope field (x -5..5, y -12..1); the rest
+# of the window is over the 20 deg limit, so a tour that left the component would measure
+# the terrain rather than the planner.
+SLOPE_GOALS = [(4.5, -8.5, 0.0),
+               (-1.0, -12.0, math.pi),
+               (-5.0, -3.5, math.pi / 2),
+               (0.0, -5.5, 0.0)]
+
+# The pit cluster's internal gaps are 0.1-1.8 m against a 1.5 m body, so it is effectively
+# one blob and the tour has to round its southern edge rather than thread it. Out and back
+# along the same corridor keeps every leg under 7.2 m.
+NEGATIVE_GOALS = [(-8.0, -11.0, 0.0),
+                  (-1.0, -12.0, 0.0),
+                  (-8.0, -11.0, math.pi),
+                  (-10.0, -6.0, math.pi / 2)]
+
+# tour: repeated n_trials times. hard: run once, after the tour.
+SCENARIOS = {
+    "mixed": {"tour": EASY_GOALS, "timeout": 25.0,
+              "hard": HARD_GOALS, "hard_timeout": 35.0},
+    "flat": {"tour": EASY_GOALS, "timeout": 25.0},
+    "dense": {"tour": DENSE_GOALS, "timeout": 50.0},
+    "slope": {"tour": SLOPE_GOALS, "timeout": 50.0},
+    "negative": {"tour": NEGATIVE_GOALS, "timeout": 45.0},
+}
+
+# Where the tour is open terrain by construction and the success rate is therefore a real
+# bar rather than a measurement. The other three classes are deliberately marginal: holding
+# them to 99% would turn a designed edge case into a flaky failure, so their rates are
+# reported and only collisions and the resource budget are asserted.
+STRICT_SCENARIOS = ("mixed", "flat")
+
 REACH_TOLERANCE = 0.5
+NOMINAL_STATUSES = ("success", "success_snapped")
+
+
+def _stats(values):
+    """mean / sd / min / max over the finite samples, as the task book asks for."""
+    vals = [v for v in values if isinstance(v, float) and v == v and abs(v) != float("inf")]
+    if not vals:
+        return {"n": 0, "mean": None, "sd": None, "min": None, "max": None}
+    return {"n": len(vals), "mean": statistics.mean(vals), "sd": statistics.pstdev(vals),
+            "min": min(vals), "max": max(vals)}
 
 
 class LunarPipelineTest(unittest.TestCase):
     def setUp(self):
         self.lock = threading.Lock()
+        self.scenario = rospy.get_param("~scenario", "mixed")
+        if self.scenario not in SCENARIOS:
+            rospy.logwarn("unknown scenario '%s', falling back to 'mixed'", self.scenario)
+            self.scenario = "mixed"
+        self.cpu_budget = float(rospy.get_param("~cpu_budget_pct", 40.0))
         self.last_path = None
         self.last_vel = None
         self.status = None
         self.statuses = set()
         self.first_success_time = None
         self.plan_ms = []
+        self.plan_path_len = None
+        self.profile_ok = False
+        self.cpu_pct = []
+        self.rss_mb = []
         self.diag = {}
+        self.obstacles = []
         rospy.Subscriber("/lunar_planner/path", Path, self._on_path, queue_size=1)
         rospy.Subscriber("/lunar_planner/velocity_profile", Float32MultiArray,
                          self._on_vel, queue_size=1)
         rospy.Subscriber("/lunar_planner/status", String, self._on_status, queue_size=1)
         rospy.Subscriber("/lunar_planner/diagnostics", String, self._on_diag, queue_size=10)
+        try:
+            self._on_obstacles(rospy.wait_for_message("/lunar_sim/obstacles",
+                                                      Float32MultiArray, timeout=10))
+        except rospy.ROSException:
+            # Clearance and collision then go unmeasured, which is worth a loud warning
+            # but not worth failing the latency and success-rate metrics over.
+            rospy.logwarn("no /lunar_sim/obstacles: 安全距离 and 避障成功率 unavailable")
+
+    def _on_obstacles(self, msg):
+        data = list(msg.data)
+        with self.lock:
+            self.obstacles = [tuple(data[i:i + 4]) for i in range(0, len(data) - 3, 4)]
 
     def _on_path(self, msg):
         with self.lock:
             self.last_path = msg
+            # The first plan after a goal is the whole route; later ones are the shrinking
+            # remainder, so only the first is comparable against the straight-line distance.
+            if self.plan_path_len is None and msg.poses:
+                self.plan_path_len = sum(
+                    math.hypot(b.pose.position.x - a.pose.position.x,
+                               b.pose.position.y - a.pose.position.y)
+                    for a, b in zip(msg.poses, msg.poses[1:]))
 
     def _on_vel(self, msg):
         with self.lock:
             self.last_vel = msg
+            # Checked here rather than by polling both topics: the profile is published
+            # after the path it belongs to, so at this instant last_path is its match.
+            n_poses = len(self.last_path.poses) if self.last_path else 0
+            if n_poses > 0 and len(msg.data) == 2 * n_poses:
+                self.profile_ok = True
 
     def _on_status(self, msg):
         with self.lock:
@@ -97,6 +196,16 @@ class LunarPipelineTest(unittest.TestCase):
                 ms = 0.0
             if ms > 0.0:
                 self.plan_ms.append(ms)
+            # The planner reports -1 when /proc is unreadable and on its first sample,
+            # where there is no interval to divide by. Dropping those is the point: a
+            # fabricated zero would silently satisfy the budget assertion.
+            for key, sink in (("cpu_pct", self.cpu_pct), ("rss_mb", self.rss_mb)):
+                try:
+                    value = float(fields.get(key, "-1"))
+                except ValueError:
+                    continue
+                if value >= 0.0:
+                    sink.append(value)
 
     def _counter(self, name):
         with self.lock:
@@ -113,12 +222,26 @@ class LunarPipelineTest(unittest.TestCase):
         return min(math.hypot(p.pose.position.x - x, p.pose.position.y - y)
                    for p in path.poses)
 
+    def _clearance(self, x, y):
+        """Gap between the body and the nearest ground-truth hazard footprint.
+
+        Negative means the body overlaps a hazard, which is the collision criterion.
+        """
+        with self.lock:
+            obstacles = self.obstacles
+        if not obstacles:
+            return None
+        return min(math.hypot(x - ox, y - oy) - radius
+                   for ox, oy, radius, _h in obstacles) - BODY_HALF_DIAG
+
     def _reset_trial_state(self):
         with self.lock:
             self.status = None
             self.statuses = set()
             self.first_success_time = None
             self.plan_ms = []
+            self.plan_path_len = None
+            self.profile_ok = False
 
     def _run_trial(self, gx, gy, gyaw, timeout):
         """Send one goal, follow it to completion or failure, return its metrics."""
@@ -128,6 +251,7 @@ class LunarPipelineTest(unittest.TestCase):
         aborts0 = self._counter("recovery_aborts")
 
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
+        x0, y0 = initial.pose.pose.position.x, initial.pose.pose.position.y
         goal = PoseStamped()
         goal.header.frame_id = "map"
         goal.header.stamp = rospy.Time.now()
@@ -148,14 +272,22 @@ class LunarPipelineTest(unittest.TestCase):
         final = initial
         sq_err = 0.0
         n_err = 0
+        driven = 0.0
+        prev = (x0, y0)
+        clearances = []
         reached = False
         while not rospy.is_shutdown() and rospy.Time.now() < end:
             final = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=2)
             fx, fy = final.pose.pose.position.x, final.pose.pose.position.y
+            driven += math.hypot(fx - prev[0], fy - prev[1])
+            prev = (fx, fy)
             ct = self._cross_track(fx, fy)
             if ct is not None:
                 sq_err += ct * ct
                 n_err += 1
+            gap = self._clearance(fx, fy)
+            if gap is not None:
+                clearances.append(gap)
             if math.hypot(fx - gx, fy - gy) < REACH_TOLERANCE:
                 reached = True
                 break
@@ -172,19 +304,38 @@ class LunarPipelineTest(unittest.TestCase):
                        if self.first_success_time else float("nan"))
             statuses = set(self.statuses)
             plan_ms = list(self.plan_ms)
+            path_len = self.plan_path_len
+            profile_ok = self.profile_ok
+        straight = math.hypot(gx - x0, gy - y0)
+        # Relative to the straight line, so it is comparable across legs of different
+        # lengths. Undefined when the goal is where the rover already stands.
+        detour = ((path_len - straight) / straight
+                  if path_len is not None and straight > 1e-3 else float("nan"))
         return {
             "goal": (gx, gy),
+            "start": (x0, y0),
             "reached": reached,
             "planned": any(s.startswith("success") for s in statuses),
             "statuses": statuses,
+            "anomaly": any(s not in NOMINAL_STATUSES for s in statuses),
+            "produced_path": path_len is not None,
+            "profile_ok": profile_ok,
             "latency": latency,
             "plan_ms": plan_ms,
+            "path_len": path_len if path_len is not None else float("nan"),
+            "straight": straight,
+            "detour": detour,
+            "driven": driven,
             "recovery_events": self._counter("recovery_events") - events0,
             "recovery_successes": self._counter("recovery_successes") - successes0,
             "recovery_aborts": self._counter("recovery_aborts") - aborts0,
             "rmse": math.sqrt(sq_err / n_err) if n_err else float("nan"),
-            "moved": math.hypot(final.pose.pose.position.x - initial.pose.pose.position.x,
-                                final.pose.pose.position.y - initial.pose.pose.position.y),
+            "clearance_mean": statistics.mean(clearances) if clearances else float("nan"),
+            "clearance_min": min(clearances) if clearances else float("nan"),
+            "collided": bool(clearances) and min(clearances) < 0.0,
+            "measured_clearance": bool(clearances),
+            "moved": math.hypot(final.pose.pose.position.x - x0,
+                                final.pose.pose.position.y - y0),
             "final_err": math.hypot(final.pose.pose.position.x - gx,
                                     final.pose.pose.position.y - gy),
         }
@@ -221,7 +372,7 @@ class LunarPipelineTest(unittest.TestCase):
                                 initial.pose.pose.position.y, 0.0, 35.0)
         n_poses, n_vel = self._await_consistent_profile()
 
-        rospy.loginfo("=== pipeline metrics [mode=%s] ===", mode)
+        rospy.loginfo("=== pipeline metrics [mode=%s scenario=%s] ===", mode, self.scenario)
         rospy.loginfo("  moved            = %.3f m", trial["moved"])
         rospy.loginfo("  final goal error = %.3f m", trial["final_err"])
         rospy.loginfo("  tracking RMSE    = %.3f m", trial["rmse"])
@@ -238,17 +389,24 @@ class LunarPipelineTest(unittest.TestCase):
 
     def test_metrics_over_trials(self):
         n_trials = int(rospy.get_param("~n_trials", 3))
+        spec = SCENARIOS[self.scenario]
         rospy.wait_for_message("/terrain/costmap", OccupancyGrid, timeout=20)
 
-        easy, hard = [], []
+        tour, hard = [], []
         for _ in range(n_trials):
-            for gx, gy, gyaw in EASY_GOALS:
-                easy.append(self._run_trial(gx, gy, gyaw, EASY_TIMEOUT))
-        for gx, gy, gyaw in HARD_GOALS:
-            hard.append(self._run_trial(gx, gy, gyaw, HARD_TIMEOUT))
+            for gx, gy, gyaw in spec["tour"]:
+                tour.append(self._run_trial(gx, gy, gyaw, spec["timeout"]))
+        for gx, gy, gyaw in spec.get("hard", []):
+            hard.append(self._run_trial(gx, gy, gyaw, spec.get("hard_timeout", 35.0)))
 
-        every = easy + hard
-        easy_rate = sum(1 for t in easy if t["planned"]) / len(easy)
+        every = tour + hard
+        report = self._report(every, tour, hard)
+        self._dump(report, every)
+        self._assert(report, tour)
+
+    def _report(self, every, tour, hard):
+        """Compute and log every task-book metric; returns the JSON-serialisable summary."""
+        tour_rate = sum(1 for t in tour if t["planned"]) / len(tour)
         overall_rate = sum(1 for t in every if t["planned"]) / len(every)
         events = sum(t["recovery_events"] for t in every)
         successes = sum(t["recovery_successes"] for t in every)
@@ -259,46 +417,165 @@ class LunarPipelineTest(unittest.TestCase):
         # numbers are reported side by side.
         recoverable = events - aborts
         recovery_rate = successes / recoverable if recoverable else float("nan")
-        samples = [ms for t in every for ms in t["plan_ms"]]
+        # 避障成功率 is deliberately not the same question as 近障恢复率: it asks whether
+        # the trial got where it was going without ever putting the body inside a hazard,
+        # and it is only meaningful where clearance was actually measurable.
+        measured = [t for t in every if t["measured_clearance"]]
+        avoid_rate = (sum(1 for t in measured if t["reached"] and not t["collided"])
+                      / len(measured)) if measured else float("nan")
+        collisions = [t for t in measured if t["collided"]]
 
-        rospy.loginfo("=== planner metrics over %d trials ===", len(every))
-        rospy.loginfo("  规划成功率 easy   = %.3f (%d/%d)", easy_rate,
-                      sum(1 for t in easy if t["planned"]), len(easy))
+        with self.lock:
+            cpu = list(self.cpu_pct)
+            rss = list(self.rss_mb)
+        cpu_over = (sum(1 for c in cpu if c > self.cpu_budget) / len(cpu)) if cpu else float("nan")
+        anomaly_rate = sum(1 for t in every if t["anomaly"]) / len(every)
+        # Conditioned on a path having been published: a correctly aborted goal produces
+        # no output, and counting that as non-conforming would measure goal difficulty
+        # instead of the follower invariant this is here to protect.
+        emitted = [t for t in every if t["produced_path"]]
+        conformance = (sum(1 for t in emitted if t["profile_ok"]) / len(emitted)
+                       if emitted else float("nan"))
+
+        metrics = {
+            "plan_ms": _stats([ms for t in every for ms in t["plan_ms"]]),
+            "detour_ratio": _stats([t["detour"] for t in every]),
+            "path_len_m": _stats([t["path_len"] for t in every]),
+            "driven_m": _stats([t["driven"] for t in every]),
+            "tracking_rmse_m": _stats([t["rmse"] for t in every]),
+            "clearance_mean_m": _stats([t["clearance_mean"] for t in every]),
+            "clearance_min_m": _stats([t["clearance_min"] for t in every]),
+            "cpu_pct": _stats(cpu),
+            "rss_mb": _stats(rss),
+        }
+        rates = {
+            "plan_success_tour": tour_rate,
+            "plan_success_all": overall_rate,
+            "reach_rate": sum(1 for t in every if t["reached"]) / len(every),
+            "obstacle_avoidance": avoid_rate,
+            "near_obstacle_recovery": recovery_rate,
+            "cpu_overrun": cpu_over,
+            "anomaly": anomaly_rate,
+            "output_conformance": conformance,
+        }
+        counts = {"trials": len(every), "tour": len(tour), "hard": len(hard),
+                  "recovery_events": events, "recovery_successes": successes,
+                  "recovery_aborts": aborts, "collisions": len(collisions),
+                  "clearance_measured": len(measured), "paths_emitted": len(emitted)}
+
+        rospy.loginfo("=== planner metrics [scenario=%s] over %d trials ===",
+                      self.scenario, len(every))
+        rospy.loginfo("  规划成功率 tour   = %.3f (%d/%d)", tour_rate,
+                      sum(1 for t in tour if t["planned"]), len(tour))
         rospy.loginfo("  规划成功率 all    = %.3f (%d/%d)", overall_rate,
                       sum(1 for t in every if t["planned"]), len(every))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
-        rospy.loginfo("  避障恢复率        = %.3f (%d recovered / %d recoverable; "
+        rospy.loginfo("  避障成功率        = %.3f (%d reached without collision / %d measured; "
+                      "%d collisions)", avoid_rate,
+                      sum(1 for t in measured if t["reached"] and not t["collided"]),
+                      len(measured), len(collisions))
+        rospy.loginfo("  近障恢复率        = %.3f (%d recovered / %d recoverable; "
                       "%d entered, %d aborted as unreachable)",
                       recovery_rate, successes, recoverable, events, aborts)
-        if samples:
-            rospy.loginfo("  规划耗时 mean/sd  = %.1f / %.1f ms",
-                          statistics.mean(samples), statistics.pstdev(samples))
-            rospy.loginfo("  规划耗时 min/max  = %.1f / %.1f ms", min(samples), max(samples))
+        rospy.loginfo("  资源占用超标率    = %.3f (cpu_pct > %.0f%%, %d samples)",
+                      cpu_over, self.cpu_budget, len(cpu))
+        rospy.loginfo("  异常发生率        = %.3f", anomaly_rate)
+        rospy.loginfo("  输出达标率        = %.3f (%d/%d trials that emitted a path)",
+                      conformance, sum(1 for t in emitted if t["profile_ok"]), len(emitted))
+        for label, key in (("规划耗时 (ms)", "plan_ms"),
+                           ("路径长度偏差", "detour_ratio"),
+                           ("轨迹跟踪误差 (m)", "tracking_rmse_m"),
+                           ("安全距离均值 (m)", "clearance_mean_m"),
+                           ("安全距离最小 (m)", "clearance_min_m"),
+                           ("CPU (%)", "cpu_pct"),
+                           ("RSS (MB)", "rss_mb")):
+            s = metrics[key]
+            if s["n"]:
+                rospy.loginfo("  %-18s mean/sd/min/max = %.3f / %.3f / %.3f / %.3f (n=%d)",
+                              label, s["mean"], s["sd"], s["min"], s["max"], s["n"])
+            else:
+                rospy.loginfo("  %-18s no samples", label)
         for t in every:
-            rospy.loginfo("    goal (%.1f, %.1f) planned=%s reached=%s statuses=%s",
-                          t["goal"][0], t["goal"][1], t["planned"], t["reached"],
-                          ",".join(sorted(t["statuses"])))
+            rospy.loginfo("    goal (%.1f, %.1f) planned=%s reached=%s clr_min=%.2f "
+                          "statuses=%s", t["goal"][0], t["goal"][1], t["planned"],
+                          t["reached"], t["clearance_min"], ",".join(sorted(t["statuses"])))
+        return {"scenario": self.scenario, "counts": counts, "rates": rates,
+                "metrics": metrics, "cpu_budget_pct": self.cpu_budget}
 
-        # 99% is asserted only on the open-terrain subset. The hard subset exists to
-        # exercise snapping and recovery, so holding it to the same bar would turn a
-        # deliberately marginal goal into a flaky failure; its rate is reported instead.
-        self.assertGreaterEqual(easy_rate, 0.99, "规划成功率 on open terrain")
-        self.assertGreaterEqual(overall_rate, 0.90, "规划成功率 including hard goals")
-        # Guards the failure mode the split above could otherwise hide: a planner that
-        # declares reachable goals unreachable. Open terrain must never abort.
-        self.assertFalse([t for t in easy if "aborted" in t["statuses"]],
-                         "an open-terrain goal was aborted")
-        if recoverable:
-            self.assertGreaterEqual(recovery_rate, 0.8,
-                                    "避障恢复率: %d recovered of %d recoverable entries"
-                                    % (successes, recoverable))
+    def _dump(self, report, every):
+        """Persist the run so the numbers survive as a citable artefact.
+
+        rostest captures loginfo into ~/.ros/log/ rather than the console, which has
+        repeatedly meant the metric table went unread; the JSON is what the summary
+        script and the report consume.
+        """
+        path = rospy.get_param("~metrics_out", "")
+        if not path:
+            path = os.path.expanduser("~/.ros/planner_metrics_%s.json" % self.scenario)
+        report = dict(report)
+        report["trials"] = [
+            {"goal": list(t["goal"]), "start": list(t["start"]), "reached": t["reached"],
+             "planned": t["planned"], "anomaly": t["anomaly"], "collided": t["collided"],
+             "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
+             "statuses": sorted(t["statuses"]),
+             "latency_s": t["latency"], "path_len_m": t["path_len"],
+             "straight_m": t["straight"], "detour_ratio": t["detour"],
+             "driven_m": t["driven"], "rmse_m": t["rmse"],
+             "clearance_mean_m": t["clearance_mean"], "clearance_min_m": t["clearance_min"],
+             "plan_ms": t["plan_ms"]}
+            for t in every]
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "w") as handle:
+                # NaN is not valid JSON but every reader in this repo is Python, and the
+                # alternative -- null -- would be indistinguishable from "not collected".
+                json.dump(report, handle, indent=2, sort_keys=True)
+            rospy.loginfo("  metrics written to %s", path)
+        except OSError as exc:
+            rospy.logwarn("could not write metrics to %s: %s", path, exc)
+
+    def _assert(self, report, tour):
+        rates, metrics = report["rates"], report["metrics"]
+        # Never allowed anywhere: driving the body through a ground-truth hazard.
+        self.assertEqual(report["counts"]["collisions"], 0,
+                         "%d trial(s) put the body inside a hazard footprint"
+                         % report["counts"]["collisions"])
+        if self.scenario in STRICT_SCENARIOS:
+            self.assertGreaterEqual(rates["plan_success_tour"], 0.99,
+                                    "规划成功率 on open terrain")
+            self.assertGreaterEqual(rates["plan_success_all"], 0.90,
+                                    "规划成功率 including hard goals")
+            # Guards the failure mode the tiering could otherwise hide: a planner that
+            # declares reachable goals unreachable. Open terrain must never abort.
+            self.assertFalse([t for t in tour if "aborted" in t["statuses"]],
+                             "an open-terrain goal was aborted")
         else:
-            rospy.logwarn("避障恢复率 not asserted: no recoverable entries in this run "
-                          "(%d entered, all %d aborted as unreachable)", events, aborts)
-        self.assertTrue(samples, "no plan_ms samples: /lunar_planner/diagnostics is silent")
-        self.assertLess(statistics.mean(samples), 1000.0, "规划耗时 mean exceeds the budget")
-        self.assertLess(max(samples), 1200.0, "规划耗时 worst case exceeds the budget")
+            rospy.logwarn("scenario '%s' is a marginal terrain class: 规划成功率 %.3f "
+                          "reported, not asserted", self.scenario,
+                          rates["plan_success_tour"])
+
+        self.assertGreater(metrics["plan_ms"]["n"], 0,
+                           "no plan_ms samples: /lunar_planner/diagnostics is silent")
+        self.assertLess(metrics["plan_ms"]["mean"], 1000.0, "规划耗时 mean exceeds the budget")
+        self.assertLess(metrics["plan_ms"]["max"], 1200.0, "规划耗时 worst case exceeds the budget")
+
+        if report["counts"]["recovery_events"] - report["counts"]["recovery_aborts"]:
+            self.assertGreaterEqual(rates["near_obstacle_recovery"], 0.8, "近障恢复率")
+        else:
+            rospy.logwarn("近障恢复率 not asserted: no recoverable entries in this run")
+        if metrics["cpu_pct"]["n"]:
+            self.assertLess(rates["cpu_overrun"], 0.2,
+                            "资源占用超标率: cpu_pct over %.0f%% in %.0f%% of samples"
+                            % (self.cpu_budget, 100.0 * rates["cpu_overrun"]))
+        else:
+            rospy.logwarn("资源占用超标率 not asserted: planner reported no /proc samples")
+        self.assertGreater(report["counts"]["paths_emitted"], 0,
+                           "planner never published a path in any trial")
+        self.assertGreaterEqual(rates["output_conformance"], 0.99,
+                                "输出达标率: path and velocity profile must stay consistent")
 
 
 if __name__ == "__main__":
