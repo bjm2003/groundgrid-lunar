@@ -140,20 +140,23 @@ private:
     }
 
     // Structured counterpart to /lunar_planner/status, which has to stay short single-word
-    // tokens for `rostopic echo` diagnosis. recovery_events/successes are monotone counters
-    // rather than events, so the test harness can diff them without caring about drops --
-    // that difference is the 避障恢复率 metric, and plan_ms is 规划耗时.
+    // tokens for `rostopic echo` diagnosis. recovery_events/successes/aborts are monotone
+    // counters rather than events, so the test harness can diff them without caring about
+    // drops. 避障恢复率 is successes / (events - aborts): an entry that ends in an abort was
+    // a goal with no solution, so it is neither a recovery nor a failed recovery. That split
+    // cannot be gamed by aborting freely, because every abort also costs a 规划成功率 trial.
     void publishDiagnostics() {
         const ros::Time now = ros::Time::now();
         const bool chatty = (mode_ == PlannerMode::Recovery);
         if(!chatty && !last_diag_time_.isZero() && (now - last_diag_time_).toSec() < 1.0) return;
         last_diag_time_ = now;
-        char buf[320];
+        char buf[384];
         std::snprintf(buf, sizeof(buf),
                       "mode=%s action=%s escalation=%d fails=%d recovery_events=%d "
-                      "recovery_successes=%d last_fail=%s plan_ms=%.1f snap_m=%.2f",
+                      "recovery_successes=%d recovery_aborts=%d last_fail=%s plan_ms=%.1f snap_m=%.2f",
                       modeName(mode_), actionName(action_), recovery_escalation_,
                       consecutive_failures_, recovery_events_, recovery_successes_,
+                      recovery_aborts_,
                       last_fail_reason_.empty() ? "none" : last_fail_reason_.c_str(),
                       last_plan_ms_, last_snap_dist_);
         std_msgs::String msg; msg.data = buf; diag_pub_.publish(msg);
@@ -330,7 +333,7 @@ private:
                 manoeuvre = true;
                 return recoveryBackOut(start, path, vel);
             case RecoveryAction::Abort:
-                mode_ = PlannerMode::Aborted; have_goal_ = false;
+                mode_ = PlannerMode::Aborted; have_goal_ = false; ++recovery_aborts_;
                 ROS_WARN("plan: giving up on this goal after %d failed attempts; send a new goal",
                          consecutive_failures_);
                 return false;
@@ -932,7 +935,7 @@ private:
     double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
     double recovery_rotate_step_, recovery_backout_distance_;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
-    int recovery_events_=0, recovery_successes_=0;
+    int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
     double last_plan_ms_ = 0.0;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;

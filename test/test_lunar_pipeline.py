@@ -116,6 +116,7 @@ class LunarPipelineTest(unittest.TestCase):
         self._reset_trial_state()
         events0 = self._counter("recovery_events")
         successes0 = self._counter("recovery_successes")
+        aborts0 = self._counter("recovery_aborts")
 
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
         goal = PoseStamped()
@@ -171,6 +172,7 @@ class LunarPipelineTest(unittest.TestCase):
             "plan_ms": plan_ms,
             "recovery_events": self._counter("recovery_events") - events0,
             "recovery_successes": self._counter("recovery_successes") - successes0,
+            "recovery_aborts": self._counter("recovery_aborts") - aborts0,
             "rmse": math.sqrt(sq_err / n_err) if n_err else float("nan"),
             "moved": math.hypot(final.pose.pose.position.x - initial.pose.pose.position.x,
                                 final.pose.pose.position.y - initial.pose.pose.position.y),
@@ -241,7 +243,13 @@ class LunarPipelineTest(unittest.TestCase):
         overall_rate = sum(1 for t in every if t["planned"]) / len(every)
         events = sum(t["recovery_events"] for t in every)
         successes = sum(t["recovery_successes"] for t in every)
-        recovery_rate = successes / events if events else 1.0
+        aborts = sum(t["recovery_aborts"] for t in every)
+        # An entry that ends in an abort was a goal with no solution, so it is neither a
+        # recovery nor a failed recovery and does not belong in the denominator. Aborting
+        # freely cannot game this: every abort also costs a 规划成功率 trial, and both
+        # numbers are reported side by side.
+        recoverable = events - aborts
+        recovery_rate = successes / recoverable if recoverable else float("nan")
         samples = [ms for t in every for ms in t["plan_ms"]]
 
         rospy.loginfo("=== planner metrics over %d trials ===", len(every))
@@ -251,8 +259,9 @@ class LunarPipelineTest(unittest.TestCase):
                       sum(1 for t in every if t["planned"]), len(every))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
-        rospy.loginfo("  避障恢复率        = %.3f (%d recovered / %d entered)",
-                      recovery_rate, successes, events)
+        rospy.loginfo("  避障恢复率        = %.3f (%d recovered / %d recoverable; "
+                      "%d entered, %d aborted as unreachable)",
+                      recovery_rate, successes, recoverable, events, aborts)
         if samples:
             rospy.loginfo("  规划耗时 mean/sd  = %.1f / %.1f ms",
                           statistics.mean(samples), statistics.pstdev(samples))
@@ -267,8 +276,17 @@ class LunarPipelineTest(unittest.TestCase):
         # deliberately marginal goal into a flaky failure; its rate is reported instead.
         self.assertGreaterEqual(easy_rate, 0.99, "规划成功率 on open terrain")
         self.assertGreaterEqual(overall_rate, 0.90, "规划成功率 including hard goals")
-        self.assertGreaterEqual(recovery_rate, 0.8,
-                                "避障恢复率: %d recovered of %d entries" % (successes, events))
+        # Guards the failure mode the split above could otherwise hide: a planner that
+        # declares reachable goals unreachable. Open terrain must never abort.
+        self.assertFalse([t for t in easy if "aborted" in t["statuses"]],
+                         "an open-terrain goal was aborted")
+        if recoverable:
+            self.assertGreaterEqual(recovery_rate, 0.8,
+                                    "避障恢复率: %d recovered of %d recoverable entries"
+                                    % (successes, recoverable))
+        else:
+            rospy.logwarn("避障恢复率 not asserted: no recoverable entries in this run "
+                          "(%d entered, all %d aborted as unreachable)", events, aborts)
         self.assertTrue(samples, "no plan_ms samples: /lunar_planner/diagnostics is silent")
         self.assertLess(statistics.mean(samples), 1000.0, "规划耗时 mean exceeds the budget")
         self.assertLess(max(samples), 1200.0, "规划耗时 worst case exceeds the budget")
