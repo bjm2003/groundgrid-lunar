@@ -63,6 +63,15 @@ state_lattice_planner:
   goal_snap_heading_span: 2       # heading bins searched either side of the requested one
   goal_snap_heading_weight: 0.25  # penalty per bin of heading deviation
   goal_snap_cost_weight: 0.5      # prefer low-terrain-cost snap targets
+  # 异常检测与恢复 (软件设计9, 避障恢复率). The map refreshes at ~1.1s while the planner
+  # reacts per frame, so a single failure is usually a transient: require a streak before
+  # declaring the rover stuck, and repeated success before declaring it recovered.
+  recovery_fail_threshold: 3      # consecutive plan() failures before entering recovery
+  no_progress_timeout: 6.0        # s without closing on the goal before entering recovery
+  progress_epsilon: 0.10          # m of goal-distance improvement that counts as progress
+  recovery_step_timeout: 2.0      # s per escalation rung before escalating
+  recovery_confirm_count: 2       # consecutive successes needed to leave recovery
+  min_recovery_interval: 3.0      # s of nominal operation required between recoveries
 
 lunar_path_follower:
   map_frame: map

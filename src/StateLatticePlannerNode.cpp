@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <queue>
@@ -30,6 +31,8 @@ class StateLatticePlannerNode {
         float f; int key;
         bool operator<(const QueueNode& other) const { return f > other.f; }
     };
+    enum class PlannerMode { Nominal, Recovery, Aborted };
+    enum class RecoveryAction { None, Relax, Abort };
 
 public:
     StateLatticePlannerNode() : nh_(), pnh_("~"), tf_listener_(tf_buffer_) {
@@ -56,6 +59,16 @@ public:
         pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
         pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
         pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
+        pnh_.param("recovery_fail_threshold", recovery_fail_threshold_, 3);
+        pnh_.param("no_progress_timeout", no_progress_timeout_, 6.0);
+        pnh_.param("progress_epsilon", progress_epsilon_, 0.10);
+        pnh_.param("recovery_step_timeout", recovery_step_timeout_, 2.0);
+        pnh_.param("recovery_confirm_count", recovery_confirm_count_, 2);
+        pnh_.param("min_recovery_interval", min_recovery_interval_, 3.0);
+
+        // Escalation ladder, tried in order. Abort is the terminal rung: retrying a
+        // hopeless goal forever burns CPU and makes the success-rate metric meaningless.
+        ladder_ = { RecoveryAction::Relax, RecoveryAction::Abort };
 
         // Shared dynamics envelope: the arc-mode velocity profile has to honour the same
         // limits the offline primitive library was generated under, otherwise the A/B
@@ -86,6 +99,7 @@ public:
         vel_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/lunar_planner/velocity_profile", 1, true);
         status_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/status", 1, true);
         snapped_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/lunar_planner/snapped_goal", 1, true);
+        diag_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/diagnostics", 1, true);
         service_ = nh_.advertiseService("/lunar_planner/make_plan", &StateLatticePlannerNode::serviceCallback, this);
         timer_ = nh_.createTimer(ros::Duration(0.5), &StateLatticePlannerNode::timerCallback, this);
     }
@@ -106,12 +120,50 @@ private:
         std_msgs::String msg; msg.data = text; status_pub_.publish(msg);
     }
 
+    static const char* modeName(PlannerMode m) {
+        switch(m) { case PlannerMode::Recovery: return "recovery";
+                    case PlannerMode::Aborted:  return "aborted";
+                    default: return "nominal"; }
+    }
+    static const char* actionName(RecoveryAction a) {
+        switch(a) { case RecoveryAction::Relax: return "relax";
+                    case RecoveryAction::Abort: return "abort";
+                    default: return "none"; }
+    }
+
+    // Structured counterpart to /lunar_planner/status, which has to stay short single-word
+    // tokens for `rostopic echo` diagnosis. recovery_events/successes are monotone counters
+    // rather than events, so the test harness can diff them without caring about drops --
+    // that difference is the 避障恢复率 metric, and plan_ms is 规划耗时.
+    void publishDiagnostics() {
+        const ros::Time now = ros::Time::now();
+        const bool chatty = (mode_ == PlannerMode::Recovery);
+        if(!chatty && !last_diag_time_.isZero() && (now - last_diag_time_).toSec() < 1.0) return;
+        last_diag_time_ = now;
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      "mode=%s action=%s escalation=%d fails=%d recovery_events=%d "
+                      "recovery_successes=%d last_fail=%s plan_ms=%.1f snap_m=%.2f",
+                      modeName(mode_), actionName(action_), recovery_escalation_,
+                      consecutive_failures_, recovery_events_, recovery_successes_,
+                      last_fail_reason_.empty() ? "none" : last_fail_reason_.c_str(),
+                      last_plan_ms_, last_snap_dist_);
+        std_msgs::String msg; msg.data = buf; diag_pub_.publish(msg);
+    }
+
+    void resetRecoveryState() {
+        mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
+        recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
+        best_goal_dist_ = std::numeric_limits<double>::infinity();
+        last_progress_time_ = ros::Time::now();
+    }
+
     void mapCallback(const grid_map_msgs::GridMapConstPtr& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
         grid_map::GridMapRosConverter::fromMessage(*msg, map_);
         map_stamp_ = msg->info.header.stamp;
         have_map_ = map_.exists("terrain_cost") && map_.exists("slope_x") && map_.exists("slope_y");
-        if(have_map_) buildTraversabilityCache();
+        if(have_map_) { buildTraversabilityCache(); replan_requested_ = true; }
     }
 
     // Flatten the per-cell traversability inputs into contiguous arrays so the footprint
@@ -147,6 +199,9 @@ private:
     void goalCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
         goal_ = *msg; have_goal_ = true; replan_requested_ = true;
+        // A new goal must not inherit the previous goal's stuck state, or it would be
+        // declared unreachable before it has been attempted even once.
+        resetRecoveryState();
     }
 
     bool robotPose(geometry_msgs::PoseStamped& pose) {
@@ -172,27 +227,105 @@ private:
         return true;
     }
 
+    // One rung of the escalation ladder. Returns whether it produced a usable path.
+    bool runRecovery(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
+                     std_msgs::Float32MultiArray& vel) {
+        action_ = ladder_[std::min<size_t>(recovery_escalation_, ladder_.size()-1)];
+        switch(action_) {
+            case RecoveryAction::Relax: {
+                // Most failures are "the goal is barely out of reach": widen the acceptance
+                // ball and the snap radius for this attempt only. The collision test itself
+                // is untouched, so this trades goal precision, never clearance.
+                const double saved_tol = goal_tolerance_, saved_snap = max_snap_distance_;
+                goal_tolerance_ *= 2.0; max_snap_distance_ *= 2.0;
+                const bool ok = plan(start, goal_, path, vel);
+                goal_tolerance_ = saved_tol; max_snap_distance_ = saved_snap;
+                return ok;
+            }
+            case RecoveryAction::Abort:
+                mode_ = PlannerMode::Aborted; have_goal_ = false;
+                ROS_WARN("plan: giving up on this goal after %d failed attempts; send a new goal",
+                         consecutive_failures_);
+                return false;
+            default:
+                return plan(start, goal_, path, vel);
+        }
+    }
+
     void timerCallback(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if(!have_map_ || !have_goal_) return;
+        if(!have_map_) return;
+        // Checked before have_goal_, which abort clears: the latched status has to keep
+        // saying "aborted" so `rostopic echo /lunar_planner/status` explains the silence.
+        if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); publishDiagnostics(); return; }
+        if(!have_goal_) return;
         if((ros::Time::now() - map_stamp_).toSec() > max_map_age_) {
             publishStatus("stale_map"); return;
         }
-        if(!replan_requested_ && !last_path_.poses.empty()) replan_requested_ = true;
+        // Replanning is driven by map arrival (see mapCallback), not by this timer: at a
+        // 0.5s tick against a ~1.1s perception cycle the same map was replanned twice, which
+        // is what lets consecutive plans disagree and the rover oscillate.
         if(!replan_requested_) return;
+        replan_requested_ = false;
         geometry_msgs::PoseStamped start;
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
+
+        const double goal_dist = std::hypot(goal_.pose.position.x - start.pose.position.x,
+                                            goal_.pose.position.y - start.pose.position.y);
+        if(goal_dist < best_goal_dist_ - progress_epsilon_) {
+            best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
+        }
+
+        // Two independent triggers, because the task book names both failure modes: repeated
+        // planning failure near obstacles, and making no headway while still producing paths
+        // (an oscillating planner replans happily forever but never improves best_goal_dist_).
+        const bool no_progress = goal_dist > goal_tolerance_ &&
+            (ros::Time::now() - last_progress_time_).toSec() > no_progress_timeout_;
+        if(mode_ == PlannerMode::Nominal) {
+            const bool cooled_down = last_recovery_end_.isZero() ||
+                (ros::Time::now() - last_recovery_end_).toSec() > min_recovery_interval_;
+            if((consecutive_failures_ >= recovery_fail_threshold_ || no_progress) && cooled_down) {
+                mode_ = PlannerMode::Recovery; recovery_escalation_ = 0; confirm_count_ = 0;
+                recovery_step_start_ = ros::Time::now(); ++recovery_events_;
+            }
+        } else if((ros::Time::now() - recovery_step_start_).toSec() > recovery_step_timeout_) {
+            ++recovery_escalation_; confirm_count_ = 0; recovery_step_start_ = ros::Time::now();
+        }
+
         nav_msgs::Path path;
         std_msgs::Float32MultiArray vel;
-        if(plan(start, goal_, path, vel)) {
-            last_path_ = path; path_pub_.publish(path); vel_pub_.publish(vel);
-            publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
+        const bool in_recovery = (mode_ == PlannerMode::Recovery);
+        const bool ok = in_recovery ? runRecovery(start, path, vel)
+                                    : plan(start, goal_, path, vel);
+        if(ok) {
+            consecutive_failures_ = 0;
+            last_path_ = path;
+            path_pub_.publish(path); vel_pub_.publish(vel);
+            if(mode_ == PlannerMode::Recovery) {
+                // Require repeated success before declaring recovery over, otherwise a
+                // marginal situation chatters between recovery and nominal every cycle.
+                if(++confirm_count_ >= recovery_confirm_count_) {
+                    mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
+                    recovery_escalation_ = 0; confirm_count_ = 0;
+                    last_recovery_end_ = ros::Time::now();
+                    best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
+                    ++recovery_successes_;
+                }
+                publishStatus(recoveryStatus());
+            } else {
+                publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
+            }
         } else {
+            ++consecutive_failures_; confirm_count_ = 0;
             last_path_.poses.clear(); path_pub_.publish(last_path_);
-            vel_pub_.publish(std_msgs::Float32MultiArray()); publishStatus("no_path");
+            vel_pub_.publish(std_msgs::Float32MultiArray());
+            publishStatus(mode_ == PlannerMode::Aborted ? "aborted"
+                          : (in_recovery ? recoveryStatus() : "no_path"));
         }
-        replan_requested_ = false;
+        publishDiagnostics();
     }
+
+    std::string recoveryStatus() const { return std::string("recovery_") + actionName(action_); }
 
     bool poseToState(const geometry_msgs::PoseStamped& pose, State& state) const {
         if(pose.header.frame_id != map_frame_ && !pose.header.frame_id.empty()) return false;
@@ -487,12 +620,23 @@ private:
         return false;
     }
 
+    // Timed wrapper: goal snapping has to come out of max_planning_time rather than be
+    // charged on top of it, and plan_ms is the 规划耗时 metric the harness reads back.
     bool plan(const geometry_msgs::PoseStamped& start_pose,
               const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
               std_msgs::Float32MultiArray& vel_profile) {
-        // Timed from here, not from the A* loop: goal snapping has to come out of
-        // max_planning_time rather than be charged on top of it.
-        const auto begin=std::chrono::steady_clock::now();
+        const auto begin = std::chrono::steady_clock::now();
+        last_fail_reason_.clear();
+        const bool ok = planImpl(start_pose, goal_pose, path, vel_profile, begin);
+        last_plan_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        return ok;
+    }
+
+    bool planImpl(const geometry_msgs::PoseStamped& start_pose,
+                  const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
+                  std_msgs::Float32MultiArray& vel_profile,
+                  const std::chrono::steady_clock::time_point& begin) {
         path.poses.clear(); vel_profile.data.clear();
         snapped_goal_used_ = false; last_snap_dist_ = 0.0;
         State start, goal;
@@ -500,12 +644,14 @@ private:
             ROS_WARN_THROTTLE(1.0, "plan: start pose not in map (frame='%s', x=%.2f y=%.2f)",
                               start_pose.header.frame_id.c_str(),
                               start_pose.pose.position.x, start_pose.pose.position.y);
+            last_fail_reason_ = "start_off_map";
             return false;
         }
         if(!poseToState(goal_pose,goal)) {
             ROS_WARN_THROTTLE(1.0, "plan: goal pose not in map (frame='%s', x=%.2f y=%.2f)",
                               goal_pose.header.frame_id.c_str(),
                               goal_pose.pose.position.x, goal_pose.pose.position.y);
+            last_fail_reason_ = "goal_off_map";
             return false;
         }
         float dummy;
@@ -517,6 +663,7 @@ private:
                               "(a LETHAL cell or over-limit slope lies under the vehicle; "
                               "unobserved cells are tolerated at the start)",
                               sp.x(), sp.y(), yawForBin(start.t));
+            last_fail_reason_ = "start_footprint";
             return false;
         }
         if(!footprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
@@ -525,6 +672,7 @@ private:
                 ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f and no "
                                   "valid pose within %.2fm (pick a goal on clear, observed terrain)",
                                   gp.x(), gp.y(), yawForBin(goal.t), max_snap_distance_);
+                last_fail_reason_ = "goal_invalid";
                 return false;
             }
             goal = snapped;
@@ -599,6 +747,7 @@ private:
                               "(mode=%s, expanded=%d nodes, %.3fs, goal_bin=%d, goal_tol=%.2f). "
                               "Start footprints ok, so this is search/goal-tolerance, not the start.",
                               use_dynamics?"dynamics":"arcs", expanded, elapsed, goal.t, goal_tolerance_);
+            last_fail_reason_ = "search_exhausted";
             return false;
         }
         path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
@@ -673,6 +822,18 @@ private:
     double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
+
+    PlannerMode mode_ = PlannerMode::Nominal;
+    RecoveryAction action_ = RecoveryAction::None;
+    std::vector<RecoveryAction> ladder_;
+    int recovery_fail_threshold_, recovery_confirm_count_;
+    double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
+    int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
+    int recovery_events_=0, recovery_successes_=0;
+    double best_goal_dist_ = std::numeric_limits<double>::infinity();
+    double last_plan_ms_ = 0.0;
+    ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
+    std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;
     mutable std::vector<int> prof_dir_;
