@@ -2,11 +2,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -139,6 +142,42 @@ private:
                     default: return "none"; }
     }
 
+    // CPU share of one core since the previous call, and resident set size. Sampled here
+    // rather than from an external monitor so the figure follows the code onto the Atlas
+    // board, where the CPU budget it exists to check (<40%) actually applies. Returns
+    // false if /proc is unavailable, and the harness then drops the sample rather than
+    // recording a zero -- a fabricated zero would silently pass the budget assertion.
+    bool sampleResources(double& cpu_pct, double& rss_mb) {
+        std::FILE* f = std::fopen("/proc/self/stat", "r");
+        if(!f) return false;
+        char line[2048];
+        const bool read_ok = std::fgets(line, sizeof(line), f) != nullptr;
+        std::fclose(f);
+        // The comm field is parenthesised and may itself contain spaces, so fields are
+        // only unambiguous after the last ')'. utime/stime are fields 14/15 counting
+        // from 1, i.e. the 12th and 13th tokens after that point.
+        const char* rest = read_ok ? std::strrchr(line, ')') : nullptr;
+        if(!rest) return false;        long unsigned utime = 0, stime = 0;
+        if(std::sscanf(rest + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+                       &utime, &stime) != 2) return false;
+        const double ticks = static_cast<double>(utime + stime) / sysconf(_SC_CLK_TCK);
+        const ros::Time now = ros::Time::now();
+        const double dt = last_cpu_time_.isZero() ? 0.0 : (now - last_cpu_time_).toSec();
+        cpu_pct = (last_cpu_ticks_ < 0.0 || dt <= 0.0)
+                      ? -1.0 : 100.0 * (ticks - last_cpu_ticks_) / dt;
+        last_cpu_ticks_ = ticks;
+        last_cpu_time_ = now;
+
+        rss_mb = -1.0;
+        if(std::FILE* m = std::fopen("/proc/self/statm", "r")) {
+            long unsigned total = 0, resident = 0;
+            if(std::fscanf(m, "%lu %lu", &total, &resident) == 2)
+                rss_mb = static_cast<double>(resident) * sysconf(_SC_PAGESIZE) / (1024.0*1024.0);
+            std::fclose(m);
+        }
+        return true;
+    }
+
     // Structured counterpart to /lunar_planner/status, which has to stay short single-word
     // tokens for `rostopic echo` diagnosis. recovery_events/successes/aborts are monotone
     // counters rather than events, so the test harness can diff them without caring about
@@ -150,15 +189,18 @@ private:
         const bool chatty = (mode_ == PlannerMode::Recovery);
         if(!chatty && !last_diag_time_.isZero() && (now - last_diag_time_).toSec() < 1.0) return;
         last_diag_time_ = now;
-        char buf[384];
+        double cpu_pct = -1.0, rss_mb = -1.0;
+        sampleResources(cpu_pct, rss_mb);
+        char buf[448];
         std::snprintf(buf, sizeof(buf),
                       "mode=%s action=%s escalation=%d fails=%d recovery_events=%d "
-                      "recovery_successes=%d recovery_aborts=%d last_fail=%s plan_ms=%.1f snap_m=%.2f",
+                      "recovery_successes=%d recovery_aborts=%d last_fail=%s plan_ms=%.1f "
+                      "snap_m=%.2f cpu_pct=%.1f rss_mb=%.1f",
                       modeName(mode_), actionName(action_), recovery_escalation_,
                       consecutive_failures_, recovery_events_, recovery_successes_,
                       recovery_aborts_,
                       last_fail_reason_.empty() ? "none" : last_fail_reason_.c_str(),
-                      last_plan_ms_, last_snap_dist_);
+                      last_plan_ms_, last_snap_dist_, cpu_pct, rss_mb);
         std_msgs::String msg; msg.data = buf; diag_pub_.publish(msg);
     }
 
@@ -938,6 +980,8 @@ private:
     int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
     double last_plan_ms_ = 0.0;
+    double last_cpu_ticks_ = -1.0;
+    ros::Time last_cpu_time_;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
     nav_msgs::Path last_valid_path_;
     std::string last_fail_reason_;
