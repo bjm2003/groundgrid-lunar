@@ -1,7 +1,13 @@
 <?xml version="1.0"?>
 <launch>
+    <!-- CI runs the short sweep; a review run uses n_trials:=10 for tighter statistics.
+         The limit has to cover n_trials x 4 easy goals plus 3 hard ones, each with its
+         own drive-to-goal timeout, so it is far above the old single-goal budget. -->
+    <arg name="n_trials" default="3"/>
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" />
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
-          time-limit="60" />
+          time-limit="900">
+        <param name="n_trials" value="$(arg n_trials)"/>
+    </test>
 </launch>
