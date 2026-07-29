@@ -49,6 +49,12 @@ state_lattice_planner:
   # true = dynamics-feasible motion primitive library (requires motion_primitive_file).
   use_dynamics_primitives: false
   motion_primitive_file: motion_primitives.dat
+  # Arc mode has no offline (v, w) library, so the planner profiles its own path.
+  # Hard limits come from the shared skid_steer_model block; these only shape how much
+  # speed rough or steep terrain sheds on top of that.
+  terrain_speed_gain: 0.6    # fraction of v_max shed at the worst non-lethal terrain cost
+  min_speed_scale: 0.25      # floor on the terrain factor, so the rover never crawls
+  reverse_speed_frac: 0.5    # reversing is blind; cap it well under v_max
 
 lunar_path_follower:
   map_frame: map

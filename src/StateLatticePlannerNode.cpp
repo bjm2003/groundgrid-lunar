@@ -49,6 +49,17 @@ public:
         pnh_.param<std::string>("base_frame", base_frame_, "base_link");
         pnh_.param("use_dynamics_primitives", use_dynamics_primitives_, false);
         pnh_.param<std::string>("motion_primitive_file", motion_primitive_file_, "");
+        pnh_.param("terrain_speed_gain", terrain_speed_gain_, 0.6);
+        pnh_.param("min_speed_scale", min_speed_scale_, 0.25);
+        pnh_.param("reverse_speed_frac", reverse_speed_frac_, 0.5);
+
+        // Shared dynamics envelope: the arc-mode velocity profile has to honour the same
+        // limits the offline primitive library was generated under, otherwise the A/B
+        // comparison would run the two modes against different vehicles.
+        nh_.param("skid_steer_model/v_max", sp_.v_max, sp_.v_max);
+        nh_.param("skid_steer_model/w_max", sp_.w_max, sp_.w_max);
+        nh_.param("skid_steer_model/a_max", sp_.a_max, sp_.a_max);
+        nh_.param("skid_steer_model/alpha_max", sp_.alpha_max, sp_.alpha_max);
 
         if(use_dynamics_primitives_) {
             if(motion_primitive_file_.empty() || !primitive_lib_.load(motion_primitive_file_)) {
@@ -316,7 +327,111 @@ private:
         return distance + static_cast<float>(dt * primitive_length_ * 0.25);
     }
 
+    // Arc mode has no offline (v, w) library, so the planner profiles its own path here:
+    // the desired linear/angular velocity is a required planner output, and without it the
+    // follower falls back to a curvature guess and the skid_steer_model acceleration limits
+    // are never enforced. Classic forward-backward trapezoidal pass; the emitted layout is
+    // identical to the dynamics branch so LunarPathFollowerNode::plannedSpeedAt accepts it.
+    void buildVelocityProfile(const nav_msgs::Path& path,
+                              std_msgs::Float32MultiArray& vel_profile) const {
+        const size_t n = path.poses.size();
+        vel_profile.data.assign(2*n, 0.0f);
+        vel_profile.layout.dim.resize(2);
+        vel_profile.layout.dim[0].label = "pairs";
+        vel_profile.layout.dim[0].size = n;
+        vel_profile.layout.dim[0].stride = 2*n;
+        vel_profile.layout.dim[1].label = "vw";
+        vel_profile.layout.dim[1].size = 2;
+        vel_profile.layout.dim[1].stride = 2;
+        if(n < 2) return;
+
+        const size_t segs = n - 1;
+        prof_ds_.resize(segs); prof_dyaw_.resize(segs); prof_kappa_.resize(segs);
+        prof_dir_.resize(segs); prof_v_.resize(n); prof_w_.resize(n);
+        prof_yaw_.resize(n); prof_wmag_.resize(n);
+
+        for(size_t i=0;i<n;++i) prof_yaw_[i] = tf2::getYaw(path.poses[i].pose.orientation);
+        for(size_t i=0;i<segs;++i) {
+            const double dx = path.poses[i+1].pose.position.x - path.poses[i].pose.position.x;
+            const double dy = path.poses[i+1].pose.position.y - path.poses[i].pose.position.y;
+            prof_ds_[i] = static_cast<float>(std::hypot(dx,dy));
+            prof_dyaw_[i] = static_cast<float>(wrap(prof_yaw_[i+1]-prof_yaw_[i]));
+            if(prof_ds_[i] < 1e-3f) {          // in-place rotation step
+                prof_dir_[i] = 0;
+                prof_kappa_[i] = 0.0f;
+            } else {
+                prof_dir_[i] = std::cos(wrap(std::atan2(dy,dx)-prof_yaw_[i])) >= 0.0 ? 1 : -1;
+                prof_kappa_[i] = prof_dyaw_[i]/prof_ds_[i];
+            }
+        }
+
+        for(size_t i=0;i<n;++i) {
+            const size_t s = std::min(i, segs-1);
+            double lim = sp_.v_max;
+            const double k = std::abs(prof_kappa_[s]);
+            if(k > 1e-3) lim = std::min(lim, sp_.w_max/k);
+            grid_map::Index idx;
+            if(map_.getIndex(grid_map::Position(path.poses[i].pose.position.x,
+                                               path.poses[i].pose.position.y), idx)) {
+                const size_t lin = static_cast<size_t>(idx(0))*cell_cols_ + idx(1);
+                const float c = cell_cost_[lin];
+                // Non-finite is legitimate here: the start footprint sits on the cells the
+                // vehicle body occludes. Skip the factor rather than poisoning the profile.
+                if(std::isfinite(c))
+                    lim *= std::clamp(1.0 - terrain_speed_gain_*(c/99.0), min_speed_scale_, 1.0);
+                const float sm = cell_slopemag_[lin];
+                if(std::isfinite(sm) && max_long_slope_ > 1e-3)
+                    lim *= std::clamp(1.0 - sm/max_long_slope_, min_speed_scale_, 1.0);
+            }
+            if(prof_dir_[s] < 0) lim = std::min(lim, reverse_speed_frac_*sp_.v_max);
+            const bool rotating = (i > 0 && prof_dir_[i-1] == 0) || (i < segs && prof_dir_[i] == 0);
+            const bool reversal = (i > 0 && i < segs && prof_dir_[i-1]*prof_dir_[i] < 0);
+            if(i == 0 || i == n-1 || rotating || reversal) lim = 0.0;
+            prof_v_[i] = static_cast<float>(std::max(lim, 0.0));
+        }
+
+        for(size_t i=1;i<n;++i)
+            prof_v_[i] = std::min(prof_v_[i], static_cast<float>(
+                std::sqrt(prof_v_[i-1]*prof_v_[i-1] + 2.0*sp_.a_max*prof_ds_[i-1])));
+        for(size_t i=n-1;i-->0;)
+            prof_v_[i] = std::min(prof_v_[i], static_cast<float>(
+                std::sqrt(prof_v_[i+1]*prof_v_[i+1] + 2.0*sp_.a_max*prof_ds_[i])));
+
+        // Angular: curvature-implied rate where the vehicle translates, and a dedicated
+        // in-place rate where it does not (otherwise the profile is a dead zero exactly
+        // where the rover is supposed to be turning on the spot).
+        for(size_t i=0;i<n;++i) {
+            const size_t s = std::min(i, segs-1);
+            double w = prof_v_[i]*prof_kappa_[s];
+            if(prof_dir_[s] == 0 && std::abs(prof_dyaw_[s]) > 1e-3) {
+                const double mag = std::min(sp_.w_max,
+                                            std::sqrt(2.0*sp_.alpha_max*std::abs(prof_dyaw_[s])));
+                w = std::copysign(mag, prof_dyaw_[s]);
+            }
+            prof_w_[i] = static_cast<float>(std::clamp(w, -sp_.w_max, sp_.w_max));
+        }
+        // Same trapezoidal pass on |w| over angular arc length, so alpha_max is honoured.
+        for(size_t i=0;i<n;++i) prof_wmag_[i] = std::abs(prof_w_[i]);
+        for(size_t i=1;i<n;++i)
+            prof_wmag_[i] = std::min(prof_wmag_[i], static_cast<float>(
+                std::sqrt(prof_wmag_[i-1]*prof_wmag_[i-1] + 2.0*sp_.alpha_max*std::abs(prof_dyaw_[i-1]))));
+        for(size_t i=n-1;i-->0;)
+            prof_wmag_[i] = std::min(prof_wmag_[i], static_cast<float>(
+                std::sqrt(prof_wmag_[i+1]*prof_wmag_[i+1] + 2.0*sp_.alpha_max*std::abs(prof_dyaw_[i]))));
+
+        float v_peak = 0.0f;
+        for(size_t i=0;i<n;++i) {
+            const size_t s = std::min(i, segs-1);
+            const float signed_v = prof_dir_[s] < 0 ? -prof_v_[i] : prof_v_[i];
+            vel_profile.data[2*i]   = signed_v;
+            vel_profile.data[2*i+1] = std::copysign(prof_wmag_[i], prof_w_[i]);
+            v_peak = std::max(v_peak, prof_v_[i]);
+        }
+        ROS_INFO_THROTTLE(2.0, "vprofile: n=%zu v_peak=%.2f", n, v_peak);
+    }
+
     bool plan(const geometry_msgs::PoseStamped& start_pose,
+
               const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
               std_msgs::Float32MultiArray& vel_profile) {
         path.poses.clear(); vel_profile.data.clear();
@@ -464,7 +579,9 @@ private:
             tf2::Quaternion q; q.setRPY(0,0,yawForBin(s.t)); pose.pose.orientation=tf2::toMsg(q);
             path.poses.push_back(pose);
         }
-        return !path.poses.empty();
+        if(path.poses.empty()) return false;
+        buildVelocityProfile(path, vel_profile);
+        return true;
     }
 
     ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_; ros::Publisher path_pub_,vel_pub_,status_pub_;
@@ -477,6 +594,11 @@ private:
     bool use_dynamics_primitives_=false; std::string motion_primitive_file_;
     MotionPrimitiveLibrary primitive_lib_;
     std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
+    SkidSteerParams sp_;
+    double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
+    mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
+    mutable std::vector<double> prof_yaw_;
+    mutable std::vector<int> prof_dir_;
 };
 
 } // namespace groundgrid
