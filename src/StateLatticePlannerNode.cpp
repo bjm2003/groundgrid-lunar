@@ -52,6 +52,10 @@ public:
         pnh_.param("terrain_speed_gain", terrain_speed_gain_, 0.6);
         pnh_.param("min_speed_scale", min_speed_scale_, 0.25);
         pnh_.param("reverse_speed_frac", reverse_speed_frac_, 0.5);
+        pnh_.param("max_snap_distance", max_snap_distance_, 1.5);
+        pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
+        pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
+        pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
 
         // Shared dynamics envelope: the arc-mode velocity profile has to honour the same
         // limits the offline primitive library was generated under, otherwise the A/B
@@ -81,6 +85,7 @@ public:
         path_pub_ = nh_.advertise<nav_msgs::Path>("/lunar_planner/path", 1, true);
         vel_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/lunar_planner/velocity_profile", 1, true);
         status_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/status", 1, true);
+        snapped_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/lunar_planner/snapped_goal", 1, true);
         service_ = nh_.advertiseService("/lunar_planner/make_plan", &StateLatticePlannerNode::serviceCallback, this);
         timer_ = nh_.createTimer(ros::Duration(0.5), &StateLatticePlannerNode::timerCallback, this);
     }
@@ -180,7 +185,8 @@ private:
         nav_msgs::Path path;
         std_msgs::Float32MultiArray vel;
         if(plan(start, goal_, path, vel)) {
-            last_path_ = path; path_pub_.publish(path); vel_pub_.publish(vel); publishStatus("success");
+            last_path_ = path; path_pub_.publish(path); vel_pub_.publish(vel);
+            publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
         } else {
             last_path_.poses.clear(); path_pub_.publish(last_path_);
             vel_pub_.publish(std_msgs::Float32MultiArray()); publishStatus("no_path");
@@ -430,11 +436,65 @@ private:
         ROS_INFO_THROTTLE(2.0, "vprofile: n=%zu v_peak=%.2f", n, v_peak);
     }
 
-    bool plan(const geometry_msgs::PoseStamped& start_pose,
+    // Nudge an unreachable goal onto the nearest pose whose footprint actually validates.
+    // 要点13 is about planning close to obstacles: the strict footprint test rejects a goal
+    // whose 1.8x1.5m box clips a single unobserved or lethal cell, which happens whenever the
+    // operator clicks within about one body half-diagonal (hypot(0.9,0.75)=1.17m) of the edge
+    // of the observed region -- even though a pose a few decimetres away is perfectly drivable.
+    // This moves the goal; it does NOT relax the collision test. Rings are ordered by distance,
+    // so the first ring containing any valid candidate is the best one and the search stops there.
+    bool snapGoal(const State& requested, double max_distance, double budget_s,
+                  const std::chrono::steady_clock::time_point& begin,
+                  State& snapped, double& snap_dist) const {
+        grid_map::Position rp;
+        if(!map_.getPosition(grid_map::Index(requested.x, requested.y), rp)) return false;
+        const double res = map_.getResolution();
+        const int max_ring = std::max(1, static_cast<int>(std::ceil(max_distance/res)));
+        const double heading_step = 2.0*M_PI/bins_;
 
+        for(int r = 1; r <= max_ring; ++r) {
+            if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count() > budget_s)
+                return false;
+            double best_score = std::numeric_limits<double>::infinity();
+            bool found = false;
+            for(int dx = -r; dx <= r; ++dx) {
+                for(int dy = -r; dy <= r; ++dy) {
+                    if(std::max(std::abs(dx), std::abs(dy)) != r) continue;   // perimeter only
+                    // Stepped in world space, not index space: grid_map is a circular buffer,
+                    // so index arithmetic wraps to the wrong cell at the buffer seam.
+                    grid_map::Index idx;
+                    if(!map_.getIndex(grid_map::Position(rp.x()+dx*res, rp.y()+dy*res), idx)) continue;
+                    grid_map::Position cp;
+                    if(!map_.getPosition(idx, cp)) continue;
+                    const double dist = (cp - rp).norm();
+                    if(dist > max_distance) continue;
+                    for(int db = -goal_snap_heading_span_; db <= goal_snap_heading_span_; ++db) {
+                        const int t = ((requested.t + db) % bins_ + bins_) % bins_;
+                        float cost;
+                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
+                        const double score = dist
+                            + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
+                            + goal_snap_cost_weight_*(cost/99.0);
+                        if(score < best_score) {
+                            best_score = score; found = true;
+                            snapped = {idx(0), idx(1), t}; snap_dist = dist;
+                        }
+                    }
+                }
+            }
+            if(found) return true;
+        }
+        return false;
+    }
+
+    bool plan(const geometry_msgs::PoseStamped& start_pose,
               const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
               std_msgs::Float32MultiArray& vel_profile) {
+        // Timed from here, not from the A* loop: goal snapping has to come out of
+        // max_planning_time rather than be charged on top of it.
+        const auto begin=std::chrono::steady_clock::now();
         path.poses.clear(); vel_profile.data.clear();
+        snapped_goal_used_ = false; last_snap_dist_ = 0.0;
         State start, goal;
         if(!poseToState(start_pose,start)) {
             ROS_WARN_THROTTLE(1.0, "plan: start pose not in map (frame='%s', x=%.2f y=%.2f)",
@@ -460,10 +520,25 @@ private:
             return false;
         }
         if(!footprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
-            ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f "
-                              "(pick a goal on clear, observed terrain)",
-                              gp.x(), gp.y(), yawForBin(goal.t));
-            return false;
+            State snapped; double snap_dist;
+            if(!snapGoal(goal, max_snap_distance_, max_planning_time_*0.2, begin, snapped, snap_dist)) {
+                ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f and no "
+                                  "valid pose within %.2fm (pick a goal on clear, observed terrain)",
+                                  gp.x(), gp.y(), yawForBin(goal.t), max_snap_distance_);
+                return false;
+            }
+            goal = snapped;
+            map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
+            snapped_goal_used_ = true; last_snap_dist_ = snap_dist;
+            geometry_msgs::PoseStamped snapped_msg;
+            snapped_msg.header.frame_id = map_frame_;
+            snapped_msg.header.stamp = ros::Time::now();
+            snapped_msg.pose.position.x = gp.x(); snapped_msg.pose.position.y = gp.y();
+            tf2::Quaternion sq; sq.setRPY(0,0,yawForBin(goal.t));
+            snapped_msg.pose.orientation = tf2::toMsg(sq);
+            snapped_goal_pub_.publish(snapped_msg);
+            ROS_WARN_THROTTLE(1.0, "plan: goal snapped %.2fm to (%.2f,%.2f) yaw=%.2f",
+                              snap_dist, gp.x(), gp.y(), yawForBin(goal.t));
         }
 
         const bool use_dynamics = use_dynamics_primitives_ && !primitive_lib_.empty();
@@ -475,7 +550,6 @@ private:
         std::priority_queue<QueueNode> open;
         const int sk=key(start,cols);
         g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
-        const auto begin=std::chrono::steady_clock::now();
         int reached=-1;
         int expanded=0;
         while(!open.empty()) {
@@ -584,7 +658,7 @@ private:
         return true;
     }
 
-    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_; ros::Publisher path_pub_,vel_pub_,status_pub_;
+    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_; ros::Publisher path_pub_,vel_pub_,status_pub_,snapped_goal_pub_;
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
     bool have_map_=false,have_goal_=false,replan_requested_=false;
@@ -596,6 +670,9 @@ private:
     std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
     SkidSteerParams sp_;
     double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
+    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
+    int goal_snap_heading_span_;
+    bool snapped_goal_used_=false; double last_snap_dist_=0.0;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;
     mutable std::vector<int> prof_dir_;

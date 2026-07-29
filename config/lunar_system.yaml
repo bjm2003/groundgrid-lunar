@@ -55,6 +55,14 @@ state_lattice_planner:
   terrain_speed_gain: 0.6    # fraction of v_max shed at the worst non-lethal terrain cost
   min_speed_scale: 0.25      # floor on the terrain factor, so the rover never crawls
   reverse_speed_frac: 0.5    # reversing is blind; cap it well under v_max
+  # 要点13 (planning near obstacles): a goal whose footprint clips an unobserved or lethal
+  # cell is nudged onto the nearest valid pose instead of failing outright. The bound is one
+  # body half-diagonal (hypot(0.9,0.75)=1.17m) plus margin -- past that the goal really was
+  # unreachable and failing is the honest answer.
+  max_snap_distance: 1.5
+  goal_snap_heading_span: 2       # heading bins searched either side of the requested one
+  goal_snap_heading_weight: 0.25  # penalty per bin of heading deviation
+  goal_snap_cost_weight: 0.5      # prefer low-terrain-cost snap targets
 
 lunar_path_follower:
   map_frame: map
