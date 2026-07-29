@@ -305,10 +305,13 @@ private:
         return true;
     }
 
-    // One rung of the escalation ladder. Returns whether it produced a usable path.
+    // One rung of the escalation ladder. Returns whether it produced a usable path, and
+    // sets `manoeuvre` when that path only repositions the vehicle instead of routing it to
+    // the goal -- the caller must not count those two as the same kind of success.
     bool runRecovery(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
-                     std_msgs::Float32MultiArray& vel) {
+                     std_msgs::Float32MultiArray& vel, bool& manoeuvre) {
         action_ = ladder_[std::min<size_t>(recovery_escalation_, ladder_.size()-1)];
+        manoeuvre = false;
         switch(action_) {
             case RecoveryAction::Relax: {
                 // Most failures are "the goal is barely out of reach": widen the acceptance
@@ -321,8 +324,10 @@ private:
                 return ok;
             }
             case RecoveryAction::Rotate:
+                manoeuvre = true;
                 return recoveryRotate(start, path, vel);
             case RecoveryAction::BackOut:
+                manoeuvre = true;
                 return recoveryBackOut(start, path, vel);
             case RecoveryAction::Abort:
                 mode_ = PlannerMode::Aborted; have_goal_ = false;
@@ -377,16 +382,26 @@ private:
         nav_msgs::Path path;
         std_msgs::Float32MultiArray vel;
         const bool in_recovery = (mode_ == PlannerMode::Recovery);
-        const bool ok = in_recovery ? runRecovery(start, path, vel)
+        bool manoeuvre = false;
+        const bool ok = in_recovery ? runRecovery(start, path, vel, manoeuvre)
                                     : plan(start, goal_, path, vel);
-        if(ok) {
+        if(ok && manoeuvre) {
+            // Rotate and back-out produce a path the follower can execute, but it does not
+            // reach the goal. Counting it as a planning success would clear the failure
+            // streak and satisfy the confirm counter, so the ladder would reset here and
+            // never escalate to Abort -- a hopeless goal would be retried forever, and the
+            // 避障恢复率 metric would score a manoeuvre as a recovery.
+            last_path_ = path;
+            path_pub_.publish(path); vel_pub_.publish(vel);
+            publishStatus(recoveryStatus());
+        } else if(ok) {
             consecutive_failures_ = 0;
             last_path_ = path;
             // Only genuine plans seed the back-out buffer: retreating along a previous
             // recovery manoeuvre would just replay the manoeuvre that already failed.
             if(!in_recovery) last_valid_path_ = path;
             path_pub_.publish(path); vel_pub_.publish(vel);
-            if(mode_ == PlannerMode::Recovery) {
+            if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
                 // marginal situation chatters between recovery and nominal every cycle.
                 if(++confirm_count_ >= recovery_confirm_count_) {
@@ -395,8 +410,10 @@ private:
                     last_recovery_end_ = ros::Time::now();
                     best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
                     ++recovery_successes_;
+                    publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
+                } else {
+                    publishStatus(recoveryStatus());
                 }
-                publishStatus(recoveryStatus());
             } else {
                 publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
             }
