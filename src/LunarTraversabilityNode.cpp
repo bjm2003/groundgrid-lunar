@@ -20,6 +20,7 @@ public:
         pnh_.param("min_ground_confidence", min_confidence_, 0.20);
         pnh_.param("max_observation_age", max_age_, 1.0);
         pnh_.param("observation_fill_radius", fill_radius_, 1.0);
+        pnh_.param("sensor_blind_radius", blind_radius_, 2.5);
         pnh_.param("min_obstacle_height", min_obstacle_height_, 0.10);
         pnh_.param("min_obstacle_confidence", min_obstacle_confidence_, 0.45);
         pnh_.param<std::string>("input_topic", input_topic_, "/groundgrid/grid_map");
@@ -97,6 +98,24 @@ private:
         dilate(fresh, swept, std::max(0, static_cast<int>(std::lround(fill_radius_ /
                                                                      map.getResolution()))));
 
+        // The beams bottom out at a fixed depression angle, so a disc under the vehicle
+        // never receives a return -- 2.2 m at 1 m mounting height and -24.8 deg. Nothing
+        // ever observes it, so without this the rover cannot take its first step: every
+        // successor pose's footprint lands in the hole. Once moving it would be covered by
+        // memory (`observed` is sticky and the disc is crossed well inside max_age_), but
+        // at t=0 there is no memory to have. Obstacles standing in the disc are still seen
+        // -- a 0.5 m boulder at 2 m is struck by the beams that clear the ground -- so what
+        // is being assumed here is only that the ground the vehicle is standing on is
+        // ground, which it demonstrably is.
+        grid_map::Index centre;
+        if(blind_radius_ > 0.0 && map.getIndex(map.getPosition(), centre)) {
+            const int r = static_cast<int>(std::lround(blind_radius_ / map.getResolution()));
+            for(int i = std::max(0, centre(0)-r); i <= std::min<int>(swept.rows()-1, centre(0)+r); ++i)
+                for(int j = std::max(0, centre(1)-r); j <= std::min<int>(swept.cols()-1, centre(1)+r); ++j)
+                    if((i-centre(0))*(i-centre(0)) + (j-centre(1))*(j-centre(1)) <= r*r)
+                        swept(i, j) = 1.0f;
+        }
+
         for(grid_map::GridMapIterator it(map); !it.isPastEnd(); ++it) {
             const grid_map::Index idx(*it);
             const float confidence = map.at("groundpatch", idx);
@@ -147,7 +166,8 @@ private:
     ros::Subscriber sub_;
     ros::Publisher map_pub_, cost_pub_;
     std::string input_topic_, grid_map_topic_, costmap_topic_;
-    double max_slope_deg_, max_roughness_, max_step_, min_confidence_, max_age_, fill_radius_;
+    double max_slope_deg_, max_roughness_, max_step_, min_confidence_, max_age_;
+    double fill_radius_, blind_radius_;
     double min_obstacle_height_, min_obstacle_confidence_;
 };
 

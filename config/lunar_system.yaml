@@ -30,6 +30,9 @@ lunar_traversability:
   # LunarTraversabilityNode::mapCallback: past r where (h + r^2/h)*beam_pitch > 2*this,
   # the costmap is legitimately unknown. 1.0 m puts that edge at ~16 m.
   observation_fill_radius: 1.0
+  # No beam lands inside this disc (1.0 m mounting height / -24.8 deg lowest beam gives
+  # 2.16 m), so it is never observed and the rover could not take its first step.
+  sensor_blind_radius: 2.5
   min_obstacle_height: 0.10
   min_obstacle_confidence: 0.45
 
