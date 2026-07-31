@@ -9,6 +9,13 @@ groundgrid:
   thread_count: 8
   minimum_distance_factor: 0.005
   distance_factor: 0.0005
+  # Upstream default is sqrt(12) = 3.46 m, sized for a car with a roof LiDAR. On a 1.8 m
+  # rover that discards every point inside two body lengths: `points` stays 0 so no ground
+  # patch is ever detected, and `maxGroundHeight` stays at lowest() so obstacle_height
+  # computes as 0 and obstacle_confidence decays away -- the rover drives into rocks it
+  # measured perfectly well a second earlier. 1.2 m is the body half-diagonal (1.17 m),
+  # i.e. the radius inside which a return could only be the vehicle itself.
+  min_point_distance: 1.2
   slope_enable: true
   height_correction_enable: true
   height_correction_iterations: 1

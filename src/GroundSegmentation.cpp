@@ -524,6 +524,7 @@ void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x
 void GroundSegmentation::setConfig(const groundgrid::GroundGridConfig &config)
 {
     mConfig = config;
+    minDistSquared = static_cast<float>(config.min_point_distance * config.min_point_distance);
 }
 
 

@@ -104,9 +104,10 @@ private:
         // successor pose's footprint lands in the hole. Once moving it would be covered by
         // memory (`observed` is sticky and the disc is crossed well inside max_age_), but
         // at t=0 there is no memory to have. Obstacles standing in the disc are still seen
-        // -- a 0.5 m boulder at 2 m is struck by the beams that clear the ground -- so what
-        // is being assumed here is only that the ground the vehicle is standing on is
-        // ground, which it demonstrably is.
+        // -- a 0.5 m boulder at 2 m is struck by the beams that clear the ground -- but only
+        // because groundgrid's min_point_distance is set below this radius. Raise that back
+        // to its 3.46 m default and this override turns "will not move" into "drives into
+        // rocks it cannot see": the two values are coupled.
         grid_map::Index centre;
         if(blind_radius_ > 0.0 && map.getIndex(map.getPosition(), centre)) {
             const int r = static_cast<int>(std::lround(blind_radius_ / map.getResolution()));
