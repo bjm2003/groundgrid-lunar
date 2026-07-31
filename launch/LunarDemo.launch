@@ -4,10 +4,16 @@
     <!-- Terrain class from the task book's scenario library: mixed (the original map and
          the regression baseline) | flat | dense | slope | negative. -->
     <arg name="scenario" default="mixed" />
+    <!-- Sensor sampling. 0.20 m against the 0.15 m map resolution beats at their LCM of
+         0.60 m and leaves every fourth cell empty, which the perception stack reports as
+         a lattice of spurious obstacles -- exposed as args so the effect is measurable. -->
+    <arg name="cloud_spacing" default="0.20" />
+    <arg name="cloud_radius" default="25.0" />
     <param name="/use_sim_time" value="false" />
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" output="screen">
         <param name="scenario" value="$(arg scenario)" />
-        <param name="cloud_spacing" value="0.20" />
+        <param name="cloud_spacing" value="$(arg cloud_spacing)" />
+        <param name="cloud_radius" value="$(arg cloud_radius)" />
         <param name="noise_std" value="0.001" />
     </node>
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
