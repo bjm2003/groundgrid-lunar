@@ -23,7 +23,13 @@ lunar_traversability:
   max_roughness: 0.08
   max_step_height: 0.20
   min_ground_confidence: 0.0
-  max_observation_age: 1.0
+  # groundgrid runs ~1.05 s/frame, so a 1.0 s tolerance invalidated a cell the instant
+  # one frame missed it -- and the rings shift under the vehicle every frame.
+  max_observation_age: 3.0
+  # Half the LiDAR's inter-ring ground spacing at the working range. See the comment in
+  # LunarTraversabilityNode::mapCallback: past r where (h + r^2/h)*beam_pitch > 2*this,
+  # the costmap is legitimately unknown. 1.0 m puts that edge at ~16 m.
+  observation_fill_radius: 1.0
   min_obstacle_height: 0.10
   min_obstacle_confidence: 0.45
 

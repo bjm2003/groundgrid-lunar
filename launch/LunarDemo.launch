@@ -8,7 +8,7 @@
          gate is written against (GroundSegmentation.h:92); coarsening it starves the
          gate and the costmap degenerates into artefact. Exposed so that is measurable. -->
     <arg name="azimuth_res_deg" default="0.2" />
-    <arg name="n_rings" default="48" />
+    <arg name="n_rings" default="64" />
     <arg name="cloud_radius" default="25.0" />
     <param name="/use_sim_time" value="false" />
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" output="screen">
