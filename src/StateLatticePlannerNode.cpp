@@ -297,8 +297,10 @@ private:
         float cost;
         // allow_unknown for the same reason the start check uses it: the body occludes the
         // ground beneath itself, so those cells are never observed. Lethal cells and
-        // over-slope cells are still rejected.
-        if(!footprintValid(x, y, target_yaw, cost, true)) return false;
+        // over-slope cells are still rejected, and the whole sweep is checked, not just
+        // the end yaw -- this probe is issued when the rover is already boxed in, which is
+        // exactly where a corner has something to hit.
+        if(!rotationValid(x, y, yaw, target_yaw, cost, true)) return false;
 
         path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
         path.poses.clear();
@@ -529,6 +531,30 @@ private:
         return true;
     }
 
+    // Half the body diagonal: how far a corner stands from the centre, and therefore the
+    // radius its arc has when the body turns on the spot.
+    double cornerRadius() const {
+        return std::hypot(footprint_length_, footprint_width_) / 2.0;
+    }
+
+    // Validate a turn on the spot. Checking only the end yaw is not enough: a corner
+    // reaches 0.42 m further out than the broadside rectangle, so a pose that is clear at
+    // every axis-aligned heading can still graze an obstacle mid-turn. Measured on the
+    // mixed scenario -- the rover sat 0.12 m clear of the (0,-2) boulder, rotated during
+    // recovery, and its corner passed 0.15 m inside it. Arc primitives have always sampled
+    // their sweep; rotations, which sweep the most, did not. The step keeps corner travel
+    // under one cell, which is the spacing footprintValid samples the body at anyway.
+    bool rotationValid(double x, double y, double yaw0, double yaw1, float& cost,
+                       bool allow_unknown = false) const {
+        const double dyaw = wrap(yaw1 - yaw0);
+        const int n = std::max(1, static_cast<int>(std::ceil(std::abs(dyaw) * cornerRadius() /
+                                                             map_.getResolution())));
+        cost = 0.0f;
+        for(int i = 1; i <= n; ++i)
+            if(!footprintValid(x, y, wrap(yaw0 + dyaw*i/n), cost, allow_unknown)) return false;
+        return true;  // cost is the end pose's, which is what the caller charges for
+    }
+
     // Transform primitive samples from the start-body frame into the world, validate the
     // swept footprint along the primitive, accumulate terrain cost, and return the endpoint.
     bool primitiveValid(double px, double py, double pyaw, const MotionPrimitive& prim,
@@ -538,7 +564,12 @@ private:
         const double c = std::cos(pyaw), s = std::sin(pyaw);
         const double r = map_.getResolution();
         const double step_len = prim.length / std::max(1, n);
-        const int stride = std::max(1, static_cast<int>(std::lround(r / std::max(step_len, 1e-3))));
+        // Rotation moves the corners even when the centre stays put, and an in-place
+        // primitive has length ~ 0, so a stride derived from path length alone would
+        // collapse to "endpoint only" on exactly the primitives that sweep the widest.
+        const double step_sweep = std::abs(prim.samples[n-1].yaw) / std::max(1, n-1) * cornerRadius();
+        const int stride = std::max(1, static_cast<int>(std::lround(
+            r / std::max(step_len + step_sweep, 1e-3))));
         float cost_sum = 0.0f; int checks = 0;
         for(int i = 0; i < n; i += stride) {
             const auto& smp = prim.samples[i];
@@ -567,7 +598,7 @@ private:
         if(direction == 0) {
             to = from; to.t = (from.t + turn + bins_) % bins_;
             float terrain;
-            if(!footprintValid(p.x(), p.y(), yawForBin(to.t), terrain)) return false;
+            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain)) return false;
             edge_cost = static_cast<float>(rotation_cost_ * primitive_length_ + terrain * 0.002);
             return true;
         }
