@@ -124,6 +124,20 @@ def _stats(values):
             "min": min(vals), "max": max(vals)}
 
 
+def _describe_collision(c):
+    """One line per collision: which goal, where the body was, and what it hit."""
+    at = "(%.2f, %.2f)" % tuple(c["at"]) if c["at"] else "unknown pose"
+    if c["obstacle"]:
+        ox, oy, radius, height = c["obstacle"]
+        what = "%s r=%.2f h=%+.2f at (%.2f, %.2f)" % (
+            "crater" if height < 0 else "rock", radius, height, ox, oy)
+    else:
+        what = "unknown hazard"
+    return "    goal (%.1f, %.1f): clearance %.2f m at %s vs %s [%s]" % (
+        c["goal"][0], c["goal"][1], c["clearance_min_m"], at, what,
+        ",".join(c["statuses"]))
+
+
 class LunarPipelineTest(unittest.TestCase):
     def setUp(self):
         self.lock = threading.Lock()
@@ -230,28 +244,30 @@ class LunarPipelineTest(unittest.TestCase):
                    for p in path.poses)
 
     def _clearance(self, x, y, yaw):
-        """Gap between the body rectangle and the nearest ground-truth hazard footprint.
+        """Gap to the nearest ground-truth hazard, and which hazard it was.
 
         Negative means the hazard circle overlaps the body, which is the collision
         criterion. A hazard whose centre lies under the body reads as -radius, so the
         depth of the negative number distinguishes "clipped the skirt" from "parked on
-        top of it".
+        top of it". Returns None when no ground truth has arrived.
         """
         with self.lock:
             obstacles = self.obstacles
         if not obstacles:
             return None
         cyaw, syaw = math.cos(yaw), math.sin(yaw)
-        gaps = []
-        for ox, oy, radius, _h in obstacles:
+        worst = None
+        for ox, oy, radius, height in obstacles:
             dx, dy = ox - x, oy - y
             # Hazard centre in the body frame, then the distance from it to the rectangle.
             px = cyaw * dx + syaw * dy
             py = -syaw * dx + cyaw * dy
             ex = max(abs(px) - FOOTPRINT_LENGTH / 2.0, 0.0)
             ey = max(abs(py) - FOOTPRINT_WIDTH / 2.0, 0.0)
-            gaps.append(math.hypot(ex, ey) - radius)
-        return min(gaps)
+            gap = math.hypot(ex, ey) - radius
+            if worst is None or gap < worst[0]:
+                worst = (gap, (ox, oy, radius, height))
+        return worst
 
     def _reset_trial_state(self):
         with self.lock:
@@ -294,6 +310,7 @@ class LunarPipelineTest(unittest.TestCase):
         driven = 0.0
         prev = (x0, y0)
         clearances = []
+        worst = None
         reached = False
         while not rospy.is_shutdown() and rospy.Time.now() < end:
             final = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=2)
@@ -304,9 +321,11 @@ class LunarPipelineTest(unittest.TestCase):
             if ct is not None:
                 sq_err += ct * ct
                 n_err += 1
-            gap = self._clearance(fx, fy, _yaw_of(final.pose.pose.orientation))
-            if gap is not None:
-                clearances.append(gap)
+            near = self._clearance(fx, fy, _yaw_of(final.pose.pose.orientation))
+            if near is not None:
+                clearances.append(near[0])
+                if worst is None or near[0] < worst[0]:
+                    worst = (near[0], near[1], (fx, fy))
             if math.hypot(fx - gx, fy - gy) < REACH_TOLERANCE:
                 reached = True
                 break
@@ -353,6 +372,10 @@ class LunarPipelineTest(unittest.TestCase):
             "clearance_min": min(clearances) if clearances else float("nan"),
             "collided": bool(clearances) and min(clearances) < 0.0,
             "measured_clearance": bool(clearances),
+            # Where the body came closest and to what, so a collision failure can name the
+            # rock instead of only counting trials.
+            "worst_at": list(worst[2]) if worst else None,
+            "worst_obstacle": list(worst[1]) if worst else None,
             "moved": math.hypot(final.pose.pose.position.x - x0,
                                 final.pose.pose.position.y - y0),
             "final_err": math.hypot(final.pose.pose.position.x - gx,
@@ -481,6 +504,11 @@ class LunarPipelineTest(unittest.TestCase):
                   "recovery_events": events, "recovery_successes": successes,
                   "recovery_aborts": aborts, "collisions": len(collisions),
                   "clearance_measured": len(measured), "paths_emitted": len(emitted)}
+        # Carried in the summary itself (not just the per-trial dump) so the assertion
+        # message can name the offending goal and rock on the console.
+        collided = [{"goal": list(t["goal"]), "clearance_min_m": t["clearance_min"],
+                     "at": t["worst_at"], "obstacle": t["worst_obstacle"],
+                     "statuses": sorted(t["statuses"])} for t in collisions]
 
         rospy.loginfo("=== planner metrics [scenario=%s] over %d trials ===",
                       self.scenario, len(every))
@@ -520,7 +548,8 @@ class LunarPipelineTest(unittest.TestCase):
                           "statuses=%s", t["goal"][0], t["goal"][1], t["planned"],
                           t["reached"], t["clearance_min"], ",".join(sorted(t["statuses"])))
         return {"scenario": self.scenario, "counts": counts, "rates": rates,
-                "metrics": metrics, "cpu_budget_pct": self.cpu_budget}
+                "metrics": metrics, "collided": collided,
+                "cpu_budget_pct": self.cpu_budget}
 
     def _dump(self, report, every):
         """Persist the run so the numbers survive as a citable artefact.
@@ -559,9 +588,11 @@ class LunarPipelineTest(unittest.TestCase):
     def _assert(self, report, tour):
         rates, metrics = report["rates"], report["metrics"]
         # Never allowed anywhere: driving the body through a ground-truth hazard.
+        # rostest only echoes the assertion message, so the offenders go in it.
         self.assertEqual(report["counts"]["collisions"], 0,
-                         "%d trial(s) put the body inside a hazard footprint"
-                         % report["counts"]["collisions"])
+                         "%d trial(s) put the body inside a hazard footprint:\n%s"
+                         % (report["counts"]["collisions"],
+                            "\n".join(_describe_collision(c) for c in report["collided"])))
         if self.scenario in STRICT_SCENARIOS:
             self.assertGreaterEqual(rates["plan_success_tour"], 0.99,
                                     "规划成功率 on open terrain")
