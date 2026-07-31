@@ -194,14 +194,23 @@ class LunarSurfaceSim:
         Using ground truth rather than the published costmap keeps "did the planner avoid
         the obstacle" separate from "did perception see it".
 
-        `radius` is the hazard radius, not the shape radius: for a boulder the two coincide,
-        but for a bowl the lethal ring is where the wall exceeds the slope limit, well inside
-        the radius that defines the bowl's profile. Height is signed so a consumer can tell a
-        pit from a boulder even though the perception stack cannot.
+        `radius` is the hazard radius, not the shape radius. For a bowl the lethal ring is
+        where the wall exceeds the slope limit, well inside the radius that defines the
+        profile. A boulder is a cone -- h*(1 - d/radius) -- so the two differ there too: at
+        the shape radius the rock is 0 m tall, and the system's own definition of an
+        obstacle is `min_obstacle_height`, below which the costmap rates the ground
+        drivable and is right to. Publishing the shape radius made the harness score a
+        collision whenever the body passed over the rock's outermost few centimetres; on
+        the (0,-2) boulder that band is 0.12 m wide, which is under one map cell, so no
+        planner working from a 0.15 m grid could have satisfied it. Height is signed so a
+        consumer can tell a pit from a boulder even though the perception stack cannot.
         """
+        # Must match lunar_traversability's threshold: that node decides what is lethal,
+        # and a hazard radius derived from any other number would measure the mismatch.
+        thresh = rospy.get_param("/lunar_traversability/min_obstacle_height", 0.10)
         data = []
         for rx, ry, radius, h in self.scenario["rocks"]:
-            data += [rx, ry, radius, h]
+            data += [rx, ry, radius * max(0.0, 1.0 - thresh / h), h]
         for cx, cy, _r, depth, _rim, _sharp, hazard_r in self.scenario["craters"]:
             data += [cx, cy, hazard_r, -depth]
         msg = Float32MultiArray()

@@ -62,6 +62,7 @@ public:
         pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
         pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
         pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
+        pnh_.param("goal_snap_clearance", goal_snap_clearance_, 0.25);
         pnh_.param("recovery_fail_threshold", recovery_fail_threshold_, 3);
         pnh_.param("no_progress_timeout", no_progress_timeout_, 6.0);
         pnh_.param("progress_epsilon", progress_epsilon_, 0.10);
@@ -493,12 +494,14 @@ private:
     // Reads the flattened traversability cache; behaviour is identical to a direct grid_map
     // scan, but cells whose slope magnitude is already within the (stricter) lateral limit
     // skip the direction-dependent slope trig entirely.
-    bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false) const {
+    bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false,
+                        double margin = 0.0) const {
         cost = 0.0f; int samples = 0;
         const double r = map_.getResolution();
+        const double half_l = footprint_length_/2 + margin, half_w = footprint_width_/2 + margin;
         const double cyaw = std::cos(yaw), syaw = std::sin(yaw);
-        for(double lx = -footprint_length_/2; lx <= footprint_length_/2 + 1e-6; lx += r) {
-            for(double ly = -footprint_width_/2; ly <= footprint_width_/2 + 1e-6; ly += r) {
+        for(double lx = -half_l; lx <= half_l + 1e-6; lx += r) {
+            for(double ly = -half_w; ly <= half_w + 1e-6; ly += r) {
                 const double wx = x + cyaw*lx - syaw*ly;
                 const double wy = y + syaw*lx + cyaw*ly;
                 grid_map::Index idx;
@@ -754,6 +757,15 @@ private:
     // of the observed region -- even though a pose a few decimetres away is perfectly drivable.
     // This moves the goal; it does NOT relax the collision test. Rings are ordered by distance,
     // so the first ring containing any valid candidate is the best one and the search stops there.
+    //
+    // Candidates are checked with the footprint inflated by goal_snap_clearance_, because
+    // "nearest pose that validates" is by construction a pose on the lethal boundary, and
+    // parking there leaves nothing to absorb the two errors that are always present: the
+    // hazard map is quantised to one cell (a corner can sit 0.106 m past the last cell centre
+    // the check looked at), and the follower stops within goal_yaw_tolerance of the commanded
+    // heading (10 deg of yaw slews a corner 0.12 m further out than the yaw that was checked).
+    // Measured without the margin: the rover parked 0.13 m inside the (0,-2) boulder having
+    // passed its own footprint test. 0.25 m covers both terms with a little left over.
     bool snapGoal(const State& requested, double max_distance, double budget_s,
                   const std::chrono::steady_clock::time_point& begin,
                   State& snapped, double& snap_dist) const {
@@ -782,7 +794,8 @@ private:
                     for(int db = -goal_snap_heading_span_; db <= goal_snap_heading_span_; ++db) {
                         const int t = ((requested.t + db) % bins_ + bins_) % bins_;
                         float cost;
-                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
+                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost, false,
+                                           goal_snap_clearance_)) continue;
                         const double score = dist
                             + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
                             + goal_snap_cost_weight_*(cost/99.0);
@@ -997,7 +1010,7 @@ private:
     std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
     SkidSteerParams sp_;
     double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
-    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
+    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_, goal_snap_clearance_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
 
