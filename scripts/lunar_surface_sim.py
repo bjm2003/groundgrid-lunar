@@ -7,6 +7,11 @@ The other four are the typical-terrain classes the task book asks the comparison
 experiments to cover, and their parameters are derived from the traversability
 thresholds in config/lunar_system.yaml rather than picked by eye -- a scenario
 whose features all fall below the lethal thresholds would measure nothing.
+
+The sensor is a ray-cast rotating multi-beam LiDAR (see `_build_rays`). It replaced a
+uniform Cartesian grid of samples, which produced a costmap that was mostly artefact:
+GroundGrid gates ground-patch detection on azimuth sample density, and a grid coarser
+than the map cell cannot meet that gate at any range.
 """
 
 import math
@@ -120,7 +125,13 @@ class LunarSurfaceSim:
         self.v = self.w = 0.0
         self.sensor_height = float(rospy.get_param("~sensor_height", 1.0))
         self.cloud_radius = float(rospy.get_param("~cloud_radius", 25.0))
-        self.cloud_spacing = float(rospy.get_param("~cloud_spacing", 0.20))
+        self.n_rings = int(rospy.get_param("~n_rings", 64))
+        self.elev_max_deg = float(rospy.get_param("~elev_max_deg", 2.0))
+        self.elev_min_deg = float(rospy.get_param("~elev_min_deg", -24.8))
+        self.azimuth_res_deg = float(rospy.get_param("~azimuth_res_deg", 0.2))
+        self.march_step = float(rospy.get_param("~march_step", 0.30))
+        self.min_range = float(rospy.get_param("~min_range", 1.0))
+        self.cloud_period = float(rospy.get_param("~cloud_period", 0.20))
         self.noise_std = float(rospy.get_param("~noise_std", 0.001))
         # Command saturation (raised for the 5 km/h = 1.39 m/s operating domain).
         self.v_cmd_limit = float(rospy.get_param("~v_cmd_limit", 1.5))
@@ -134,6 +145,7 @@ class LunarSurfaceSim:
         self.slope_slip_gain = float(rospy.get_param("~slope_slip_gain", 0.0))
         self.slope_grade_gain = float(rospy.get_param("~slope_grade_gain", 0.0))
         self.rng = np.random.default_rng(42)
+        self._build_rays()
         self.cloud_pub = rospy.Publisher("/sensors/velodyne_points", PointCloud2, queue_size=1)
         self.odom_pub = rospy.Publisher("/localization/odometry/filtered_map", Odometry, queue_size=1)
         self.obstacle_pub = rospy.Publisher("/lunar_sim/obstacles", Float32MultiArray,
@@ -146,7 +158,34 @@ class LunarSurfaceSim:
                       name, len(self.scenario["rocks"]), len(self.scenario["craters"]),
                       self.x, self.y)
         rospy.Timer(rospy.Duration(0.02), self.update)
-        rospy.Timer(rospy.Duration(0.20), self.publish_cloud)
+        rospy.Timer(rospy.Duration(self.cloud_period), self.publish_cloud)
+
+    def _build_rays(self):
+        """Beam table for a rotating multi-beam LiDAR, sized from GroundGrid's own gates.
+
+        The azimuth step is not a free knob. GroundSegmentation admits a ground patch only
+        when the points in it beat `0.25 * patchSize * atan(1/dist_in_cells)/0.2deg`
+        (GroundSegmentation.cpp:420, with the 0.2 deg fixed in GroundSegmentation.h:92),
+        which is its estimate of how many azimuth samples span one cell. It then needs a
+        non-zero intra-cell variance (:438), so a cell must hold at least two points at
+        different bearings. Sampling coarser than 0.2 deg fails both at every range.
+
+        The elevation span is an HDL-64e's, taken as given rather than trimmed to the beams
+        that pay off on flat ground. It is tempting to drop everything above -1.8 deg, since
+        at the 1.0 m sensor height those beams land past the 25 m cloud radius and return
+        nothing -- but which beams return is a property of the terrain, not the sensor. On
+        the 8.5 deg base tilt of the slope scenario the -1.8 deg beam lands at 5.5 m, and
+        trimming would have capped uphill sensing there without any of it being visible as
+        a parameter. Roughly a sixth of the beams are wasted on level ground; that is the
+        price of the range not silently depending on the slope.
+        """
+        elev = np.deg2rad(np.linspace(self.elev_max_deg, self.elev_min_deg, self.n_rings))
+        az = np.deg2rad(np.arange(0.0, 360.0, self.azimuth_res_deg))
+        self.ray_az = np.tile(az, self.n_rings)
+        self.ray_tan = np.repeat(np.tan(elev), az.size)
+        self.ray_ring = np.repeat(np.arange(self.n_rings, dtype=np.uint16), az.size)
+        rospy.loginfo("lunar_surface_sim: %d beams x %d azimuths = %d rays, march %.2f m",
+                      self.n_rings, az.size, self.ray_az.size, self.march_step)
 
     def publish_obstacles(self):
         """Ground-truth hazard footprints, latched, four floats each: x, y, radius, height.
@@ -173,29 +212,51 @@ class LunarSurfaceSim:
         self.obstacle_pub.publish(msg)
 
     def terrain(self, x, y):
+        """Terrain height. Takes arrays; use height_at() for a single point.
+
+        Craters are applied only to points near them. The bowl and the rim both decay as
+        exp of a power, so beyond three shape radii the correction is below 1e-30 m and
+        skipping it costs nothing -- but evaluating it costs a great deal, because the ray
+        march calls this once per step per live ray and the negative scenario has five
+        craters. Masking took that scenario from 1.05 s per cloud to a quarter of it.
+        """
         tilt, sine_amp, sine_k = self.scenario["base"]
         r_amp, r_kx, r_ky = self.scenario["ripple"]
         z = tilt*x + sine_amp*np.sin(sine_k*y) + r_amp*np.sin(r_kx*x)*np.sin(r_ky*y)
         for cx, cy, radius, depth, rim_h, sharpness, _hazard_r in self.scenario["craters"]:
-            r = np.hypot(x - cx, y - cy)
-            z = z - depth*np.exp(-(r/radius)**sharpness)
+            reach = 3.0*radius + 2.0
+            near = (np.abs(x - cx) < reach) & (np.abs(y - cy) < reach)
+            if not near.any():
+                continue
+            r = np.hypot(x[near] - cx, y[near] - cy)
+            # Bowl then rim, in that order and as separate updates, so the result is
+            # bit-identical to the unmasked form. mixed is the regression baseline for
+            # every measurement taken so far and must not move even by an ULP.
+            z[near] -= depth*np.exp(-(r/radius)**sharpness)
             if rim_h:
-                z = z + rim_h*np.exp(-((r - (radius + 0.6))/0.65)**2)
+                z[near] += rim_h*np.exp(-((r - (radius + 0.6))/0.65)**2)
         return z
+
+    def height_at(self, x, y):
+        return float(self.terrain(np.array([x], dtype=float), np.array([y], dtype=float))[0])
 
     def rocks(self, x, y):
         height = np.zeros_like(x)
         for rx, ry, radius, h in self.scenario["rocks"]:
-            d = np.hypot(x-rx, y-ry)
-            height = np.maximum(height, h*np.clip(1.0-d/radius, 0.0, 1.0))
+            near = (np.abs(x - rx) < radius) & (np.abs(y - ry) < radius)
+            if not near.any():
+                continue
+            d = np.hypot(x[near] - rx, y[near] - ry)
+            height[near] = np.maximum(height[near], h*(1.0 - d/radius))
         return height
 
+    def ground_height(self, x, y):
+        return self.terrain(x, y) + self.rocks(x, y)
+
     def terrain_gradient(self, x, y, eps=0.05):
-        gx = (self.terrain(np.array(x+eps), np.array(y)) -
-              self.terrain(np.array(x-eps), np.array(y))) / (2.0*eps)
-        gy = (self.terrain(np.array(x), np.array(y+eps)) -
-              self.terrain(np.array(x), np.array(y-eps))) / (2.0*eps)
-        return float(gx), float(gy)
+        gx = (self.height_at(x+eps, y) - self.height_at(x-eps, y)) / (2.0*eps)
+        gy = (self.height_at(x, y+eps) - self.height_at(x, y-eps)) / (2.0*eps)
+        return gx, gy
 
     def on_cmd(self, msg):
         with self.lock:
@@ -222,7 +283,7 @@ class LunarSurfaceSim:
             self.y += (s*vx + c*vy)*dt
             self.yaw += omega*dt
             x, y, yaw = self.x, self.y, self.yaw
-        z = float(self.terrain(np.array(x), np.array(y)))
+        z = self.height_at(x, y)
         q = tf.transformations.quaternion_from_euler(0.0, 0.0, yaw)
         self.br.sendTransform((x, y, z), q, now, "base_link", "map")
         self.br.sendTransform((0.0, 0.0, self.sensor_height), (0, 0, 0, 1),
@@ -237,21 +298,55 @@ class LunarSurfaceSim:
         self.odom_pub.publish(odom)
 
     def publish_cloud(self, _event):
+        """March every beam out from the sensor and keep the first surface it meets.
+
+        Marching outward rather than evaluating the terrain under each sample point is
+        what buys occlusion: a beam stopped by a boulder never reports the ground behind
+        it, and a shallow beam skims over the far wall of a pit instead of seeing into it.
+        The old sampler had every surface visible at all times, which made the negative
+        obstacle scenario far easier than it should be.
+
+        The active set only ever shrinks, and steep beams terminate within a few metres,
+        so the march costs about a tenth of the naive rays x steps product.
+        """
         with self.lock:
             x0, y0, yaw = self.x, self.y, self.yaw
-        values = np.arange(-self.cloud_radius, self.cloud_radius+self.cloud_spacing,
-                           self.cloud_spacing, dtype=np.float32)
-        lx, ly = np.meshgrid(values, values, indexing="xy")
-        mask = lx*lx + ly*ly <= self.cloud_radius*self.cloud_radius
-        lx, ly = lx[mask], ly[mask]
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        wx, wy = x0 + cy*lx - sy*ly, y0 + sy*lx + cy*ly
-        wz = self.terrain(wx, wy) + self.rocks(wx, wy)
-        sensor_ground = float(self.terrain(np.array(x0), np.array(y0))) + self.sensor_height
-        lz = wz - sensor_ground + self.rng.normal(0.0, self.noise_std, wz.shape)
-        rings = np.mod((np.hypot(lx, ly)/self.cloud_spacing).astype(np.uint16), 32)
-        points = list(zip(lx.tolist(), ly.tolist(), lz.astype(np.float32).tolist(),
-                          np.full(lx.shape, 30.0, np.float32).tolist(), rings.tolist()))
+        z_sensor = self.height_at(x0, y0) + self.sensor_height
+        caz, saz = np.cos(self.ray_az + yaw), np.sin(self.ray_az + yaw)
+
+        hit = np.full(self.ray_az.size, np.nan)
+        rh = rh_prev = self.min_range
+        gap = (z_sensor + rh*self.ray_tan) - self.ground_height(x0 + rh*caz, y0 + rh*saz)
+        idx = np.flatnonzero(gap > 0.0)
+        gap_prev = gap[idx]
+
+        while idx.size and rh + self.march_step <= self.cloud_radius:
+            rh += self.march_step
+            gap = ((z_sensor + rh*self.ray_tan[idx]) -
+                   self.ground_height(x0 + rh*caz[idx], y0 + rh*saz[idx]))
+            below = gap <= 0.0
+            if below.any():
+                # gap_prev > 0 >= gap holds by construction, so the bracket has a root.
+                gp, g = gap_prev[below], gap[below]
+                hit[idx[below]] = rh_prev + self.march_step*(gp/(gp - g))
+                keep = ~below
+                idx, gap_prev = idx[keep], gap[keep]
+            else:
+                gap_prev = gap
+            rh_prev = rh
+
+        got = np.flatnonzero(~np.isnan(hit))
+        if got.size == 0:
+            rospy.logwarn_throttle(5.0, "lunar_surface_sim: no beam returned a point")
+            return
+        rho = hit[got]
+        lx = (rho*np.cos(self.ray_az[got])).astype(np.float32)
+        ly = (rho*np.sin(self.ray_az[got])).astype(np.float32)
+        lz = (rho*self.ray_tan[got] +
+              self.rng.normal(0.0, self.noise_std, rho.shape)).astype(np.float32)
+        points = list(zip(lx.tolist(), ly.tolist(), lz.tolist(),
+                          np.full(got.size, 30.0, np.float32).tolist(),
+                          self.ray_ring[got].tolist()))
         fields = [PointField("x",0,PointField.FLOAT32,1),
                   PointField("y",4,PointField.FLOAT32,1),
                   PointField("z",8,PointField.FLOAT32,1),
