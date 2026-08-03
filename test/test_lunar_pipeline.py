@@ -109,6 +109,18 @@ STRICT_SCENARIOS = ("mixed", "flat")
 REACH_TOLERANCE = 0.5
 NOMINAL_STATUSES = ("success", "success_snapped")
 
+# A published path counts as "the route for this trial" only if it starts where the trial
+# started and ends at the trial's goal. Without this, 路径长度偏差 measured whatever path
+# happened to arrive first after the goal was sent -- usually a straggling replan of the
+# previous goal or a recovery manoeuvre, both far shorter than the leg they were credited
+# to, which is how the ratio came out at -0.31 (a route shorter than the straight line it
+# is compared against is not a detour, it is the wrong path).
+# The start tolerance is one body length: the rover keeps moving while the goal is in
+# flight. The end tolerance covers a snapped goal (max_snap_distance 1.5 m, doubled by the
+# Relax rung) plus the follower's position tolerance.
+ROUTE_START_TOLERANCE = 2.0
+ROUTE_END_TOLERANCE = 3.5
+
 
 def _yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -153,6 +165,9 @@ class LunarPipelineTest(unittest.TestCase):
         self.first_success_time = None
         self.plan_ms = []
         self.plan_path_len = None
+        self.route_from = None
+        self.route_to = None
+        self.path_seen = False
         self.profile_ok = False
         self.cpu_pct = []
         self.rss_mb = []
@@ -179,13 +194,24 @@ class LunarPipelineTest(unittest.TestCase):
     def _on_path(self, msg):
         with self.lock:
             self.last_path = msg
+            if len(msg.poses) > 0:
+                self.path_seen = True
             # The first plan after a goal is the whole route; later ones are the shrinking
             # remainder, so only the first is comparable against the straight-line distance.
-            if self.plan_path_len is None and msg.poses:
-                self.plan_path_len = sum(
-                    math.hypot(b.pose.position.x - a.pose.position.x,
-                               b.pose.position.y - a.pose.position.y)
-                    for a, b in zip(msg.poses, msg.poses[1:]))
+            # It has to be a plan *for this trial* -- see ROUTE_START_TOLERANCE.
+            if self.plan_path_len is None and len(msg.poses) > 1 and self.route_to:
+                first = msg.poses[0].pose.position
+                last = msg.poses[-1].pose.position
+                gx, gy = self.route_to
+                x0, y0 = self.route_from
+                if (math.hypot(first.x - x0, first.y - y0) <= ROUTE_START_TOLERANCE and
+                        math.hypot(last.x - gx, last.y - gy) <= ROUTE_END_TOLERANCE and
+                        math.hypot(last.x - gx, last.y - gy) <
+                        math.hypot(first.x - gx, first.y - gy)):
+                    self.plan_path_len = sum(
+                        math.hypot(b.pose.position.x - a.pose.position.x,
+                                   b.pose.position.y - a.pose.position.y)
+                        for a, b in zip(msg.poses, msg.poses[1:]))
 
     def _on_vel(self, msg):
         with self.lock:
@@ -276,6 +302,9 @@ class LunarPipelineTest(unittest.TestCase):
             self.first_success_time = None
             self.plan_ms = []
             self.plan_path_len = None
+            self.route_from = None
+            self.route_to = None
+            self.path_seen = False
             self.profile_ok = False
 
     def _run_trial(self, gx, gy, gyaw, timeout):
@@ -294,6 +323,9 @@ class LunarPipelineTest(unittest.TestCase):
         goal.pose.position.y = gy
         goal.pose.orientation.z = math.sin(gyaw / 2.0)
         goal.pose.orientation.w = math.cos(gyaw / 2.0)
+        with self.lock:
+            self.route_from = (x0, y0)
+            self.route_to = (gx, gy)
         pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1, latch=True)
         # Published exactly once. Re-sending would reset the planner's stuck-detection
         # state on every tick, so recovery could never trigger and the recovery-rate
@@ -343,6 +375,7 @@ class LunarPipelineTest(unittest.TestCase):
             statuses = set(self.statuses)
             plan_ms = list(self.plan_ms)
             path_len = self.plan_path_len
+            path_seen = self.path_seen
             profile_ok = self.profile_ok
         straight = math.hypot(gx - x0, gy - y0)
         # Relative to the straight line, so it is comparable across legs of different
@@ -356,7 +389,9 @@ class LunarPipelineTest(unittest.TestCase):
             "planned": any(s.startswith("success") for s in statuses),
             "statuses": statuses,
             "anomaly": any(s not in NOMINAL_STATUSES for s in statuses),
-            "produced_path": path_len is not None,
+            # Any path at all, including recovery manoeuvres: this feeds 输出达标率, which
+            # is about the follower's (v, w)-per-pose invariant, not about route quality.
+            "produced_path": path_seen,
             "profile_ok": profile_ok,
             "latency": latency,
             "plan_ms": plan_ms,
@@ -463,9 +498,17 @@ class LunarPipelineTest(unittest.TestCase):
         # the trial got where it was going without ever putting the body inside a hazard,
         # and it is only meaningful where clearance was actually measurable.
         measured = [t for t in every if t["measured_clearance"]]
-        avoid_rate = (sum(1 for t in measured if t["reached"] and not t["collided"])
-                      / len(measured)) if measured else float("nan")
         collisions = [t for t in measured if t["collided"]]
+        # A goal the planner correctly declared unreachable never became an avoidance
+        # attempt, so it does not belong in the denominator -- same argument as
+        # `recoverable` above. Without this the metric read exactly `reach_rate` (0.75 for
+        # both, with zero collisions), i.e. it was measuring how hard the hard goals are.
+        # A trial that collided stays in regardless of how it ended: aborting after driving
+        # through a rock must not erase the collision.
+        attempted = [t for t in measured
+                     if t["collided"] or t["reached"] or "aborted" not in t["statuses"]]
+        avoid_rate = (sum(1 for t in attempted if not t["collided"]) / len(attempted)
+                      if attempted else float("nan"))
 
         with self.lock:
             cpu = list(self.cpu_pct)
@@ -503,7 +546,8 @@ class LunarPipelineTest(unittest.TestCase):
         counts = {"trials": len(every), "tour": len(tour), "hard": len(hard),
                   "recovery_events": events, "recovery_successes": successes,
                   "recovery_aborts": aborts, "collisions": len(collisions),
-                  "clearance_measured": len(measured), "paths_emitted": len(emitted)}
+                  "clearance_measured": len(measured),
+                  "avoidance_attempts": len(attempted), "paths_emitted": len(emitted)}
         # Carried in the summary itself (not just the per-trial dump) so the assertion
         # message can name the offending goal and rock on the console.
         collided = [{"goal": list(t["goal"]), "clearance_min_m": t["clearance_min"],
@@ -518,10 +562,10 @@ class LunarPipelineTest(unittest.TestCase):
                       sum(1 for t in every if t["planned"]), len(every))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
-        rospy.loginfo("  避障成功率        = %.3f (%d reached without collision / %d measured; "
-                      "%d collisions)", avoid_rate,
-                      sum(1 for t in measured if t["reached"] and not t["collided"]),
-                      len(measured), len(collisions))
+        rospy.loginfo("  避障成功率        = %.3f (%d collision-free / %d attempts; "
+                      "%d measured, %d correctly aborted)", avoid_rate,
+                      sum(1 for t in attempted if not t["collided"]), len(attempted),
+                      len(measured), len(measured) - len(attempted))
         rospy.loginfo("  近障恢复率        = %.3f (%d recovered / %d recoverable; "
                       "%d entered, %d aborted as unreachable)",
                       recovery_rate, successes, recoverable, events, aborts)
