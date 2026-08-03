@@ -765,7 +765,8 @@ private:
     // the check looked at), and the follower stops within goal_yaw_tolerance of the commanded
     // heading (10 deg of yaw slews a corner 0.12 m further out than the yaw that was checked).
     // Measured without the margin: the rover parked 0.13 m inside the (0,-2) boulder having
-    // passed its own footprint test. 0.25 m covers both terms with a little left over.
+    // passed its own footprint test. 0.25 m covers both terms with a little left over. The
+    // margin band tolerates unobserved cells -- see the call site.
     bool snapGoal(const State& requested, double max_distance, double budget_s,
                   const std::chrono::steady_clock::time_point& begin,
                   State& snapped, double& snap_dist) const {
@@ -793,8 +794,17 @@ private:
                     if(dist > max_distance) continue;
                     for(int db = -goal_snap_heading_span_; db <= goal_snap_heading_span_; ++db) {
                         const int t = ((requested.t + db) % bins_ + bins_) % bins_;
-                        float cost;
-                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost, false,
+                        float cost, dummy;
+                        // The body itself must stand on known drivable ground, strictly.
+                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
+                        // The margin band only has to be free of *known* hazards. Applying
+                        // the strict test to it as well would have demanded 0.25 m of
+                        // observed ground beyond the body, which is precisely what a goal in
+                        // an occlusion shadow cannot offer -- and standing 0.25 m from an
+                        // unobserved cell is a knowledge gap, not a collision risk. The band
+                        // exists to absorb cell quantisation and the follower's yaw
+                        // tolerance against hazards the map does show.
+                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), dummy, true,
                                            goal_snap_clearance_)) continue;
                         const double score = dist
                             + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
