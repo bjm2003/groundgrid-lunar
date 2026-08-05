@@ -65,6 +65,15 @@ HARD_GOALS = [(-1.2, -2.0, 0.0),
               (8.0, -5.0, 0.0),
               (3.0, 0.0, math.pi / 4)]
 
+# Goals whose correct outcome is failure. (3.0, 0.0) sits 2.83 m from the crater centre,
+# inside the 3.2 m bowl, where the wall runs at 40 deg against a 20 deg limit -- there is
+# no solution and Abort is the right answer. Counting that as a 规划成功率 failure caps the
+# metric at 15/16 = 0.9375 against a 0.90 bar, so the designed outcome alone consumed all
+# the headroom and one ordinary flake failed the run. They are excluded from the rate and
+# asserted on directly instead, which is the stricter test: the run now fails if the
+# planner *succeeds* here, which the old form could not detect at all.
+UNREACHABLE_GOALS = {(3.0, 0.0)}
+
 # Corridor intersections of the 4.0 m boulder grid: the columns sit near x = -6,-2,2,6 and
 # the rows near y = -10,-6,-2, so x = -4,0,4 and y = -8,-4 are the gaps. Every waypoint
 # below clears the nearest boulder by ~0.5 m after the body diagonal, and the longest leg
@@ -165,6 +174,7 @@ class LunarPipelineTest(unittest.TestCase):
         self.first_success_time = None
         self.plan_ms = []
         self.plan_path_len = None
+        self.plan_chord = None
         self.route_from = None
         self.route_to = None
         self.path_seen = False
@@ -212,6 +222,15 @@ class LunarPipelineTest(unittest.TestCase):
                         math.hypot(b.pose.position.x - a.pose.position.x,
                                    b.pose.position.y - a.pose.position.y)
                         for a, b in zip(msg.poses, msg.poses[1:]))
+                    # The chord of this path, not the trial's start-to-goal line. Those
+                    # differ by the metre or so the rover covers while the goal is in
+                    # flight and by however far the goal had to be snapped, and both
+                    # differences are subtracted from the route without being subtracted
+                    # from the line, which is what drove the ratio negative. Against its
+                    # own chord the quantity is a detour by construction: >= 0, zero for a
+                    # straight run, and positive only where the planner routed around
+                    # something.
+                    self.plan_chord = math.hypot(last.x - first.x, last.y - first.y)
 
     def _on_vel(self, msg):
         with self.lock:
@@ -302,6 +321,7 @@ class LunarPipelineTest(unittest.TestCase):
             self.first_success_time = None
             self.plan_ms = []
             self.plan_path_len = None
+            self.plan_chord = None
             self.route_from = None
             self.route_to = None
             self.path_seen = False
@@ -375,13 +395,13 @@ class LunarPipelineTest(unittest.TestCase):
             statuses = set(self.statuses)
             plan_ms = list(self.plan_ms)
             path_len = self.plan_path_len
+            chord = self.plan_chord
             path_seen = self.path_seen
             profile_ok = self.profile_ok
-        straight = math.hypot(gx - x0, gy - y0)
-        # Relative to the straight line, so it is comparable across legs of different
-        # lengths. Undefined when the goal is where the rover already stands.
-        detour = ((path_len - straight) / straight
-                  if path_len is not None and straight > 1e-3 else float("nan"))
+        # Relative, so legs of different lengths are comparable. Undefined when no route
+        # for this goal was captured, or when it was a turn on the spot.
+        detour = ((path_len - chord) / chord
+                  if path_len is not None and chord > 1e-3 else float("nan"))
         return {
             "goal": (gx, gy),
             "start": (x0, y0),
@@ -396,7 +416,7 @@ class LunarPipelineTest(unittest.TestCase):
             "latency": latency,
             "plan_ms": plan_ms,
             "path_len": path_len if path_len is not None else float("nan"),
-            "straight": straight,
+            "chord": chord if chord is not None else float("nan"),
             "detour": detour,
             "driven": driven,
             "recovery_events": self._counter("recovery_events") - events0,
@@ -479,12 +499,14 @@ class LunarPipelineTest(unittest.TestCase):
         every = tour + hard
         report = self._report(every, tour, hard)
         self._dump(report, every)
-        self._assert(report, tour)
+        self._assert(report, tour, every)
 
     def _report(self, every, tour, hard):
         """Compute and log every task-book metric; returns the JSON-serialisable summary."""
         tour_rate = sum(1 for t in tour if t["planned"]) / len(tour)
-        overall_rate = sum(1 for t in every if t["planned"]) / len(every)
+        # Goals with no solution are scored separately, by assertion. See UNREACHABLE_GOALS.
+        solvable = [t for t in every if tuple(t["goal"]) not in UNREACHABLE_GOALS]
+        overall_rate = sum(1 for t in solvable if t["planned"]) / len(solvable)
         events = sum(t["recovery_events"] for t in every)
         successes = sum(t["recovery_successes"] for t in every)
         aborts = sum(t["recovery_aborts"] for t in every)
@@ -544,6 +566,7 @@ class LunarPipelineTest(unittest.TestCase):
             "output_conformance": conformance,
         }
         counts = {"trials": len(every), "tour": len(tour), "hard": len(hard),
+                  "solvable": len(solvable),
                   "recovery_events": events, "recovery_successes": successes,
                   "recovery_aborts": aborts, "collisions": len(collisions),
                   "clearance_measured": len(measured),
@@ -558,8 +581,9 @@ class LunarPipelineTest(unittest.TestCase):
                       self.scenario, len(every))
         rospy.loginfo("  规划成功率 tour   = %.3f (%d/%d)", tour_rate,
                       sum(1 for t in tour if t["planned"]), len(tour))
-        rospy.loginfo("  规划成功率 all    = %.3f (%d/%d)", overall_rate,
-                      sum(1 for t in every if t["planned"]), len(every))
+        rospy.loginfo("  规划成功率 all    = %.3f (%d/%d solvable; %d unsolvable by design)",
+                      overall_rate, sum(1 for t in solvable if t["planned"]), len(solvable),
+                      len(every) - len(solvable))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
         rospy.loginfo("  避障成功率        = %.3f (%d collision-free / %d attempts; "
@@ -612,7 +636,7 @@ class LunarPipelineTest(unittest.TestCase):
              "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
              "statuses": sorted(t["statuses"]),
              "latency_s": t["latency"], "path_len_m": t["path_len"],
-             "straight_m": t["straight"], "detour_ratio": t["detour"],
+             "chord_m": t["chord"], "detour_ratio": t["detour"],
              "driven_m": t["driven"], "rmse_m": t["rmse"],
              "clearance_mean_m": t["clearance_mean"], "clearance_min_m": t["clearance_min"],
              "plan_ms": t["plan_ms"]}
@@ -629,7 +653,7 @@ class LunarPipelineTest(unittest.TestCase):
         except OSError as exc:
             rospy.logwarn("could not write metrics to %s: %s", path, exc)
 
-    def _assert(self, report, tour):
+    def _assert(self, report, tour, every):
         rates, metrics = report["rates"], report["metrics"]
         # Never allowed anywhere: driving the body through a ground-truth hazard.
         # rostest only echoes the assertion message, so the offenders go in it.
@@ -646,6 +670,20 @@ class LunarPipelineTest(unittest.TestCase):
             # declares reachable goals unreachable. Open terrain must never abort.
             self.assertFalse([t for t in tour if "aborted" in t["statuses"]],
                              "an open-terrain goal was aborted")
+            # And the converse, now that these goals no longer sit in the rate: a goal
+            # inside a 40 deg crater wall must be refused, not driven to. Reaching one
+            # would mean the slope limit is not being enforced.
+            for t in every:
+                if tuple(t["goal"]) in UNREACHABLE_GOALS:
+                    self.assertFalse(t["reached"],
+                                     "goal (%.1f, %.1f) has no legal solution but the rover "
+                                     "reached it: the slope limit is not being enforced"
+                                     % t["goal"])
+                    self.assertIn("aborted", t["statuses"],
+                                  "goal (%.1f, %.1f) has no solution; the planner should "
+                                  "escalate to Abort rather than retry, got [%s]"
+                                  % (t["goal"][0], t["goal"][1],
+                                     ",".join(sorted(t["statuses"]))))
         else:
             rospy.logwarn("scenario '%s' is a marginal terrain class: 规划成功率 %.3f "
                           "reported, not asserted", self.scenario,
