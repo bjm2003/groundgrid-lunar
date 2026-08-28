@@ -14,14 +14,15 @@
 
     <buildtool_depend>catkin</buildtool_depend>
 
-    <build_depend>roscpp</build_depend>
-
-    <build_depend>geometry_msgs</build_depend>
-    <build_depend>sensor_msgs</build_depend>
-    <build_depend>std_msgs</build_depend>
+    <depend>roscpp</depend>
+    <depend>geometry_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>std_msgs</depend>
     <build_depend>message_generation</build_depend>
+    <build_export_depend>message_runtime</build_export_depend>
     <exec_depend>message_runtime</exec_depend>
     <test_depend>rostest</test_depend>
+    <test_depend>python3-nose</test_depend>
 
     <depend>nodelet</depend>
     <depend>dynamic_reconfigure</depend>
@@ -41,6 +42,7 @@
     <depend>image_transport</depend>
     <depend>tf2</depend>
     <depend>tf2_ros</depend>
+    <depend>tf2_msgs</depend>
     <depend>tf2_geometry_msgs</depend>
     <depend>roslib</depend>
 

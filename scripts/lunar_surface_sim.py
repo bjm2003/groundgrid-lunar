@@ -26,87 +26,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs import point_cloud2
 from std_msgs.msg import Float32MultiArray, Header, MultiArrayDimension
 
-
-def _dense_rocks():
-    """Jittered 4x3 grid of boulders with corridors that provably admit a solution.
-
-    The 4.0 m pitch is derived, not tuned. The offsets are written out rather than drawn
-    from an RNG so the layout can be checked by reading it: the closest two centres are
-    3.52 m apart, perception smears a boulder over its 3-cell step-height window so the
-    effective lethal radius is about 0.5 + 0.3 m, and that leaves a 1.92 m gap against a
-    1.5 m body -- tight, but never closed. A field that could seal shut would make
-    规划成功率 measure the layout instead of the planner.
-    """
-    return [(-6.25, -9.78, 0.5, 0.5), (-5.72, -6.19, 0.5, 0.5), (-6.18, -1.75, 0.5, 0.5),
-            (-1.78, -10.24, 0.5, 0.5), (-2.21, -5.80, 0.5, 0.5), (-1.73, -2.22, 0.5, 0.5),
-            (2.19, -9.75, 0.5, 0.5), (1.76, -6.26, 0.5, 0.5), (2.24, -1.79, 0.5, 0.5),
-            (5.75, -10.18, 0.5, 0.5), (6.22, -5.77, 0.5, 0.5), (5.80, -2.20, 0.5, 0.5)]
-
-
-# crater tuple: (x, y, radius, depth, rim_height, sharpness, hazard_radius)
-# rock tuple:   (x, y, radius, height)
-SCENARIOS = {
-    # Byte-for-byte the terrain every earlier measurement was taken on.
-    "mixed": {
-        "base": (0.025, 0.15, 0.12),          # tilt_x, sine_amp, sine_k (in y)
-        "ripple": (0.05, 0.7, 0.5),           # amp, kx, ky
-        # hazard_radius 2.0 is where the bowl wall passes the 20 deg limit
-        # (|dz/dr| = 1.8*4r^3/3.2^4*exp(-(r/3.2)^4) reaches tan20 near r=1.85);
-        # the 3.2 in the profile is the shape radius, which is much wider.
-        "craters": [(5.0, 2.0, 3.2, 1.8, 0.55, 4, 2.0)],
-        "rocks": [(0.0, -2.0, 0.65, 0.55),
-                  (8.0, -5.0, 0.9, 0.75),
-                  (-3.0, 5.0, 0.5, 0.40)],
-        "start": (-10.0, -6.0, 0.0),
-    },
-    # 平坦区域: everywhere traversable. The baseline for 路径长度偏差 -- the detour
-    # ratio here should be ~0, which is the only direct evidence of search optimality.
-    "flat": {
-        "base": (0.01, 0.02, 0.10),
-        "ripple": (0.03, 0.4, 0.35),
-        "craters": [],
-        "rocks": [],
-        "start": (-10.0, -6.0, 0.0),
-    },
-    # 密集障碍区: the main test of 避障成功率. The start is west of the field and on the
-    # y=-8.0 corridor centreline, so the rover begins outside the boulders and has to
-    # thread them rather than starting already boxed in.
-    "dense": {
-        "base": (0.01, 0.03, 0.10),
-        "ripple": (0.03, 0.4, 0.35),
-        "craters": [],
-        "rocks": _dense_rocks(),
-        "start": (-11.0, -8.0, 0.0),
-    },
-    # 大坡度起伏区: amp*k = 1.2*0.35 = 0.42 -> 22.8 deg, straddling the 20 deg limit,
-    # so some slopes are climbable and some are not and routing actually matters. That
-    # also means the start cannot be the shared (-10,-6): the gradient there is 0.541
-    # (28.4 deg), outside the limit, and the rover would be unable to move at all. The
-    # start sits in the largest passable component instead (x -5..5, y -12..1), at a
-    # point measuring 15.2 deg.
-    "slope": {
-        "base": (0.15, 0.30, 0.09),
-        "ripple": (1.2, 0.35, 0.28),
-        "craters": [],
-        "rocks": [],
-        "start": (0.0, -5.5, 0.0),
-    },
-    # 负障碍物集中区: super-Gaussian (sharpness 6) gives near-vertical walls, well over
-    # the 0.20 m step limit measured across a 3-cell 0.15 m window. Note the perception
-    # stack cannot tell a pit from a boulder -- GroundSegmentation computes step_height
-    # as an unsigned max-min -- so this scenario measures avoidance, not classification.
-    "negative": {
-        "base": (0.01, 0.04, 0.10),
-        "ripple": (0.03, 0.4, 0.35),
-        "craters": [(-4.0, -3.0, 1.5, 1.2, 0.0, 6, 1.5),
-                    (-1.0, -6.5, 1.6, 1.2, 0.0, 6, 1.6),
-                    (2.0, -3.5, 1.4, 1.0, 0.0, 6, 1.4),
-                    (-5.5, -8.5, 1.5, 1.1, 0.0, 6, 1.5),
-                    (1.0, -9.0, 1.5, 1.2, 0.0, 6, 1.5)],
-        "rocks": [],
-        "start": (-10.0, -6.0, 0.0),
-    },
-}
+from lunar_terrain import AnalyticLunarTerrain, SCENARIOS
 
 
 class LunarSurfaceSim:
@@ -118,6 +38,7 @@ class LunarSurfaceSim:
             name = "mixed"
         self.scenario_name = name
         self.scenario = SCENARIOS[name]
+        self.terrain_model = AnalyticLunarTerrain(self.scenario)
         sx, sy, syaw = self.scenario["start"]
         self.x = float(rospy.get_param("~initial_x", sx))
         self.y = float(rospy.get_param("~initial_y", sy))
@@ -221,51 +142,19 @@ class LunarSurfaceSim:
         self.obstacle_pub.publish(msg)
 
     def terrain(self, x, y):
-        """Terrain height. Takes arrays; use height_at() for a single point.
-
-        Craters are applied only to points near them. The bowl and the rim both decay as
-        exp of a power, so beyond three shape radii the correction is below 1e-30 m and
-        skipping it costs nothing -- but evaluating it costs a great deal, because the ray
-        march calls this once per step per live ray and the negative scenario has five
-        craters. Masking took that scenario from 1.05 s per cloud to a quarter of it.
-        """
-        tilt, sine_amp, sine_k = self.scenario["base"]
-        r_amp, r_kx, r_ky = self.scenario["ripple"]
-        z = tilt*x + sine_amp*np.sin(sine_k*y) + r_amp*np.sin(r_kx*x)*np.sin(r_ky*y)
-        for cx, cy, radius, depth, rim_h, sharpness, _hazard_r in self.scenario["craters"]:
-            reach = 3.0*radius + 2.0
-            near = (np.abs(x - cx) < reach) & (np.abs(y - cy) < reach)
-            if not near.any():
-                continue
-            r = np.hypot(x[near] - cx, y[near] - cy)
-            # Bowl then rim, in that order and as separate updates, so the result is
-            # bit-identical to the unmasked form. mixed is the regression baseline for
-            # every measurement taken so far and must not move even by an ULP.
-            z[near] -= depth*np.exp(-(r/radius)**sharpness)
-            if rim_h:
-                z[near] += rim_h*np.exp(-((r - (radius + 0.6))/0.65)**2)
-        return z
+        return self.terrain_model.terrain(x, y)
 
     def height_at(self, x, y):
-        return float(self.terrain(np.array([x], dtype=float), np.array([y], dtype=float))[0])
+        return self.terrain_model.height_at(x, y)
 
     def rocks(self, x, y):
-        height = np.zeros_like(x)
-        for rx, ry, radius, h in self.scenario["rocks"]:
-            near = (np.abs(x - rx) < radius) & (np.abs(y - ry) < radius)
-            if not near.any():
-                continue
-            d = np.hypot(x[near] - rx, y[near] - ry)
-            height[near] = np.maximum(height[near], h*(1.0 - d/radius))
-        return height
+        return self.terrain_model.rocks(x, y)
 
     def ground_height(self, x, y):
-        return self.terrain(x, y) + self.rocks(x, y)
+        return self.terrain_model.ground_height(x, y)
 
     def terrain_gradient(self, x, y, eps=0.05):
-        gx = (self.height_at(x+eps, y) - self.height_at(x-eps, y)) / (2.0*eps)
-        gy = (self.height_at(x, y+eps) - self.height_at(x, y-eps)) / (2.0*eps)
-        return gx, gy
+        return self.terrain_model.terrain_gradient(x, y, eps)
 
     def on_cmd(self, msg):
         with self.lock:

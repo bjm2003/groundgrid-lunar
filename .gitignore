@@ -3,6 +3,7 @@ build/
 devel/
 install/
 logs/
+roslog/
 .catkin_workspace
 .catkin_tools/
 

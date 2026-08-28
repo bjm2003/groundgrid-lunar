@@ -13,6 +13,7 @@
 
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Twist.h>
 #include <nav_msgs/GetPlan.h>
 #include <nav_msgs/Path.h>
 #include <std_msgs/String.h>
@@ -25,6 +26,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include "groundgrid/MotionPrimitiveLibrary.h"
+#include "groundgrid/LunarTrajectory.h"
 
 namespace groundgrid {
 
@@ -87,6 +89,11 @@ public:
         nh_.param("skid_steer_model/w_max", sp_.w_max, sp_.w_max);
         nh_.param("skid_steer_model/a_max", sp_.a_max, sp_.a_max);
         nh_.param("skid_steer_model/alpha_max", sp_.alpha_max, sp_.alpha_max);
+        nh_.param("skid_steer_model/x_icr", sp_.x_icr, sp_.x_icr);
+        nh_.param("skid_steer_model/alpha_v", sp_.alpha_v, sp_.alpha_v);
+        nh_.param("skid_steer_model/alpha_w", sp_.alpha_w, sp_.alpha_w);
+        nh_.param("skid_steer_model/slope_slip_gain", sp_.slope_slip_gain, sp_.slope_slip_gain);
+        nh_.param("skid_steer_model/slope_grade_gain", sp_.slope_grade_gain, sp_.slope_grade_gain);
 
         if(use_dynamics_primitives_) {
             if(motion_primitive_file_.empty() || !primitive_lib_.load(motion_primitive_file_)) {
@@ -107,6 +114,7 @@ public:
         goal_sub_ = nh_.subscribe("/move_base_simple/goal", 1, &StateLatticePlannerNode::goalCallback, this);
         path_pub_ = nh_.advertise<nav_msgs::Path>("/lunar_planner/path", 1, true);
         vel_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/lunar_planner/velocity_profile", 1, true);
+        trajectory_pub_ = nh_.advertise<groundgrid::LunarTrajectory>("/lunar_planner/trajectory", 1, true);
         status_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/status", 1, true);
         snapped_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/lunar_planner/snapped_goal", 1, true);
         diag_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/diagnostics", 1, true);
@@ -128,6 +136,51 @@ private:
 
     void publishStatus(const std::string& text) {
         std_msgs::String msg; msg.data = text; status_pub_.publish(msg);
+    }
+
+    // Publish one atomic trajectory for control, plus the two legacy topics retained for
+    // RViz and existing metric tooling. Invalid planner output becomes an empty trajectory,
+    // which makes the follower fail safe instead of pairing unrelated latched messages.
+    void publishPlanOutputs(const nav_msgs::Path& path,
+                            const std_msgs::Float32MultiArray& profile) {
+        path_pub_.publish(path);
+        vel_pub_.publish(profile);
+
+        groundgrid::LunarTrajectory trajectory;
+        trajectory.path = path;
+        const bool matched = profile.data.size() == path.poses.size()*2;
+        bool finite = matched;
+        for(const auto& stamped_pose : path.poses) {
+            const auto& p = stamped_pose.pose.position;
+            const auto& q = stamped_pose.pose.orientation;
+            if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+               !std::isfinite(q.x) || !std::isfinite(q.y) ||
+               !std::isfinite(q.z) || !std::isfinite(q.w)) {
+                finite = false;
+                break;
+            }
+        }
+        if(matched) {
+            trajectory.twists.resize(path.poses.size());
+            for(size_t i=0; i<path.poses.size(); ++i) {
+                const float v = profile.data[2*i];
+                const float w = profile.data[2*i+1];
+                if(!std::isfinite(v) || !std::isfinite(w) ||
+                   std::abs(v) > sp_.v_max+1e-6 || std::abs(w) > sp_.w_max+1e-6) {
+                    finite = false;
+                    break;
+                }
+                trajectory.twists[i].linear.x = v;
+                trajectory.twists[i].angular.z = w;
+            }
+        }
+        if(!finite) {
+            ROS_ERROR_THROTTLE(1.0, "planner produced an invalid trajectory: %zu poses, %zu velocity values",
+                               path.poses.size(), profile.data.size());
+            trajectory.path.poses.clear();
+            trajectory.twists.clear();
+        }
+        trajectory_pub_.publish(trajectory);
     }
 
     static const char* modeName(PlannerMode m) {
@@ -440,7 +493,7 @@ private:
             // never escalate to Abort -- a hopeless goal would be retried forever, and the
             // 避障恢复率 metric would score a manoeuvre as a recovery.
             last_path_ = path;
-            path_pub_.publish(path); vel_pub_.publish(vel);
+            publishPlanOutputs(path, vel);
             publishStatus(recoveryStatus());
         } else if(ok) {
             consecutive_failures_ = 0;
@@ -448,7 +501,7 @@ private:
             // Only genuine plans seed the back-out buffer: retreating along a previous
             // recovery manoeuvre would just replay the manoeuvre that already failed.
             if(!in_recovery) last_valid_path_ = path;
-            path_pub_.publish(path); vel_pub_.publish(vel);
+            publishPlanOutputs(path, vel);
             if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
                 // marginal situation chatters between recovery and nominal every cycle.
@@ -467,8 +520,8 @@ private:
             }
         } else {
             ++consecutive_failures_; confirm_count_ = 0;
-            last_path_.poses.clear(); path_pub_.publish(last_path_);
-            vel_pub_.publish(std_msgs::Float32MultiArray());
+            last_path_.poses.clear();
+            publishPlanOutputs(last_path_, std_msgs::Float32MultiArray());
             publishStatus(mode_ == PlannerMode::Aborted ? "aborted"
                           : (in_recovery ? recoveryStatus() : "no_path"));
         }
@@ -647,13 +700,111 @@ private:
         return distance + static_cast<float>(dt * primitive_length_ * 0.25);
     }
 
-    // Arc mode has no offline (v, w) library, so the planner profiles its own path here:
-    // the desired linear/angular velocity is a required planner output, and without it the
-    // follower falls back to a curvature guess and the skid_steer_model acceleration limits
-    // are never enforced. Classic forward-backward trapezoidal pass; the emitted layout is
-    // identical to the dynamics branch so LunarPathFollowerNode::plannedSpeedAt accepts it.
-    void buildVelocityProfile(const nav_msgs::Path& path,
+    double terrainSpeedScaleAt(double x, double y) const {
+        grid_map::Index idx;
+        if(!map_.getIndex(grid_map::Position(x,y), idx)) return min_speed_scale_;
+        const size_t lin = static_cast<size_t>(idx(0))*cell_cols_ + idx(1);
+        double scale = 1.0;
+        const float c = cell_cost_[lin];
+        // Non-finite is legitimate at the vehicle-occluded start footprint. It must not
+        // poison the whole profile, but known terrain is always allowed to slow it down.
+        if(std::isfinite(c))
+            scale *= std::clamp(1.0 - terrain_speed_gain_*(c/99.0), min_speed_scale_, 1.0);
+        const float sm = cell_slopemag_[lin];
+        if(std::isfinite(sm) && max_long_slope_ > 1e-3)
+            scale *= std::clamp(1.0 - sm/max_long_slope_, min_speed_scale_, 1.0);
+        return std::clamp(scale, min_speed_scale_, 1.0);
+    }
+
+    // A final mode-independent envelope. Dynamics primitives are individually feasible,
+    // but concatenating them can otherwise introduce an instantaneous command jump at an
+    // edge. Arc profiles already satisfy these passes; applying them again is idempotent.
+    void enforceVelocityEnvelope(const nav_msgs::Path& path,
+                                 std_msgs::Float32MultiArray& profile) const {
+        const size_t n = path.poses.size();
+        if(n < 2 || profile.data.size() != 2*n) return;
+        std::vector<double> ds(n-1), dyaw(n-1), raw_v(n), vmag(n), wmag(n);
+        std::vector<int> vsign(n,1), wsign(n,1);
+        for(size_t i=0; i+1<n; ++i) {
+            const auto& a = path.poses[i].pose;
+            const auto& b = path.poses[i+1].pose;
+            ds[i] = std::hypot(b.position.x-a.position.x, b.position.y-a.position.y);
+            dyaw[i] = std::abs(wrap(tf2::getYaw(b.orientation)-tf2::getYaw(a.orientation)));
+        }
+        for(size_t i=0; i<n; ++i) {
+            raw_v[i] = profile.data[2*i];
+            vsign[i] = std::signbit(raw_v[i]) ? -1 : 1;
+            wsign[i] = std::signbit(profile.data[2*i+1]) ? -1 : 1;
+            vmag[i] = std::min(std::abs(raw_v[i]), sp_.v_max);
+            wmag[i] = std::min(std::abs(static_cast<double>(profile.data[2*i+1])), sp_.w_max);
+        }
+        vmag.front() = 0.0;
+        vmag.back() = 0.0;
+        for(size_t i=1; i<n; ++i) {
+            if(std::abs(raw_v[i-1]) > 1e-6 && std::abs(raw_v[i]) > 1e-6 &&
+               vsign[i-1] != vsign[i]) {
+                vmag[i] = 0.0;
+            }
+        }
+        for(size_t i=1; i<n; ++i)
+            vmag[i] = std::min(vmag[i], std::sqrt(vmag[i-1]*vmag[i-1] + 2.0*sp_.a_max*ds[i-1]));
+        for(size_t i=n-1; i-->0;)
+            vmag[i] = std::min(vmag[i], std::sqrt(vmag[i+1]*vmag[i+1] + 2.0*sp_.a_max*ds[i]));
+
+        // When linear acceleration reduces a translating sample, scale yaw rate with it so
+        // the primitive curvature is retained before the angular envelope is applied.
+        for(size_t i=0; i<n; ++i) {
+            if(std::abs(raw_v[i]) > 1e-6)
+                wmag[i] *= vmag[i]/std::abs(raw_v[i]);
+        }
+        for(size_t i=1; i<n; ++i) {
+            const double previous_w = profile.data[2*(i-1)+1];
+            const double current_w = profile.data[2*i+1];
+            if(std::abs(previous_w) > 1e-6 && std::abs(current_w) > 1e-6 &&
+               wsign[i-1] != wsign[i]) {
+                wmag[i] = 0.0;
+            }
+        }
+        for(size_t i=1; i<n; ++i)
+            wmag[i] = std::min(wmag[i], std::sqrt(wmag[i-1]*wmag[i-1] + 2.0*sp_.alpha_max*dyaw[i-1]));
+        for(size_t i=n-1; i-->0;)
+            wmag[i] = std::min(wmag[i], std::sqrt(wmag[i+1]*wmag[i+1] + 2.0*sp_.alpha_max*dyaw[i]));
+
+        for(size_t i=0; i<n; ++i) {
+            profile.data[2*i] = static_cast<float>(vsign[i]*vmag[i]);
+            profile.data[2*i+1] = static_cast<float>(wsign[i]*wmag[i]);
+        }
+    }
+
+    // Arc mode has no offline (v, w) library, so the planner profiles its own path here.
+    // The atomic trajectory requires one desired effective body twist per pose. A classic
+    // forward/backward trapezoidal pass keeps those values within the shared dynamics
+    // envelope before the follower applies inverse slip compensation once.
+    void buildVelocityProfile(nav_msgs::Path& path,
                               std_msgs::Float32MultiArray& vel_profile) const {
+        // A translating path with only start and goal has no interior sample: both
+        // boundary speeds must be zero, so an index-based follower could never start.
+        // Insert a point on the already collision-checked edge and keep the speed decision
+        // in the planner instead of inventing one in the controller.
+        if(path.poses.size() == 2) {
+            const auto& first = path.poses.front();
+            const auto& last = path.poses.back();
+            const double dx = last.pose.position.x-first.pose.position.x;
+            const double dy = last.pose.position.y-first.pose.position.y;
+            if(std::hypot(dx,dy) > 1e-3) {
+                geometry_msgs::PoseStamped middle = first;
+                middle.pose.position.x = 0.5*(first.pose.position.x+last.pose.position.x);
+                middle.pose.position.y = 0.5*(first.pose.position.y+last.pose.position.y);
+                middle.pose.position.z = 0.5*(first.pose.position.z+last.pose.position.z);
+                const double first_yaw = tf2::getYaw(first.pose.orientation);
+                const double middle_yaw = wrap(
+                    first_yaw+0.5*wrap(tf2::getYaw(last.pose.orientation)-first_yaw));
+                tf2::Quaternion q;
+                q.setRPY(0.0,0.0,middle_yaw);
+                middle.pose.orientation = tf2::toMsg(q);
+                path.poses.insert(path.poses.begin()+1,middle);
+            }
+        }
         const size_t n = path.poses.size();
         vel_profile.data.assign(2*n, 0.0f);
         vel_profile.layout.dim.resize(2);
@@ -690,19 +841,8 @@ private:
             double lim = sp_.v_max;
             const double k = std::abs(prof_kappa_[s]);
             if(k > 1e-3) lim = std::min(lim, sp_.w_max/k);
-            grid_map::Index idx;
-            if(map_.getIndex(grid_map::Position(path.poses[i].pose.position.x,
-                                               path.poses[i].pose.position.y), idx)) {
-                const size_t lin = static_cast<size_t>(idx(0))*cell_cols_ + idx(1);
-                const float c = cell_cost_[lin];
-                // Non-finite is legitimate here: the start footprint sits on the cells the
-                // vehicle body occludes. Skip the factor rather than poisoning the profile.
-                if(std::isfinite(c))
-                    lim *= std::clamp(1.0 - terrain_speed_gain_*(c/99.0), min_speed_scale_, 1.0);
-                const float sm = cell_slopemag_[lin];
-                if(std::isfinite(sm) && max_long_slope_ > 1e-3)
-                    lim *= std::clamp(1.0 - sm/max_long_slope_, min_speed_scale_, 1.0);
-            }
+            lim *= terrainSpeedScaleAt(path.poses[i].pose.position.x,
+                                       path.poses[i].pose.position.y);
             if(prof_dir_[s] < 0) lim = std::min(lim, reverse_speed_frac_*sp_.v_max);
             const bool rotating = (i > 0 && prof_dir_[i-1] == 0) || (i < segs && prof_dir_[i] == 0);
             const bool reversal = (i > 0 && i < segs && prof_dir_[i-1]*prof_dir_[i] < 0);
@@ -747,6 +887,7 @@ private:
             vel_profile.data[2*i+1] = std::copysign(prof_wmag_[i], prof_w_[i]);
             v_peak = std::max(v_peak, prof_v_[i]);
         }
+        enforceVelocityEnvelope(path, vel_profile);
         ROS_INFO_THROTTLE(2.0, "vprofile: n=%zu v_peak=%.2f", n, v_peak);
     }
 
@@ -954,6 +1095,7 @@ private:
         path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
 
         if(use_dynamics) {
+            const SkidSteerModel nominal_model(sp_);
             std::vector<int> node_keys;
             for(int k=reached;k>=0;k=parent[k]) { node_keys.push_back(k); if(k==sk) break; }
             std::reverse(node_keys.begin(),node_keys.end());
@@ -983,13 +1125,26 @@ private:
                     pose.pose.position.x=wx; pose.pose.position.y=wy;
                     tf2::Quaternion q; q.setRPY(0,0,wyaw); pose.pose.orientation=tf2::toMsg(q);
                     path.poses.push_back(pose);
-                    vel_profile.data.push_back(static_cast<float>(prim.v_profile[i]));
-                    vel_profile.data.push_back(static_cast<float>(prim.w_profile[i]));
+                    // Primitive files store wheel-command inputs because those commands are
+                    // what generated the samples. The public trajectory instead carries the
+                    // desired effective body twist, so the follower can apply inverse slip
+                    // exactly once. Scale both components together on translating samples to
+                    // preserve curvature while applying the same terrain policy as arc mode.
+                    BodyTwist desired = nominal_model.effectiveTwist(
+                        prim.v_profile[i], prim.w_profile[i]);
+                    if(prim.direction != 0) {
+                        const double terrain_scale = terrainSpeedScaleAt(wx, wy);
+                        desired.vx *= terrain_scale;
+                        desired.omega *= terrain_scale;
+                    }
+                    vel_profile.data.push_back(static_cast<float>(desired.vx));
+                    vel_profile.data.push_back(static_cast<float>(desired.omega));
                 }
             }
             vel_profile.layout.dim.resize(2);
             vel_profile.layout.dim[0].label="pairs"; vel_profile.layout.dim[0].size=path.poses.size(); vel_profile.layout.dim[0].stride=path.poses.size()*2;
             vel_profile.layout.dim[1].label="vw"; vel_profile.layout.dim[1].size=2; vel_profile.layout.dim[1].stride=2;
+            enforceVelocityEnvelope(path, vel_profile);
             return !path.poses.empty();
         }
 
@@ -1008,7 +1163,8 @@ private:
         return true;
     }
 
-    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_; ros::Publisher path_pub_,vel_pub_,status_pub_,snapped_goal_pub_,diag_pub_;
+    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_;
+    ros::Publisher path_pub_,vel_pub_,trajectory_pub_,status_pub_,snapped_goal_pub_,diag_pub_;
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
     bool have_map_=false,have_goal_=false,replan_requested_=false;

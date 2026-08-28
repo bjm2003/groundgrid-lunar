@@ -202,9 +202,13 @@ The downstream pipeline consists of:
 - `state_lattice_planner_node`: searches `(x,y,yaw)` using forward, reverse,
   curved and in-place motion primitives. Every primitive is checked across the
   full rover footprint, including direction-dependent longitudinal/lateral
-  slope.
+  slope. It publishes an atomic `groundgrid/LunarTrajectory` containing one
+  desired effective body twist per path pose; the legacy path and velocity
+  topics remain available for RViz and existing tools.
 - `lunar_path_follower_node`: a fail-safe differential-drive path follower that
-  stops on stale paths, stale terrain or missing TF.
+  blends planner yaw-rate feed-forward with geometric feedback, applies skid
+  compensation once, and stops on invalid/stale trajectories, stale terrain or
+  missing TF. Its latched state is available on `/lunar_path_follower/status`.
 - `lunar_surface_sim.py`: a deterministic lightweight crater/rock terrain
   simulator for end-to-end testing without an external simulator.
 

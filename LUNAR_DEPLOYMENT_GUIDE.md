@@ -12,13 +12,13 @@
 - GCC/G++ 支持 C++17
 - 至少 8 GB 内存；运行 RViz 时建议 16 GB
 
-后续命令假定项目源码位于：
+后续命令按当前已知 Ubuntu 工作空间编写，项目源码位于：
 
 ```bash
-/home/lyq/groundgrid-main
+$HOME/lunar_ws/src/groundgrid
 ```
 
-如果你的路径不同，请修改下文中的 `PROJECT_DIR`。
+如果你的路径不同，请相应修改 `PROJECT_DIR` 和 `WS_DIR`。
 
 ## 2. 安装 ROS Noetic
 
@@ -52,6 +52,7 @@ rosdep update
 sudo apt update
 sudo apt install -y \
   python3-catkin-tools \
+  python3-nose \
   python3-rosdep \
   python3-numpy \
   ros-noetic-grid-map \
@@ -67,16 +68,14 @@ sudo apt install -y \
 
 这里最关键的额外依赖是 `grid_map`。如果构建时出现 `Could not find grid_map_core`，通常表示 `ros-noetic-grid-map` 未正确安装。
 
-## 4. 创建独立 catkin 工作空间
+## 4. 准备 catkin 工作空间
 
-推荐将源码链接到独立工作空间，避免复制项目：
+已在 `lyq@bjm` 上使用现有工作空间时：
 
 ```bash
-export PROJECT_DIR=/home/lyq/groundgrid-main
-export WS_DIR=$HOME/groundgrid_ws
-
-mkdir -p "$WS_DIR/src"
-ln -sfn "$PROJECT_DIR" "$WS_DIR/src/groundgrid"
+export WS_DIR=$HOME/lunar_ws
+export PROJECT_DIR=$WS_DIR/src/groundgrid
+test -f "$PROJECT_DIR/package.xml"
 ```
 
 然后用 `rosdep` 检查并补齐依赖：
@@ -142,7 +141,7 @@ source "$WS_DIR/devel/setup.bash"
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 ```
 
 带 RViz 启动完整系统：
@@ -181,7 +180,7 @@ yaw = 0 rad
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 ```
 
 检查核心节点：
@@ -195,7 +194,7 @@ rosnode list | grep -E \
 
 ```bash
 rostopic list | grep -E \
-  'velodyne_points|odometry/filtered_map|groundgrid/grid_map|terrain/grid_map|terrain/costmap|lunar_planner|cmd_vel'
+  'velodyne_points|odometry/filtered_map|groundgrid/grid_map|terrain/grid_map|terrain/costmap|lunar_planner|lunar_path_follower/status|cmd_vel'
 ```
 
 检查输入点云和里程计是否持续更新：
@@ -210,7 +209,9 @@ rostopic hz /sensors/velodyne_points
 rostopic hz /localization/odometry/filtered_map
 ```
 
-预期点云约 5 Hz，里程计约 50 Hz。
+模拟器的点云定时器名义周期为 0.20 s，里程计约 50 Hz；但点云生成和
+GroundGrid 处理均可能成为瓶颈。历史 Ubuntu 实测 `/groundgrid/grid_map` 和
+`/terrain/grid_map` 约 1.05–1.10 s 一帧，应以 `rostopic hz` 实测值为准。
 
 检查地图消息：
 
@@ -251,6 +252,8 @@ pose:
 ```bash
 rostopic echo -n 1 /lunar_planner/status
 rostopic echo -n 1 /lunar_planner/path
+rostopic echo -n 1 /lunar_planner/trajectory
+rostopic echo -n 1 /lunar_path_follower/status
 ```
 
 正常状态应为：
@@ -287,6 +290,10 @@ rostopic echo /localization/odometry/filtered_map/pose/pose/position
 | Map | `/terrain/costmap` | 未知、可通行和致命区域 |
 | Path | `/lunar_planner/path` | 状态栅格规划路径 |
 | TF | 无需指定 | `map -> base_link -> velodyne` 坐标关系 |
+
+`/lunar_planner/trajectory` 是跟踪器唯一控制输入，其中 `path.poses[i]` 与
+`twists[i]` 必须一一对应。`/lunar_planner/path` 和
+`/lunar_planner/velocity_profile` 继续用于 RViz 和外部兼容工具。
 
 `/terrain/costmap` 的语义是：
 
@@ -360,19 +367,26 @@ rosnode kill /state_lattice_planner
 rostopic echo /cmd_vel
 ```
 
-约 1 秒内速度应变为零。此操作结束后，重新运行 `LunarDemo.launch` 恢复系统。
+轨迹超时固定为 3.0 s，因此速度应在约 3 s 内变为零，状态变为
+`stale_trajectory`。此操作结束后，重新运行 `LunarDemo.launch` 恢复系统。
 
 ## 13. 运行端到端自动化测试
 
 先停止手工启动的 `LunarDemo.launch`，避免同名节点和话题相互干扰。然后执行：
 
 ```bash
+if command -v conda >/dev/null 2>&1; then
+  while [[ -n "${CONDA_PREFIX:-}" ]]; do conda deactivate; done
+fi
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
-cd "$HOME/groundgrid_ws"
-catkin build groundgrid --no-deps
-cmake --build build/groundgrid \
-  --target run_tests_groundgrid_rostest_test_lunar_pipeline.test
+cd "$HOME/lunar_ws"
+git -C src/groundgrid checkout codex/p0-trajectory-fixes
+git -C src/groundgrid pull --ff-only origin codex/p0-trajectory-fixes
+catkin clean groundgrid -y
+catkin config --extend /opt/ros/noetic
+catkin build groundgrid --no-deps -DCMAKE_BUILD_TYPE=Release
+source "$HOME/lunar_ws/devel/setup.bash"
+catkin run_tests groundgrid
 catkin_test_results build/groundgrid/test_results
 ```
 
@@ -380,11 +394,10 @@ catkin_test_results build/groundgrid/test_results
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
-cd "$HOME/groundgrid_ws"
+source "$HOME/lunar_ws/devel/setup.bash"
+cd "$HOME/lunar_ws"
 catkin_make
-cmake --build build \
-  --target run_tests_groundgrid_rostest_test_lunar_pipeline.test
+catkin_make run_tests_groundgrid
 catkin_test_results build/test_results
 ```
 
@@ -402,6 +415,33 @@ catkin_test_results build/test_results
 ```bash
 rostest groundgrid lunar_pipeline.test
 ```
+
+滑移辨识的注入参数恢复测试建议把结果写入日志目录，避免改动源码配置：
+
+```bash
+roslaunch groundgrid IdentifySkidSteer.launch \
+  output:="$HOME/.ros/skid_steer_model.yaml"
+```
+
+日志中的 `max abs recovery error` 必须不超过 0.02；辨识失败、激励不足或
+矩阵退化时节点应以非零状态退出，且不得生成参数文件。
+
+正式验收前先运行 `mixed` 三次冒烟，再运行五场景十次：
+
+```bash
+rosrun groundgrid run_planner_experiments.py \
+  --scenarios mixed --n-trials 3 --out-dir "$HOME/.ros/p0-smoke"
+rosrun groundgrid run_planner_experiments.py \
+  --n-trials 10 --out-dir "$HOME/.ros/p0-five-scenarios"
+```
+
+保留两处 JSON、`~/.ros/log` 中完整日志、rostest XML、辨识参数、运行配置和
+`git rev-parse HEAD`。五场景任何一次返回非零都按回归处理，不能只汇总成功项。
+
+P0 通过条件是 `output_conformance=1.0`、碰撞数为 0、跟踪期间没有
+`stale_trajectory`/`stale_terrain`，并且五个场景的 rostest 都返回 0。
+`mixed` 和 `flat` 的巡回成功率应至少为 99%；其他场景低于任务书 99% 时，
+必须在验收记录中列为缺口，不能通过下调阈值改写为通过。
 
 ## 14. 接入外部仿真器或真实传感器
 
@@ -447,15 +487,15 @@ groundgrid:
 接入自己的系统时，建议复制配置文件后修改：
 
 ```bash
-cp /home/lyq/groundgrid-main/config/lunar_system.yaml \
-   /home/lyq/groundgrid-main/config/my_lunar_system.yaml
+cp "$HOME/lunar_ws/src/groundgrid/config/lunar_system.yaml" \
+   "$HOME/lunar_ws/src/groundgrid/config/my_lunar_system.yaml"
 ```
 
 编辑 `my_lunar_system.yaml` 后运行：
 
 ```bash
 roslaunch groundgrid LunarSystem.launch \
-  config:=/home/lyq/groundgrid-main/config/my_lunar_system.yaml \
+  config:="$HOME/lunar_ws/src/groundgrid/config/my_lunar_system.yaml" \
   point_cloud_topic:=/lidar/points \
   odometry_topic:=/odometry/filtered \
   cmd_vel_topic:=/rover/cmd_vel
@@ -484,7 +524,7 @@ lunar_traversability:
   max_longitudinal_slope_deg: 20.0
   max_roughness: 0.08
   max_step_height: 0.20
-  max_observation_age: 1.0
+  max_observation_age: 3.0
   min_obstacle_height: 0.10
   min_obstacle_confidence: 0.45
 ```
@@ -505,7 +545,7 @@ Resource not found: groundgrid
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 rospack profile
 rospack find groundgrid
 ```
@@ -513,7 +553,7 @@ rospack find groundgrid
 仍找不到时，检查链接：
 
 ```bash
-ls -l "$HOME/groundgrid_ws/src/groundgrid"
+ls -l "$HOME/lunar_ws/src/groundgrid"
 ```
 
 ### 15.2 找不到 grid_map
@@ -590,13 +630,16 @@ rosnode info /lunar_traversability
 
 ### 15.7 点云 CPU 占用高
 
-内置模拟器默认在半径 25 m 内按 0.20 m 间隔生成点云。需要降低负载时，编辑 `launch/LunarDemo.launch` 中：
+内置模拟器使用 64 线、0.2° 方位分辨率的射线步进点云，默认半径 25 m。
+需要降低负载时，优先缩小点云半径：
 
-```xml
-<param name="cloud_spacing" value="0.20" />
+```bash
+roslaunch groundgrid LunarDemo.launch rviz:=false cloud_radius:=20.0
 ```
 
-改为 `0.30` 或 `0.40`。间距越大，计算越快，但小障碍物和局部地形细节会减少。
+不要把 `azimuth_res_deg` 调粗到 0.2° 以上：GroundGrid 的地面候选密度门槛
+依赖这一采样密度，调粗后会使代价图退化。缩小半径也会减少远场可规划范围，
+因此性能数据必须记录该参数。
 
 ## 16. 最短验证流程
 
@@ -606,7 +649,7 @@ rosnode info /lunar_traversability
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 roslaunch groundgrid LunarDemo.launch rviz:=false
 ```
 
@@ -614,7 +657,7 @@ roslaunch groundgrid LunarDemo.launch rviz:=false
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 rostopic pub -1 /move_base_simple/goal geometry_msgs/PoseStamped \
 "header: {frame_id: 'map'}
 pose:
@@ -626,7 +669,7 @@ pose:
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$HOME/groundgrid_ws/devel/setup.bash"
+source "$HOME/lunar_ws/devel/setup.bash"
 rostopic echo /lunar_planner/status
 ```
 

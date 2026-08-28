@@ -1,5 +1,6 @@
 // Standalone sanity check for the SkidSteerModel (no ROS). Returns non-zero on failure.
 #include "groundgrid/SkidSteerModel.h"
+#include "groundgrid/TrajectoryControl.h"
 
 #include <cmath>
 #include <cstdio>
@@ -7,6 +8,8 @@
 using groundgrid::Pose2D;
 using groundgrid::SkidSteerModel;
 using groundgrid::SkidSteerParams;
+using groundgrid::TrajectoryControlParams;
+using groundgrid::blendTrajectoryCommand;
 
 namespace {
 
@@ -75,6 +78,29 @@ int main() {
         model.inverseCommand(0.8 * 1.0, 0.9 * 0.4, vc, wc);
         check(std::abs(vc - 1.0) < 1e-9 && std::abs(wc - 0.4) < 1e-9,
               "inverseCommand recovers commanded (v, w)");
+    }
+
+    // 5) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    {
+        TrajectoryControlParams p;
+        p.angular_feedforward_weight = 0.5;
+        p.max_linear_speed = 1.0;
+        p.max_angular_speed = 0.8;
+        double v = 0.0, w = 0.0;
+        const bool ok = blendTrajectoryCommand(0.6, 0.4, -0.2, p, v, w);
+        check(ok && std::abs(v-0.6) < 1e-9 && std::abs(w-0.1) < 1e-9,
+              "trajectory controller blends planned angular feed-forward");
+
+        check(blendTrajectoryCommand(-0.5, -0.3, -0.1, p, v, w) && v < 0.0 && w < 0.0,
+              "trajectory controller preserves reverse command signs");
+        check(blendTrajectoryCommand(0.0, 0.6, 0.2, p, v, w) &&
+              std::abs(v) < 1e-9 && w > 0.0,
+              "trajectory controller supports in-place rotation");
+        check(blendTrajectoryCommand(3.0, 3.0, 3.0, p, v, w) &&
+              std::abs(v-1.0) < 1e-9 && std::abs(w-0.8) < 1e-9,
+              "trajectory controller clamps the command envelope");
+        check(!blendTrajectoryCommand(NAN, 0.0, 0.0, p, v, w),
+              "trajectory controller rejects non-finite input");
     }
 
     std::printf("skidsteer_selfcheck: %d failure(s)\n", failures);

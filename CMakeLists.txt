@@ -42,6 +42,7 @@ find_package(Eigen3 REQUIRED)
 if(CATKIN_ENABLE_TESTING)
     find_package(rostest REQUIRED)
     add_rostest(test/lunar_pipeline.test)
+    catkin_add_nosetests(test/test_skidsteer_identification.py)
 endif()
 
 #######################################
@@ -55,6 +56,11 @@ generate_dynamic_reconfigure_options(
 ################################################
 ## Declare ROS messages, services and actions ##
 ################################################
+add_message_files(
+    FILES
+    LunarTrajectory.msg
+)
+
 add_service_files(
     FILES
     NextCloud.srv
@@ -64,6 +70,8 @@ add_service_files(
 ## Generate added messages and services with any dependencies listed here
 generate_messages(
     DEPENDENCIES
+    geometry_msgs
+    nav_msgs
     std_msgs
 )
 
@@ -76,7 +84,12 @@ catkin_package(
     LIBRARIES ${PROJECT_NAME}_lib
     CATKIN_DEPENDS
         dynamic_reconfigure
+        geometry_msgs
+        message_runtime
+        nav_msgs
         nodelet
+        roscpp
+        std_msgs
 )
 
 ###########
@@ -179,9 +192,9 @@ add_executable(lunar_traversability_node src/LunarTraversabilityNode.cpp)
 add_executable(state_lattice_planner_node src/StateLatticePlannerNode.cpp)
 add_executable(lunar_path_follower_node src/LunarPathFollowerNode.cpp)
 
-add_dependencies(lunar_traversability_node ${catkin_EXPORTED_TARGETS})
-add_dependencies(state_lattice_planner_node ${catkin_EXPORTED_TARGETS})
-add_dependencies(lunar_path_follower_node ${catkin_EXPORTED_TARGETS})
+add_dependencies(lunar_traversability_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(state_lattice_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(lunar_path_follower_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 target_link_libraries(lunar_traversability_node ${catkin_LIBRARIES})
 target_link_libraries(state_lattice_planner_node ${catkin_LIBRARIES} ${PROJECT_NAME}_skidsteer_lib)
@@ -193,6 +206,9 @@ target_link_libraries(generate_motion_primitives ${PROJECT_NAME}_skidsteer_lib)
 
 add_executable(skidsteer_selfcheck src/skidsteer_selfcheck.cpp)
 target_link_libraries(skidsteer_selfcheck ${PROJECT_NAME}_skidsteer_lib)
+if(CATKIN_ENABLE_TESTING)
+    add_test(NAME skidsteer_selfcheck COMMAND skidsteer_selfcheck)
+endif()
 
 #############
 ## Install ##
@@ -210,6 +226,7 @@ install(
         state_lattice_planner_node
         lunar_path_follower_node
         generate_motion_primitives
+        skidsteer_selfcheck
     ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -236,6 +253,8 @@ catkin_install_python(PROGRAMS
     scripts/eval_groundpoint_classifier.py
     scripts/lunar_surface_sim.py
     scripts/identify_skidsteer.py
+    scripts/lunar_terrain.py
+    scripts/skidsteer_identification_core.py
     scripts/run_planner_experiments.py
     scripts/summarize_planner_metrics.py
     DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

@@ -110,7 +110,14 @@ lunar_path_follower:
   max_angular_speed: 0.8
   goal_position_tolerance: 0.25
   goal_yaw_tolerance: 0.174532925
-  path_timeout: 1.0
+  # GroundGrid publishes at about 1.1 s/frame on the Ubuntu test machine. These separate
+  # freshness gates leave margin for one slow frame without allowing an old command to
+  # survive indefinitely.
+  path_timeout: 3.0
+  terrain_timeout: 3.0
+  # Desired yaw rate = this fraction of planner feed-forward + the remainder of geometric
+  # path-tracking feedback. Fixed for the P0 baseline; tune only from recorded evidence.
+  angular_feedforward_weight: 0.5
 
 # Skid-steer slip dynamics (ICR model). Shared by the motion primitive generator,
 # the planner (feasibility / cost) and the follower (feed-forward). These are the

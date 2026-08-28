@@ -2,7 +2,7 @@
 
 最后核对日期：2026-08-28
 
-核对基线：`main` / `14e0fde`
+核对基线：`main` / `14e0fde`；P0 实现分支：`codex/p0-trajectory-fixes`
 
 状态：可进行 ROS 仿真闭环的月球车感知与局部规划原型，尚未达到任务书整体验收或真实车辆交付状态。
 
@@ -21,10 +21,13 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
     -> LunarTraversabilityNode
     -> /terrain/grid_map + /terrain/costmap
     -> StateLatticePlannerNode
-    -> /lunar_planner/path + velocity_profile + status/diagnostics
+    -> /lunar_planner/trajectory（Path + 一一对应的 Twist）
     -> LunarPathFollowerNode
     -> /cmd_vel
 ```
+
+`/lunar_planner/path` 和 `/lunar_planner/velocity_profile` 仍锁存发布，供 RViz
+和旧工具兼容，但不再作为跟踪器控制输入。
 
 ## 3. 已实现能力
 
@@ -44,7 +47,8 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 - 1.8 m × 1.5 m 矩形车体碰撞检测，以及原地旋转的扫掠检测。
 - 目标吸附、吸附安全边界、路径和线角速度曲线输出。
 - Relax、Rotate、BackOut、Abort 恢复阶梯及状态/诊断话题。
-- 路径跟踪、地形降速和基础滑移补偿。
+- 原子轨迹跟踪、规划角速度前馈与几何反馈混合，以及一次性滑移逆补偿。
+- 轨迹和地形独立新鲜度门控，以及锁存的跟踪器状态话题。
 
 ### 仿真与评估
 
@@ -52,7 +56,7 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 - 闭环到达、规划成功率、避障、近障恢复、规划耗时、绕行率、跟踪 RMSE、安全距离、CPU、RSS、异常率和输出一致性统计。
 - 不可达陡坡目标与可达目标分开计分；碰撞按矩形车体到真值障碍计算。
 
-## 4. 已确认的当前问题
+## 4. 当前风险、P0 修复状态与待验证项
 
 ### P0：重新建立可信基线
 
@@ -60,17 +64,17 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 
 在重新运行前，不应把历史数字当作当前提交的正式验收结果。尤其不要引用 Claude 笔记中标为“作废”的旧 LiDAR 仿真指标。
 
-### P0：跟踪超时小于感知周期
+### P0 实现完成、待 Ubuntu 验证：轨迹竞态与跟踪新鲜度
 
-Ubuntu 历史实测 GroundGrid/地形图约 1.05–1.10 s 一帧，而 `lunar_path_follower.path_timeout` 当前为 1.0 s。控制器同时用它判断路径和地形图新鲜度，可能在正常帧间隔内停车。需要拆分路径/地形超时，并根据实测周期留出裕量。
+规划器新增锁存的 `groundgrid/LunarTrajectory`，原子携带等长 Path/Twist；跟踪器只订阅该话题。路径/轨迹和地形新鲜度已拆分，超时均为 3.0 s，并发布 `tracking`、`goal_reached`、空/非法/陈旧轨迹、陈旧地形和 TF 不可用状态。仍需在 Ubuntu 正常闭环中证明不会出现 `stale_trajectory` 或 `stale_terrain`。
 
-### P0：规划角速度未完整闭环
+### P0 实现完成、待 Ubuntu 验证：规划速度语义和角速度闭环
 
-规划器为每个路径点发布 `(v, w)`，但 `LunarPathFollowerNode::plannedSpeedAt` 只读取线速度 `v`；角速度由跟踪器根据前视曲率重新计算。因此当前只能证明速度数组格式正确，不能证明规划器给出的动力学可行角速度真正执行到了轮端命令。
+理想弧线和动力学基元现在都输出滑移补偿前的期望有效车体速度。动力学基元原始轮端命令先通过 `effectiveTwist()` 转换；地形缩放和速度/加速度包络统一在规划器端执行。跟踪器直接采用规划线速度，以固定 0.5 权重混合规划角速度和几何反馈，再调用一次 `inverseCommand()`。纯 C++ 核心已覆盖正向、倒车、原地旋转、角速度前馈、限幅和非有限输入；ROS 闭环仍需验证。
 
-### P0：滑移辨识脚本缺陷
+### P0 实现完成、待 Ubuntu 验证：滑移辨识
 
-`scripts/identify_skidsteer.py` 把 `LunarSurfaceSim.terrain_gradient` 实例方法作为普通函数调用，导入成功时参数绑定不正确。脚本还声称将换挡后的 settle-window 样本标为 NaN，实际代码仍写入正常命令值。应先修复并增加不依赖真实 ROS 运行的求解器单元测试。
+月面解析地形已提取为仿真器和辨识器共用的无 ROS 模块，最小二乘核心也已拆为纯 NumPy。辨识器使用场景实例、时间戳和锁丢弃命令切换后的 settle-window 样本；NaN、无效区间、激励不足和退化矩阵不会进入或伪装成成功求解，失败时不写参数文件。合成数据测试最大误差门槛为 0.02；仍需用 `IdentifySkidSteer.launch` 验证注入参数恢复。
 
 ### P1：测试门槛与任务书不完全一致
 
@@ -80,11 +84,8 @@ Ubuntu 历史实测 GroundGrid/地形图约 1.05–1.10 s 一帧，而 `lunar_pa
 - 默认 `n_trials=3` 只适合冒烟检查；正式数据至少使用 10 次重复试验。
 - JSON 允许写出 Python 的 `NaN`，它不是严格标准 JSON。
 
-### P1：构建与文档债务
+### P1：剩余构建与文档债务
 
-- CMake 依赖 `tf2_msgs`，`package.xml` 尚未声明。
-- `skidsteer_selfcheck` 会构建但未加入安装目标。
-- `LUNAR_DEPLOYMENT_GUIDE.md` 含旧工作区路径、旧观测年龄、已删除的 `cloud_spacing` 参数和过时测试说明。
 - 当前 RViz 配置主要显示感知图层，规划路径、吸附目标和诊断仍需手动添加。
 - `GroundGridNodelet.cpp` 的旧图像发布路径包含硬编码索引 `data(181,181)`，不应视为通用地图中心。
 
@@ -102,23 +103,24 @@ Ubuntu 历史实测 GroundGrid/地形图约 1.05–1.10 s 一帧，而 `lunar_pa
 
 2026-08-28 在 Windows 接手审计中完成：
 
-- 9 个 Python 文件通过纯语法编译检查。
-- 9 个 package/launch/rostest XML 文件通过解析。
+- 12 个 Python 文件通过纯语法编译检查。
+- 10 个 package/launch/rostest XML 文件通过解析。
 - 纯 C++ `SkidSteerModel`/`MotionPrimitiveLibrary` 成功使用 GCC 13.2 编译。
-- `skidsteer_selfcheck` 的零滑移、ICR、坡度、横向漂移和逆命令 5 项检查全部通过。
+- `skidsteer_selfcheck` 的动力学 5 项和轨迹控制 5 项检查全部通过。
 - 运动基元生成器可编译，默认生成结果与跟踪文件无内容差异。
+- P0 分支的 5 项纯 NumPy 辨识测试覆盖已知五参数恢复、settle/NaN 样本、退化激励、解析地形和提取前后数组结果一致性。
+- 合成五参数恢复最大绝对误差为 0.00344，加入 settle/NaN 样本后结果最大变化为 0。
 
 Windows 环境没有 ROS1 Noetic，因此以上结果不是 ROS 闭环通过证明。
 
 ## 7. 推荐执行顺序
 
-1. 修复跟踪超时、规划角速度闭环和滑移辨识脚本，并补定向测试。
-2. 补齐 `package.xml`、安装目标、日志忽略规则和部署文档。
-3. 在 Ubuntu `~/lunar_ws/src/groundgrid` 重新构建并运行冒烟测试。
-4. 运行五场景、每场景 `n_trials=10`，归档 JSON、rostest XML、完整日志、参数和 commit SHA。
-5. 基于新基线优化 GroundGrid 处理周期、规划超时和全系统 CPU。
-6. 增加公里级全局航点规划和历史障碍地图。
-7. 最后进入多传感器融合、Atlas/NPU 和真实车辆验证。
+1. 在 Ubuntu `~/lunar_ws/src/groundgrid` 清理 groundgrid 包缓存并执行 Release 构建、包测试和 `catkin_test_results`。
+2. 运行 `IdentifySkidSteer.launch`，确认五参数注入恢复最大绝对误差不超过 0.02。
+3. 先运行 `mixed, n_trials=3` 冒烟，再运行五场景、每场景 `n_trials=10`。
+4. 归档 JSON、rostest XML、完整日志、辨识参数、配置和 commit SHA；验证完成前不合并 `main`。
+5. 如出现回归，在同一 P0 分支修复并复跑；不得降低 99% 任务书门槛掩盖缺口。
+6. 基于新基线优化 GroundGrid 处理周期和全系统 CPU，然后进入公里级规划、历史地图、多传感器融合与 Atlas/NPU 工作。
 
 ## 8. 关键资料
 

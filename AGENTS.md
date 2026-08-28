@@ -6,7 +6,7 @@ These instructions apply to the entire repository.
 
 This repository extends the ROS1 GroundGrid terrain-segmentation project into a lunar-rover perception, local-planning, and control prototype. The main runtime chain is:
 
-`PointCloud2 + Odometry/TF -> GroundGrid -> lunar traversability/costmap -> state-lattice planner -> path/velocity profile -> path follower -> /cmd_vel`
+`PointCloud2 + Odometry/TF -> GroundGrid -> lunar traversability/costmap -> state-lattice planner -> atomic LunarTrajectory -> path follower -> /cmd_vel`
 
 The current system is a simulation-capable local-navigation prototype. Do not describe it as an acceptance-ready rover stack: kilometre-scale global planning, persistent/history mapping, camera/TOF fusion, Atlas 200i/NPU deployment, and external-field validation remain incomplete.
 
@@ -38,6 +38,11 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - A recovery rotate/back-out manoeuvre is not a successful nominal plan. Keep recovery, abort, planning-success, reach, and obstacle-avoidance metrics distinct.
 - The map is a 60 m rolling window centred on the rover. Fixed world goals can legitimately leave the map as the rover moves.
 - Freshness timeouts must have margin over the measured GroundGrid/map publication period; do not set them from a nominal rate alone.
+- `/lunar_planner/trajectory` is the follower's only control input. Its path and twists
+  must be equal-length, finite, and published atomically; the legacy path/profile topics
+  are compatibility and visualisation outputs, not control inputs.
+- A trajectory twist is desired effective body motion before slip compensation. Apply
+  terrain scaling in the planner and `inverseCommand()` once in the follower.
 
 ## Validation expectations
 

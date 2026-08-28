@@ -12,8 +12,11 @@
     <arg name="x_icr" default="0.15" />
     <arg name="slope_slip_gain" default="0.30" />
     <arg name="slope_grade_gain" default="0.40" />
+    <arg name="scenario" default="mixed" />
+    <arg name="output" default="$(find groundgrid)/config/skid_steer_model.yaml" />
 
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim" output="screen">
+        <param name="scenario" value="$(arg scenario)" />
         <param name="alpha_v" value="$(arg alpha_v)" />
         <param name="alpha_w" value="$(arg alpha_w)" />
         <param name="x_icr" value="$(arg x_icr)" />
@@ -23,6 +26,7 @@
 
     <node pkg="groundgrid" type="identify_skidsteer.py" name="identify_skidsteer"
           output="screen" required="true">
-        <param name="output" value="$(find groundgrid)/config/skid_steer_model.yaml" />
+        <param name="output" value="$(arg output)" />
+        <param name="scenario" value="$(arg scenario)" />
     </node>
 </launch>

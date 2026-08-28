@@ -32,6 +32,7 @@ import rostest
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from std_msgs.msg import Float32MultiArray, String
+from groundgrid.msg import LunarTrajectory
 
 # The body, from state_lattice_planner/footprint_{length,width}. Clearance is measured
 # against this rectangle rather than its circumscribed circle: the circle sits 0.42 m
@@ -179,6 +180,11 @@ class LunarPipelineTest(unittest.TestCase):
         self.route_to = None
         self.path_seen = False
         self.profile_ok = False
+        self.atomic_profile_ok = False
+        self.atomic_profile_invalid = False
+        self.angular_profile_seen = False
+        self.follower_tracking_seen = False
+        self.follower_stale = False
         self.cpu_pct = []
         self.rss_mb = []
         self.diag = {}
@@ -186,7 +192,11 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.Subscriber("/lunar_planner/path", Path, self._on_path, queue_size=1)
         rospy.Subscriber("/lunar_planner/velocity_profile", Float32MultiArray,
                          self._on_vel, queue_size=1)
+        rospy.Subscriber("/lunar_planner/trajectory", LunarTrajectory,
+                         self._on_trajectory, queue_size=1)
         rospy.Subscriber("/lunar_planner/status", String, self._on_status, queue_size=1)
+        rospy.Subscriber("/lunar_path_follower/status", String,
+                         self._on_follower_status, queue_size=10)
         rospy.Subscriber("/lunar_planner/diagnostics", String, self._on_diag, queue_size=10)
         try:
             self._on_obstacles(rospy.wait_for_message("/lunar_sim/obstacles",
@@ -240,6 +250,38 @@ class LunarPipelineTest(unittest.TestCase):
             n_poses = len(self.last_path.poses) if self.last_path else 0
             if n_poses > 0 and len(msg.data) == 2 * n_poses:
                 self.profile_ok = True
+
+    def _on_trajectory(self, msg):
+        with self.lock:
+            n_poses = len(msg.path.poses)
+            valid = len(msg.twists) == n_poses
+            if valid:
+                valid = all(math.isfinite(pose.pose.position.x) and
+                            math.isfinite(pose.pose.position.y) and
+                            math.isfinite(pose.pose.position.z) and
+                            math.isfinite(pose.pose.orientation.x) and
+                            math.isfinite(pose.pose.orientation.y) and
+                            math.isfinite(pose.pose.orientation.z) and
+                            math.isfinite(pose.pose.orientation.w) and
+                            math.isfinite(twist.linear.x) and
+                            math.isfinite(twist.angular.z) and
+                            abs(twist.linear.x) <= 1.39 + 1e-4 and
+                            abs(twist.angular.z) <= 0.8 + 1e-4
+                            for pose, twist in zip(msg.path.poses, msg.twists))
+            if not valid:
+                self.atomic_profile_invalid = True
+            elif n_poses > 0:
+                self.atomic_profile_ok = True
+                if any(abs(twist.angular.z) > 1e-3 for twist in msg.twists):
+                    self.angular_profile_seen = True
+
+    def _on_follower_status(self, msg):
+        with self.lock:
+            if msg.data == "tracking":
+                self.follower_tracking_seen = True
+            elif (self.follower_tracking_seen and
+                  msg.data in ("stale_trajectory", "stale_terrain")):
+                self.follower_stale = True
 
     def _on_status(self, msg):
         with self.lock:
@@ -326,6 +368,11 @@ class LunarPipelineTest(unittest.TestCase):
             self.route_to = None
             self.path_seen = False
             self.profile_ok = False
+            self.atomic_profile_ok = False
+            self.atomic_profile_invalid = False
+            self.angular_profile_seen = False
+            self.follower_tracking_seen = False
+            self.follower_stale = False
 
     def _run_trial(self, gx, gy, gyaw, timeout):
         """Send one goal, follow it to completion or failure, return its metrics."""
@@ -397,7 +444,10 @@ class LunarPipelineTest(unittest.TestCase):
             path_len = self.plan_path_len
             chord = self.plan_chord
             path_seen = self.path_seen
-            profile_ok = self.profile_ok
+            profile_ok = (self.profile_ok and self.atomic_profile_ok and
+                          not self.atomic_profile_invalid)
+            angular_profile_seen = self.angular_profile_seen
+            follower_stale = self.follower_stale
         # Relative, so legs of different lengths are comparable. Undefined when no route
         # for this goal was captured, or when it was a turn on the spot.
         detour = ((path_len - chord) / chord
@@ -413,6 +463,8 @@ class LunarPipelineTest(unittest.TestCase):
             # is about the follower's (v, w)-per-pose invariant, not about route quality.
             "produced_path": path_seen,
             "profile_ok": profile_ok,
+            "angular_profile_seen": angular_profile_seen,
+            "follower_stale": follower_stale,
             "latency": latency,
             "plan_ms": plan_ms,
             "path_len": path_len if path_len is not None else float("nan"),
@@ -468,6 +520,8 @@ class LunarPipelineTest(unittest.TestCase):
         trial = self._run_trial(initial.pose.pose.position.x + 2.0,
                                 initial.pose.pose.position.y, 0.0, 35.0)
         n_poses, n_vel = self._await_consistent_profile()
+        trajectory = rospy.wait_for_message("/lunar_planner/trajectory",
+                                            LunarTrajectory, timeout=10)
 
         rospy.loginfo("=== pipeline metrics [mode=%s scenario=%s] ===", mode, self.scenario)
         rospy.loginfo("  moved            = %.3f m", trial["moved"])
@@ -483,6 +537,12 @@ class LunarPipelineTest(unittest.TestCase):
         self.assertGreater(n_poses, 0, "planner published no path")
         self.assertEqual(n_vel, 2 * n_poses,
                          "velocity profile must hold one (v, w) pair per pose")
+        self.assertGreater(len(trajectory.path.poses), 0,
+                           "planner published no atomic trajectory")
+        self.assertEqual(len(trajectory.twists), len(trajectory.path.poses),
+                         "atomic trajectory must hold one twist per pose")
+        self.assertFalse(trial["follower_stale"],
+                         "follower stopped on a nominal GroundGrid publication interval")
 
     def test_metrics_over_trials(self):
         n_trials = int(rospy.get_param("~n_trials", 3))
@@ -543,6 +603,9 @@ class LunarPipelineTest(unittest.TestCase):
         emitted = [t for t in every if t["produced_path"]]
         conformance = (sum(1 for t in emitted if t["profile_ok"]) / len(emitted)
                        if emitted else float("nan"))
+        stale_rate = sum(1 for t in every if t["follower_stale"]) / len(every)
+        angular_coverage = (sum(1 for t in emitted if t["angular_profile_seen"]) / len(emitted)
+                            if emitted else float("nan"))
 
         metrics = {
             "plan_ms": _stats([ms for t in every for ms in t["plan_ms"]]),
@@ -564,6 +627,8 @@ class LunarPipelineTest(unittest.TestCase):
             "cpu_overrun": cpu_over,
             "anomaly": anomaly_rate,
             "output_conformance": conformance,
+            "follower_stale": stale_rate,
+            "angular_profile_coverage": angular_coverage,
         }
         counts = {"trials": len(every), "tour": len(tour), "hard": len(hard),
                   "solvable": len(solvable),
@@ -598,6 +663,8 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  异常发生率        = %.3f", anomaly_rate)
         rospy.loginfo("  输出达标率        = %.3f (%d/%d trials that emitted a path)",
                       conformance, sum(1 for t in emitted if t["profile_ok"]), len(emitted))
+        rospy.loginfo("  跟踪陈旧停止率    = %.3f", stale_rate)
+        rospy.loginfo("  角速度剖面覆盖率  = %.3f", angular_coverage)
         for label, key in (("规划耗时 (ms)", "plan_ms"),
                            ("路径长度偏差", "detour_ratio"),
                            ("轨迹跟踪误差 (m)", "tracking_rmse_m"),
@@ -634,6 +701,8 @@ class LunarPipelineTest(unittest.TestCase):
             {"goal": list(t["goal"]), "start": list(t["start"]), "reached": t["reached"],
              "planned": t["planned"], "anomaly": t["anomaly"], "collided": t["collided"],
              "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
+             "angular_profile_seen": t["angular_profile_seen"],
+             "follower_stale": t["follower_stale"],
              "statuses": sorted(t["statuses"]),
              "latency_s": t["latency"], "path_len_m": t["path_len"],
              "chord_m": t["chord"], "detour_ratio": t["detour"],
@@ -706,8 +775,13 @@ class LunarPipelineTest(unittest.TestCase):
             rospy.logwarn("资源占用超标率 not asserted: planner reported no /proc samples")
         self.assertGreater(report["counts"]["paths_emitted"], 0,
                            "planner never published a path in any trial")
-        self.assertGreaterEqual(rates["output_conformance"], 0.99,
-                                "输出达标率: path and velocity profile must stay consistent")
+        self.assertEqual(rates["output_conformance"], 1.0,
+                         "输出达标率: every emitted path must have an equal-length, finite "
+                         "legacy profile and atomic trajectory")
+        self.assertEqual(rates["follower_stale"], 0.0,
+                         "follower stopped because a nominal trajectory or terrain map was stale")
+        self.assertGreater(rates["angular_profile_coverage"], 0.0,
+                           "planner never emitted a non-zero angular velocity profile")
 
 
 if __name__ == "__main__":
