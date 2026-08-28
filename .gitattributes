@@ -1,0 +1,2 @@
+# Preserve the imported Claude memory as an exact historical archive.
+docs/project-memory/claude/* -text

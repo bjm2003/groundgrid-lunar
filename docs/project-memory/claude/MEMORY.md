@@ -1,0 +1,5 @@
+- [Project overview](project_overview.md) — 月球车感知+规划项目，感知基于 GroundGrid 论文开源码，当前在增加规划模块
+- [Planning tech route](planning_tech_route.md) — 规划模块16项技术要点/11项软件设计清单来源与当前落地范围
+- [Planning verification results](planning_verification.md) — 规划模块 Ubuntu 端实测结论与踩过的坑（恢复语义、指标分母、可执行位）
+- [Ubuntu build/run environment](ubuntu_build_env.md) — Ubuntu 端 catkin 编译/roslaunch 验证要点与已知坑（OpenCV 软链、ROS1 vs ROS2、忌 conda）
+- [Git sync + dual-machine workflow](feedback_git_sync.md) — 及时 commit/push 到 GitHub，并每次分点说明 Windows/Ubuntu 两机各做什么
