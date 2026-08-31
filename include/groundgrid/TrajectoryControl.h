@@ -23,6 +23,20 @@ inline bool requiresInPlaceRotationTracking(double segment_distance,
     return segment_distance < 1e-3 && std::abs(next_yaw_error) >= yaw_tolerance;
 }
 
+// Do not let ordinary lookahead replace the penultimate waypoint with the fixed goal while
+// the rover is still far from that waypoint. With zero terminal feed-forward, doing so turns
+// half-weight pure pursuit into a limit cycle whose radius is approximately the lookahead.
+inline bool requiresTerminalWaypointTracking(bool next_is_goal,
+                                             double current_target_distance,
+                                             double position_tolerance) {
+    if(!next_is_goal) return false;
+    if(!std::isfinite(current_target_distance) || !std::isfinite(position_tolerance) ||
+       current_target_distance < 0.0 || position_tolerance < 0.0) {
+        return true;
+    }
+    return current_target_distance >= position_tolerance;
+}
+
 // Pure-pursuit yaw feedback after the bearing error has been expressed in the direction
 // of travel (body yaw for forward motion, body yaw + pi for reverse motion). At that point
 // the yaw-rate sign is independent of the sign of v: a reverse arc with positive

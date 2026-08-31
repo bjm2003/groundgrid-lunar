@@ -194,8 +194,11 @@ private:
         while(target+1 < path_.poses.size()) {
             const auto& current_pose = path_.poses[target].pose;
             const auto& next_pose = path_.poses[target+1].pose;
-            if(std::hypot(current_pose.position.x-x,
-                          current_pose.position.y-y) >= lookahead_) {
+            const double current_target_distance = std::hypot(
+                current_pose.position.x-x, current_pose.position.y-y);
+            if(current_target_distance >= lookahead_ ||
+               requiresTerminalWaypointTracking(
+                   target+2 == path_.poses.size(), current_target_distance, goal_pos_tol_)) {
                 break;
             }
             const double segment_distance = std::hypot(

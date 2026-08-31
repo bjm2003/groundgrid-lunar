@@ -12,6 +12,7 @@ using groundgrid::TrajectoryControlParams;
 using groundgrid::blendTrajectoryCommand;
 using groundgrid::geometricAngularFeedback;
 using groundgrid::requiresInPlaceRotationTracking;
+using groundgrid::requiresTerminalWaypointTracking;
 
 namespace {
 
@@ -103,7 +104,16 @@ int main() {
               "lookahead advances after rotation or along translation");
     }
 
-    // 7) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 7) The final waypoint is exposed only after the penultimate one is acquired.
+    {
+        check(requiresTerminalWaypointTracking(true, 0.8, 0.25),
+              "lookahead cannot skip a distant penultimate waypoint");
+        check(!requiresTerminalWaypointTracking(true, 0.2, 0.25) &&
+              !requiresTerminalWaypointTracking(false, 0.8, 0.25),
+              "lookahead releases an acquired terminal waypoint");
+    }
+
+    // 8) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;
