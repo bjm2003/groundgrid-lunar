@@ -163,11 +163,19 @@ private:
 
         size_t nearest = 0;
         double nearest_d = std::numeric_limits<double>::infinity();
+        double nearest_yaw_error = std::numeric_limits<double>::infinity();
         for(size_t i=0; i<path_.poses.size(); ++i) {
             const double d = std::hypot(path_.poses[i].pose.position.x-x,
                                         path_.poses[i].pose.position.y-y);
-            if(d < nearest_d) {
+            const double yaw_error = std::abs(wrap(
+                tf2::getYaw(path_.poses[i].pose.orientation)-yaw));
+            // In-place rotations contain several poses at exactly the same position. Use
+            // heading to break those distance ties, otherwise nearest remains stuck on the
+            // first rotation pose even after the rover has turned through it.
+            if(d < nearest_d-1e-6 ||
+               (std::abs(d-nearest_d) <= 1e-6 && yaw_error < nearest_yaw_error)) {
                 nearest_d = d;
+                nearest_yaw_error = yaw_error;
                 nearest = i;
             }
         }
@@ -183,10 +191,25 @@ private:
         }
 
         size_t target = nearest;
-        while(target+1 < path_.poses.size() &&
-              std::hypot(path_.poses[target].pose.position.x-x,
-                         path_.poses[target].pose.position.y-y) < lookahead_) {
+        while(target+1 < path_.poses.size()) {
+            const auto& current_pose = path_.poses[target].pose;
+            const auto& next_pose = path_.poses[target+1].pose;
+            if(std::hypot(current_pose.position.x-x,
+                          current_pose.position.y-y) >= lookahead_) {
+                break;
+            }
+            const double segment_distance = std::hypot(
+                next_pose.position.x-current_pose.position.x,
+                next_pose.position.y-current_pose.position.y);
             ++target;
+            // A distance-only lookahead skips every co-located rotation pose and starts
+            // translating before its heading is established. Track one rotation step at a
+            // time until the rover is within the configured yaw tolerance.
+            if(requiresInPlaceRotationTracking(
+                   segment_distance,
+                   wrap(tf2::getYaw(next_pose.orientation)-yaw), goal_yaw_tol_)) {
+                break;
+            }
         }
         const auto& tp = path_.poses[target].pose;
         const double dx = tp.position.x-x;
@@ -216,9 +239,12 @@ private:
                 reverse = std::cos(wrap(bearing-yaw)) < 0.0;
             const double reference_yaw = reverse ? wrap(yaw+M_PI) : yaw;
             const double alpha = wrap(bearing-reference_yaw);
-            const double curvature = 2.0*std::sin(alpha)/std::max(dist,0.1);
-            feedback_w = std::clamp(std::abs(planned_v)*curvature*(reverse?-1.0:1.0),
-                                    -max_w_, max_w_);
+            if(!geometricAngularFeedback(planned_v, alpha, dist, max_w_, feedback_w)) {
+                path_.poses.clear();
+                twists_.clear();
+                stop("invalid_trajectory");
+                return;
+            }
         }
 
         TrajectoryControlParams control_params;

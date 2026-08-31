@@ -782,28 +782,36 @@ private:
     // envelope before the follower applies inverse slip compensation once.
     void buildVelocityProfile(nav_msgs::Path& path,
                               std_msgs::Float32MultiArray& vel_profile) const {
-        // A translating path with only start and goal has no interior sample: both
-        // boundary speeds must be zero, so an index-based follower could never start.
-        // Insert a point on the already collision-checked edge and keep the speed decision
-        // in the planner instead of inventing one in the controller.
-        if(path.poses.size() == 2) {
-            const auto& first = path.poses.front();
-            const auto& last = path.poses.back();
-            const double dx = last.pose.position.x-first.pose.position.x;
-            const double dy = last.pose.position.y-first.pose.position.y;
-            if(std::hypot(dx,dy) > 1e-3) {
-                geometry_msgs::PoseStamped middle = first;
-                middle.pose.position.x = 0.5*(first.pose.position.x+last.pose.position.x);
-                middle.pose.position.y = 0.5*(first.pose.position.y+last.pose.position.y);
-                middle.pose.position.z = 0.5*(first.pose.position.z+last.pose.position.z);
+        // Ideal lattice edges only contain their endpoints. Densify every already
+        // collision-checked edge once so the incoming-command convention has a usable
+        // non-zero sample between zero-speed boundaries. This is especially important for
+        // in-place rotations followed by translation: without an interior yaw sample the
+        // angular deceleration pass correctly reduces the shared endpoint to w=0, leaving
+        // no feed-forward sample with which to execute the rotation.
+        if(path.poses.size() >= 2) {
+            std::vector<geometry_msgs::PoseStamped> dense;
+            dense.reserve(path.poses.size()*2-1);
+            for(size_t i=0; i+1<path.poses.size(); ++i) {
+                const auto& first = path.poses[i];
+                const auto& last = path.poses[i+1];
+                dense.push_back(first);
+                const double dx = last.pose.position.x-first.pose.position.x;
+                const double dy = last.pose.position.y-first.pose.position.y;
                 const double first_yaw = tf2::getYaw(first.pose.orientation);
-                const double middle_yaw = wrap(
-                    first_yaw+0.5*wrap(tf2::getYaw(last.pose.orientation)-first_yaw));
-                tf2::Quaternion q;
-                q.setRPY(0.0,0.0,middle_yaw);
-                middle.pose.orientation = tf2::toMsg(q);
-                path.poses.insert(path.poses.begin()+1,middle);
+                const double dyaw = wrap(tf2::getYaw(last.pose.orientation)-first_yaw);
+                if(std::hypot(dx,dy) > 1e-3 || std::abs(dyaw) > 1e-3) {
+                    geometry_msgs::PoseStamped middle = first;
+                    middle.pose.position.x = 0.5*(first.pose.position.x+last.pose.position.x);
+                    middle.pose.position.y = 0.5*(first.pose.position.y+last.pose.position.y);
+                    middle.pose.position.z = 0.5*(first.pose.position.z+last.pose.position.z);
+                    tf2::Quaternion q;
+                    q.setRPY(0.0,0.0,wrap(first_yaw+0.5*dyaw));
+                    middle.pose.orientation = tf2::toMsg(q);
+                    dense.push_back(middle);
+                }
             }
+            dense.push_back(path.poses.back());
+            path.poses.swap(dense);
         }
         const size_t n = path.poses.size();
         vel_profile.data.assign(2*n, 0.0f);
@@ -837,7 +845,9 @@ private:
         }
 
         for(size_t i=0;i<n;++i) {
-            const size_t s = std::min(i, segs-1);
+            // Match dynamics-primitives semantics: sample i carries the command that
+            // arrives at pose i, so every pose after the first uses its incoming segment.
+            const size_t s = i == 0 ? 0 : i-1;
             double lim = sp_.v_max;
             const double k = std::abs(prof_kappa_[s]);
             if(k > 1e-3) lim = std::min(lim, sp_.w_max/k);
@@ -861,9 +871,11 @@ private:
         // in-place rate where it does not (otherwise the profile is a dead zero exactly
         // where the rover is supposed to be turning on the spot).
         for(size_t i=0;i<n;++i) {
-            const size_t s = std::min(i, segs-1);
+            const size_t s = i == 0 ? 0 : i-1;
             double w = prof_v_[i]*prof_kappa_[s];
-            if(prof_dir_[s] == 0 && std::abs(prof_dyaw_[s]) > 1e-3) {
+            if(i == 0) {
+                w = 0.0;  // same zero-speed boundary as the dynamics branch
+            } else if(prof_dir_[s] == 0 && std::abs(prof_dyaw_[s]) > 1e-3) {
                 const double mag = std::min(sp_.w_max,
                                             std::sqrt(2.0*sp_.alpha_max*std::abs(prof_dyaw_[s])));
                 w = std::copysign(mag, prof_dyaw_[s]);
@@ -881,7 +893,7 @@ private:
 
         float v_peak = 0.0f;
         for(size_t i=0;i<n;++i) {
-            const size_t s = std::min(i, segs-1);
+            const size_t s = i == 0 ? 0 : i-1;
             const float signed_v = prof_dir_[s] < 0 ? -prof_v_[i] : prof_v_[i];
             vel_profile.data[2*i]   = signed_v;
             vel_profile.data[2*i+1] = std::copysign(prof_wmag_[i], prof_w_[i]);

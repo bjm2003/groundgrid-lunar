@@ -621,6 +621,7 @@ class LunarPipelineTest(unittest.TestCase):
         rates = {
             "plan_success_tour": tour_rate,
             "plan_success_all": overall_rate,
+            "reach_tour": sum(1 for t in tour if t["reached"]) / len(tour),
             "reach_rate": sum(1 for t in every if t["reached"]) / len(every),
             "obstacle_avoidance": avoid_rate,
             "near_obstacle_recovery": recovery_rate,
@@ -651,6 +652,8 @@ class LunarPipelineTest(unittest.TestCase):
                       len(every) - len(solvable))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
+        rospy.loginfo("  reached tour      = %.3f (%d/%d)", rates["reach_tour"],
+                      sum(1 for t in tour if t["reached"]), len(tour))
         rospy.loginfo("  避障成功率        = %.3f (%d collision-free / %d attempts; "
                       "%d measured, %d correctly aborted)", avoid_rate,
                       sum(1 for t in attempted if not t["collided"]), len(attempted),
@@ -735,6 +738,8 @@ class LunarPipelineTest(unittest.TestCase):
                                     "规划成功率 on open terrain")
             self.assertGreaterEqual(rates["plan_success_all"], 0.90,
                                     "规划成功率 including hard goals")
+            self.assertGreaterEqual(rates["reach_tour"], 0.99,
+                                    "open-terrain tour goals must actually be reached")
             # Guards the failure mode the tiering could otherwise hide: a planner that
             # declares reachable goals unreachable. Open terrain must never abort.
             self.assertFalse([t for t in tour if "aborted" in t["statuses"]],

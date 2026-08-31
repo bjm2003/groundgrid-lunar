@@ -106,7 +106,8 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 - 12 个 Python 文件通过纯语法编译检查。
 - 10 个 package/launch/rostest XML 文件通过解析。
 - 纯 C++ `SkidSteerModel`/`MotionPrimitiveLibrary` 成功使用 GCC 13.2 编译。
-- `skidsteer_selfcheck` 的动力学 5 项和轨迹控制 5 项检查全部通过。
+- `skidsteer_selfcheck` 的动力学 5 项和轨迹控制 9 项检查全部通过；控制项包含倒车
+  几何反馈方向、前视原地旋转保护、角速度前馈混合、限幅与非有限输入。
 - 运动基元生成器可编译，默认生成结果与跟踪文件无内容差异。
 - P0 分支的 5 项纯 NumPy 辨识测试覆盖已知五参数恢复、settle/NaN 样本、退化激励、解析地形和提取前后数组结果一致性。
 - 合成五参数恢复最大绝对误差为 0.00344，加入 settle/NaN 样本后结果最大变化为 0。

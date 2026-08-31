@@ -10,6 +10,8 @@ using groundgrid::SkidSteerModel;
 using groundgrid::SkidSteerParams;
 using groundgrid::TrajectoryControlParams;
 using groundgrid::blendTrajectoryCommand;
+using groundgrid::geometricAngularFeedback;
+using groundgrid::requiresInPlaceRotationTracking;
 
 namespace {
 
@@ -80,7 +82,28 @@ int main() {
               "inverseCommand recovers commanded (v, w)");
     }
 
-    // 5) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 5) Direction-frame pure pursuit must reinforce, not cancel, reverse feed-forward.
+    {
+        double forward_w = 0.0, reverse_w = 0.0;
+        const bool forward_ok = geometricAngularFeedback(0.6, 0.2, 0.8, 0.8, forward_w);
+        const bool reverse_ok = geometricAngularFeedback(-0.6, 0.2, 0.8, 0.8, reverse_w);
+        check(forward_ok && reverse_ok && forward_w > 0.0 &&
+              std::abs(forward_w-reverse_w) < 1e-12,
+              "reverse geometric feedback preserves planner yaw-rate sign");
+        check(!geometricAngularFeedback(-0.6, 0.2, -0.1, 0.8, reverse_w),
+              "geometric feedback rejects invalid distance");
+    }
+
+    // 6) Lookahead stops at unfinished co-located rotations, then advances when aligned.
+    {
+        check(requiresInPlaceRotationTracking(0.0, 0.3, 0.17),
+              "lookahead preserves unfinished in-place rotation");
+        check(!requiresInPlaceRotationTracking(0.0, 0.1, 0.17) &&
+              !requiresInPlaceRotationTracking(0.45, 0.3, 0.17),
+              "lookahead advances after rotation or along translation");
+    }
+
+    // 7) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;
