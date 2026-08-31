@@ -31,6 +31,7 @@ public:
         pnh_.param("path_timeout", path_timeout_, 3.0);
         pnh_.param("terrain_timeout", terrain_timeout_, 3.0);
         pnh_.param("angular_feedforward_weight", angular_feedforward_weight_, 0.5);
+        pnh_.param("debug_control", debug_control_, false);
         pnh_.param<std::string>("map_frame", map_frame_, "map");
         pnh_.param<std::string>("base_frame", base_frame_, "base_link");
 
@@ -276,6 +277,17 @@ private:
         geometry_msgs::Twist cmd;
         cmd.linear.x = v_cmd;
         cmd.angular.z = w_cmd;
+        if(debug_control_) {
+            ROS_INFO_THROTTLE(
+                0.5,
+                "follow_debug x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
+                "goal_d=%.3f nearest=%zu target=%zu target_d=%.3f "
+                "planned_v=%.3f planned_w=%.3f feedback_w=%.3f "
+                "desired_v=%.3f desired_w=%.3f cmd_v=%.3f cmd_w=%.3f",
+                x, y, yaw, goal.position.x, goal.position.y, goal_d,
+                nearest, target, dist, planned_v, planned_w, feedback_w,
+                desired_v, desired_w, v_cmd, w_cmd);
+        }
         cmd_pub_.publish(cmd);
         publishStatus("tracking");
     }
@@ -294,6 +306,7 @@ private:
     SkidSteerModel model_;
     double lookahead_,max_v_,max_w_,goal_pos_tol_,goal_yaw_tol_;
     double path_timeout_,terrain_timeout_,angular_feedforward_weight_;
+    bool debug_control_;
 };
 
 } // namespace groundgrid

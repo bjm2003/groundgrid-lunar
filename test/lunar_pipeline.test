@@ -9,14 +9,19 @@
          loops over all of them. -->
     <arg name="scenario" default="mixed"/>
     <arg name="metrics_out" default=""/>
+    <!-- Short one-turn controller diagnosis. Skips the multi-trial sweep and enables
+         throttled follower command traces; normal package/formal tests leave it false. -->
+    <arg name="diagnostic_turn" default="false"/>
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim">
         <param name="scenario" value="$(arg scenario)"/>
     </node>
+    <param name="/lunar_path_follower/debug_control" value="$(arg diagnostic_turn)"/>
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
           time-limit="3600">
         <param name="n_trials" value="$(arg n_trials)"/>
         <param name="scenario" value="$(arg scenario)"/>
         <param name="metrics_out" value="$(arg metrics_out)"/>
+        <param name="diagnostic_turn" value="$(arg diagnostic_turn)"/>
     </test>
 </launch>

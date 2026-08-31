@@ -448,6 +448,7 @@ class LunarPipelineTest(unittest.TestCase):
                           not self.atomic_profile_invalid)
             angular_profile_seen = self.angular_profile_seen
             follower_stale = self.follower_stale
+            diagnostics = dict(self.diag)
         # Relative, so legs of different lengths are comparable. Undefined when no route
         # for this goal was captured, or when it was a turn on the spot.
         detour = ((path_len - chord) / chord
@@ -455,6 +456,8 @@ class LunarPipelineTest(unittest.TestCase):
         return {
             "goal": (gx, gy),
             "start": (x0, y0),
+            "final": (final.pose.pose.position.x, final.pose.pose.position.y,
+                      _yaw_of(final.pose.pose.orientation)),
             "reached": reached,
             "planned": any(s.startswith("success") for s in statuses),
             "statuses": statuses,
@@ -465,6 +468,7 @@ class LunarPipelineTest(unittest.TestCase):
             "profile_ok": profile_ok,
             "angular_profile_seen": angular_profile_seen,
             "follower_stale": follower_stale,
+            "diagnostics": diagnostics,
             "latency": latency,
             "plan_ms": plan_ms,
             "path_len": path_len if path_len is not None else float("nan"),
@@ -517,8 +521,14 @@ class LunarPipelineTest(unittest.TestCase):
         cost = rospy.wait_for_message("/terrain/costmap", OccupancyGrid, timeout=20)
         self.assertGreater(sum(1 for v in cost.data if 0 <= v < 100), 1000)
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
-        trial = self._run_trial(initial.pose.pose.position.x + 2.0,
-                                initial.pose.pose.position.y, 0.0, 35.0)
+        diagnostic_turn = bool(rospy.get_param("~diagnostic_turn", False))
+        if diagnostic_turn:
+            trial = self._run_trial(initial.pose.pose.position.x,
+                                    initial.pose.pose.position.y-2.0,
+                                    -math.pi/2.0, 25.0)
+        else:
+            trial = self._run_trial(initial.pose.pose.position.x + 2.0,
+                                    initial.pose.pose.position.y, 0.0, 35.0)
         n_poses, n_vel = self._await_consistent_profile()
         trajectory = rospy.wait_for_message("/lunar_planner/trajectory",
                                             LunarTrajectory, timeout=10)
@@ -526,6 +536,9 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("=== pipeline metrics [mode=%s scenario=%s] ===", mode, self.scenario)
         rospy.loginfo("  moved            = %.3f m", trial["moved"])
         rospy.loginfo("  final goal error = %.3f m", trial["final_err"])
+        rospy.loginfo("  final pose       = (%.3f, %.3f, %.3f)", *trial["final"])
+        rospy.loginfo("  planner statuses = %s", ",".join(sorted(trial["statuses"])))
+        rospy.loginfo("  planner diag     = %s", trial["diagnostics"])
         rospy.loginfo("  tracking RMSE    = %.3f m", trial["rmse"])
         rospy.loginfo("  plan latency     = %.3f s", trial["latency"])
         rospy.loginfo("  path poses / vel = %d / %d", n_poses, n_vel)
@@ -545,6 +558,8 @@ class LunarPipelineTest(unittest.TestCase):
                          "follower stopped on a nominal GroundGrid publication interval")
 
     def test_metrics_over_trials(self):
+        if bool(rospy.get_param("~diagnostic_turn", False)):
+            self.skipTest("short turn diagnostic requested")
         n_trials = int(rospy.get_param("~n_trials", 3))
         spec = SCENARIOS[self.scenario]
         rospy.wait_for_message("/terrain/costmap", OccupancyGrid, timeout=20)
@@ -701,7 +716,8 @@ class LunarPipelineTest(unittest.TestCase):
             path = os.path.expanduser("~/.ros/planner_metrics_%s.json" % self.scenario)
         report = dict(report)
         report["trials"] = [
-            {"goal": list(t["goal"]), "start": list(t["start"]), "reached": t["reached"],
+            {"goal": list(t["goal"]), "start": list(t["start"]),
+             "final": list(t["final"]), "reached": t["reached"],
              "planned": t["planned"], "anomaly": t["anomaly"], "collided": t["collided"],
              "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
              "angular_profile_seen": t["angular_profile_seen"],
