@@ -8,16 +8,14 @@ without launching the vehicle stack.
 
 import math
 import os
-import sys
 import threading
 
 import rospy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lunar_terrain import AnalyticLunarTerrain, SCENARIOS  # noqa: E402
-from skidsteer_identification_core import fit_skidsteer  # noqa: E402
+from groundgrid.lunar_terrain import AnalyticLunarTerrain, SCENARIOS
+from groundgrid.skidsteer_identification_core import fit_skidsteer
 
 
 def yaw_of(q):

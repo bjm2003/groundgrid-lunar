@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """ROS-free least-squares core for skid-steer parameter identification."""
 
 import math

@@ -26,7 +26,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs import point_cloud2
 from std_msgs.msg import Float32MultiArray, Header, MultiArrayDimension
 
-from lunar_terrain import AnalyticLunarTerrain, SCENARIOS
+from groundgrid.lunar_terrain import AnalyticLunarTerrain, SCENARIOS
 
 
 class LunarSurfaceSim:

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """ROS-free analytic lunar terrain shared by simulation and identification."""
 
 import numpy as np

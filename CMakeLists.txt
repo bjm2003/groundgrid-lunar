@@ -32,6 +32,8 @@ find_package(catkin REQUIRED COMPONENTS
     message_generation
 )
 
+catkin_python_setup()
+
 ################################
 ## include common CMake setup ##
 ################################
@@ -253,8 +255,6 @@ catkin_install_python(PROGRAMS
     scripts/eval_groundpoint_classifier.py
     scripts/lunar_surface_sim.py
     scripts/identify_skidsteer.py
-    scripts/lunar_terrain.py
-    scripts/skidsteer_identification_core.py
     scripts/run_planner_experiments.py
     scripts/summarize_planner_metrics.py
     DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

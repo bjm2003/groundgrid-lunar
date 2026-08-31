@@ -8,11 +8,11 @@ import unittest
 
 import numpy as np
 
-SCRIPTS = pathlib.Path(__file__).resolve().parents[1]/"scripts"
-sys.path.insert(0, str(SCRIPTS))
+PYTHON_SRC = pathlib.Path(__file__).resolve().parents[1]/"src"
+sys.path.insert(0, str(PYTHON_SRC))
 
-from lunar_terrain import AnalyticLunarTerrain, SCENARIOS  # noqa: E402
-from skidsteer_identification_core import fit_skidsteer  # noqa: E402
+from groundgrid.lunar_terrain import AnalyticLunarTerrain, SCENARIOS  # noqa: E402
+from groundgrid.skidsteer_identification_core import fit_skidsteer  # noqa: E402
 
 
 TRUTH = {
