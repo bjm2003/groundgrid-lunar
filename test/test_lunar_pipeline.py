@@ -553,7 +553,17 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  path poses / vel = %d / %d", n_poses, n_vel)
 
         self.assertGreater(trial["moved"], 1.0)
-        self.assertLess(trial["final_err"], 0.5)
+        if diagnostic_hard_goal:
+            # This goal is deliberately inside the raw body+clearance envelope. The safe
+            # outcome is a snapped endpoint, so distance to the operator's original click
+            # may exceed the ordinary reach tolerance even when execution is correct.
+            self.assertTrue(trial["planned"], "hard-goal diagnostic produced no nominal plan")
+            self.assertNotIn("aborted", trial["statuses"],
+                             "first hard goal should be solved by snapping, not aborted")
+            self.assertLess(trial["final_err"], 1.5,
+                            "snapped endpoint exceeded max_snap_distance")
+        else:
+            self.assertLess(trial["final_err"], 0.5)
         self.assertFalse(trial["collided"],
                          "closed-loop diagnostic put the body inside a ground-truth hazard")
         # Required in both modes: 3.2 lists the desired linear and angular velocity as a
