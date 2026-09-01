@@ -12,6 +12,18 @@ struct TrajectoryControlParams {
     double max_angular_speed = 0.8;
 };
 
+// Replanning remains mandatory outside the terminal region, in recovery, or whenever the
+// retained path fails validation on the newest map. Invalid distances conservatively deny
+// reuse. Kept pure so the safety gate can be exercised without ROS.
+inline bool terminalTrajectoryReuseAllowed(double goal_distance,
+                                           double terminal_replan_distance,
+                                           bool nominal_mode,
+                                           bool retained_path_valid) {
+    return std::isfinite(goal_distance) && std::isfinite(terminal_replan_distance) &&
+           goal_distance >= 0.0 && terminal_replan_distance > 0.0 && nominal_mode &&
+           retained_path_valid && goal_distance <= terminal_replan_distance;
+}
+
 // A zero linear speed at a pose is a boundary condition, not a command to apply while
 // that pose is still spatially ahead of the rover. This matters at internal
 // translation/rotation junctions as well as at the final goal: lookahead can legitimately

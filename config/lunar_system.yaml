@@ -101,6 +101,9 @@ state_lattice_planner:
   # short enough that it stays on ground the rover just drove over.
   recovery_rotate_step: 0.6       # rad of in-place turn per rotate attempt
   recovery_backout_distance: 1.0  # m retraced along the last successful path
+  # Inside one follower lookahead, reuse the last safe terminal trajectory instead of
+  # allowing equivalent replans to alternate their initial forward/reverse direction.
+  terminal_replan_distance: 0.8
 
 lunar_path_follower:
   map_frame: map

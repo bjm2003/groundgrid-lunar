@@ -73,6 +73,7 @@ public:
         pnh_.param("min_recovery_interval", min_recovery_interval_, 3.0);
         pnh_.param("recovery_rotate_step", recovery_rotate_step_, 0.6);
         pnh_.param("recovery_backout_distance", recovery_backout_distance_, 1.0);
+        pnh_.param("terminal_replan_distance", terminal_replan_distance_, 0.8);
 
         // Escalation ladder, tried in order: cheapest and safest first. Relax and Abort
         // command no motion at all; Rotate turns in place; BackOut is the only rung that
@@ -264,6 +265,50 @@ private:
         best_goal_dist_ = std::numeric_limits<double>::infinity();
         last_progress_time_ = ros::Time::now();
         last_valid_path_.poses.clear();
+        last_valid_profile_.data.clear();
+    }
+
+    bool terminalTrajectoryStillValid(const geometry_msgs::PoseStamped& start) const {
+        if(last_valid_path_.poses.empty() ||
+           last_valid_profile_.data.size() != last_valid_path_.poses.size()*2) {
+            return false;
+        }
+        size_t nearest = 0;
+        double nearest_distance = std::numeric_limits<double>::infinity();
+        for(size_t i=0; i<last_valid_path_.poses.size(); ++i) {
+            const auto& p = last_valid_path_.poses[i].pose.position;
+            const double distance = std::hypot(p.x-start.pose.position.x,
+                                               p.y-start.pose.position.y);
+            if(distance < nearest_distance) {
+                nearest_distance = distance;
+                nearest = i;
+            }
+        }
+        for(size_t i=nearest; i<last_valid_path_.poses.size(); ++i) {
+            const auto& pose = last_valid_path_.poses[i].pose;
+            float cost;
+            // Only the pose occupied by the rover receives the same unknown-cell
+            // exception as an ordinary planning start. Every future pose remains strict;
+            // known hazards and over-limit slopes are invalid in either case.
+            if(!footprintValid(pose.position.x, pose.position.y,
+                               tf2::getYaw(pose.orientation), cost,
+                               /*allow_unknown=*/i == nearest)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void republishTerminalTrajectory() {
+        nav_msgs::Path path = last_valid_path_;
+        path.header.stamp = ros::Time::now();
+        for(auto& pose : path.poses) pose.header = path.header;
+        last_path_ = path;
+        publishPlanOutputs(path, last_valid_profile_);
+        last_plan_ms_ = 0.0;
+        last_fail_reason_.clear();
+        publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
+        publishDiagnostics();
     }
 
     void mapCallback(const grid_map_msgs::GridMapConstPtr& msg) {
@@ -464,6 +509,28 @@ private:
             best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
         }
 
+        // Once the goal is within one follower lookahead, replacing a still-safe path on
+        // every rolling-map update is counterproductive: several equally short lattice
+        // solutions can start in opposite directions, so the rover alternates forward and
+        // reverse without converging. Keep the already collision-checked terminal
+        // trajectory authoritative while it remains valid on the fresh map, and refresh
+        // its atomic timestamp so the follower's freshness gate remains meaningful.
+        if(terminalTrajectoryReuseAllowed(
+               goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
+               /*retained_path_valid=*/true)) {
+            const bool terminal_path_valid = terminalTrajectoryStillValid(start);
+            if(terminalTrajectoryReuseAllowed(
+                   goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
+                   terminal_path_valid)) {
+                ROS_INFO_THROTTLE(1.0,
+                                  "plan: reusing stable terminal trajectory (%zu poses, "
+                                  "goal_dist=%.3fm)",
+                                  last_valid_path_.poses.size(), goal_dist);
+                republishTerminalTrajectory();
+                return;
+            }
+        }
+
         // Two independent triggers, because the task book names both failure modes: repeated
         // planning failure near obstacles, and making no headway while still producing paths
         // (an oscillating planner replans happily forever but never improves best_goal_dist_).
@@ -500,7 +567,10 @@ private:
             last_path_ = path;
             // Only genuine plans seed the back-out buffer: retreating along a previous
             // recovery manoeuvre would just replay the manoeuvre that already failed.
-            if(!in_recovery) last_valid_path_ = path;
+            if(!in_recovery) {
+                last_valid_path_ = path;
+                last_valid_profile_ = vel;
+            }
             publishPlanOutputs(path, vel);
             if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
@@ -1222,7 +1292,7 @@ private:
     std::vector<RecoveryAction> ladder_;
     int recovery_fail_threshold_, recovery_confirm_count_;
     double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
-    double recovery_rotate_step_, recovery_backout_distance_;
+    double recovery_rotate_step_, recovery_backout_distance_, terminal_replan_distance_;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
     int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
@@ -1231,6 +1301,7 @@ private:
     ros::Time last_cpu_time_;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
     nav_msgs::Path last_valid_path_;
+    std_msgs::Float32MultiArray last_valid_profile_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;

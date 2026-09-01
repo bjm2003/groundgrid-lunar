@@ -15,6 +15,7 @@ using groundgrid::geometricAngularFeedback;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
 using groundgrid::selectTrajectoryCommandIndex;
+using groundgrid::terminalTrajectoryReuseAllowed;
 
 namespace {
 
@@ -133,7 +134,19 @@ int main() {
               "distant pose without translation is rejected");
     }
 
-    // 9) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 9) Terminal trajectory locking is allowed only for a fresh, valid nominal remainder.
+    {
+        check(terminalTrajectoryReuseAllowed(0.6, 0.8, true, true),
+              "valid terminal trajectory can be retained");
+        check(!terminalTrajectoryReuseAllowed(0.9, 0.8, true, true) &&
+              !terminalTrajectoryReuseAllowed(0.6, 0.8, false, true) &&
+              !terminalTrajectoryReuseAllowed(0.6, 0.8, true, false),
+              "terminal reuse never bypasses replanning or recovery safety gates");
+        check(!terminalTrajectoryReuseAllowed(NAN, 0.8, true, true),
+              "terminal reuse rejects non-finite input");
+    }
+
+    // 10) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;
