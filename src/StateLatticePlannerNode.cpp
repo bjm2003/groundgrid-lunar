@@ -27,6 +27,7 @@
 
 #include "groundgrid/MotionPrimitiveLibrary.h"
 #include "groundgrid/LunarTrajectory.h"
+#include "groundgrid/TrajectoryControl.h"
 
 namespace groundgrid {
 
