@@ -523,9 +523,12 @@ class LunarPipelineTest(unittest.TestCase):
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
         diagnostic_turn = bool(rospy.get_param("~diagnostic_turn", False))
         if diagnostic_turn:
-            trial = self._run_trial(initial.pose.pose.position.x,
-                                    initial.pose.pose.position.y-2.0,
-                                    -math.pi/2.0, 25.0)
+            # Match the first failing mixed-tour corner: the previous leg is accepted
+            # about 0.5 m before its exact goal, so the next southbound goal is also
+            # offset east of the rover instead of lying exactly on its lateral axis.
+            trial = self._run_trial(initial.pose.pose.position.x+0.5,
+                                    initial.pose.pose.position.y-3.0,
+                                    -math.pi/2.0, 30.0)
         else:
             trial = self._run_trial(initial.pose.pose.position.x + 2.0,
                                     initial.pose.pose.position.y, 0.0, 35.0)
