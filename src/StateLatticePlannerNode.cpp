@@ -1053,6 +1053,7 @@ private:
         const int sk=key(start,cols);
         g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
         int reached=-1;
+        float reached_error=std::numeric_limits<float>::infinity();
         int expanded=0;
         while(!open.empty()) {
             if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) break;
@@ -1060,7 +1061,25 @@ private:
             if(closed[ck]) continue;
             closed[ck]=1; ++expanded;
             const State cur=stateFromKey(ck,cols);
-            if(cur.t==goal.t && heuristic(cur,goal)<=goal_tolerance_) { reached=ck; break; }
+            if(cur.t==goal.t) {
+                const float error = heuristic(cur,goal);
+                // A tolerance hit is a valid fallback, but publishing the first such
+                // state makes the endpoint jump by several cells between replans. Near
+                // the goal that changed the first segment from forward to reverse on
+                // alternate maps and produced a persistent limit cycle. Prefer the exact
+                // lattice goal whenever it is reachable; if the time budget expires,
+                // retain the closest safe tolerance candidate found so recovery/goal
+                // snapping still have their intended escape hatch.
+                if(error <= goal_tolerance_ && error < reached_error) {
+                    reached=ck;
+                    reached_error=error;
+                }
+                if(cur.x==goal.x && cur.y==goal.y) {
+                    reached=ck;
+                    reached_error=0.0f;
+                    break;
+                }
+            }
             if(use_dynamics) {
                 grid_map::Position cp;
                 if(!map_.getPosition(grid_map::Index(cur.x,cur.y),cp)) continue;
@@ -1103,6 +1122,12 @@ private:
                               use_dynamics?"dynamics":"arcs", expanded, elapsed, goal.t, goal_tolerance_);
             last_fail_reason_ = "search_exhausted";
             return false;
+        }
+        if(reached_error > 1e-4f) {
+            ROS_WARN_THROTTLE(1.0,
+                              "plan: exact goal state unavailable within budget; "
+                              "using closest tolerance endpoint %.3fm away",
+                              reached_error);
         }
         path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
 
