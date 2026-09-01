@@ -271,9 +271,10 @@ private:
         last_progress_time_ = ros::Time::now();
         last_valid_path_.poses.clear();
         last_valid_profile_.data.clear();
+        last_valid_was_snapped_ = false;
     }
 
-    bool terminalTrajectoryStillValid(const geometry_msgs::PoseStamped& start) const {
+    bool retainedTrajectoryStillValid(const geometry_msgs::PoseStamped& start) const {
         if(last_valid_path_.poses.empty() ||
            last_valid_profile_.data.size() != last_valid_path_.poses.size()*2) {
             return false;
@@ -289,30 +290,65 @@ private:
                 nearest = i;
             }
         }
-        for(size_t i=nearest; i<last_valid_path_.poses.size(); ++i) {
-            const auto& pose = last_valid_path_.poses[i].pose;
-            float cost;
-            // Only the pose occupied by the rover receives the same unknown-cell
-            // exception as an ordinary planning start. Every future pose remains strict;
-            // known hazards and over-limit slopes are invalid in either case.
-            if(!trajectoryFootprintValid(pose.position.x, pose.position.y,
-                                         tf2::getYaw(pose.orientation), cost,
-                                         /*allow_body_unknown=*/i == nearest)) {
-                return false;
+        // A stale path that the rover has already departed cannot be made safe by choosing
+        // an arbitrary nearest point and cutting back to it. Normal tracking error is much
+        // smaller than the follower lookahead; this bound catches a genuinely lost route.
+        if(nearest_distance > terminal_replan_distance_) return false;
+
+        auto segmentValid = [this](const geometry_msgs::Pose& from,
+                                   const geometry_msgs::Pose& to,
+                                   bool allow_start_unknown) {
+            const double dx = to.position.x-from.position.x;
+            const double dy = to.position.y-from.position.y;
+            const double yaw0 = tf2::getYaw(from.orientation);
+            const double dyaw = wrap(tf2::getYaw(to.orientation)-yaw0);
+            // Bound corner travel, not only centre travel. This makes retained-path
+            // validation obey the same swept-body invariant as newly expanded primitives,
+            // including co-located in-place rotations.
+            const double sweep = std::hypot(dx, dy) + std::abs(dyaw)*cornerRadius();
+            const int steps = std::max(1, static_cast<int>(std::ceil(
+                sweep/std::max(map_.getResolution(), 1e-3))));
+            for(int step=0; step<=steps; ++step) {
+                const double q = static_cast<double>(step)/steps;
+                float cost;
+                if(!trajectoryFootprintValid(from.position.x+q*dx,
+                                             from.position.y+q*dy,
+                                             wrap(yaw0+q*dyaw), cost,
+                                             allow_start_unknown && step==0)) {
+                    return false;
+                }
             }
+            return true;
+        };
+
+        // The current body may occlude its own cells; every point after it is strict. Check
+        // the connector to the nearest retained pose because the follower will immediately
+        // look ahead from there rather than replaying the path prefix.
+        geometry_msgs::Pose from = start.pose;
+        if(!segmentValid(from, last_valid_path_.poses[nearest].pose,
+                         /*allow_start_unknown=*/true)) return false;
+        for(size_t i=nearest+1; i<last_valid_path_.poses.size(); ++i) {
+            if(!segmentValid(last_valid_path_.poses[i-1].pose,
+                             last_valid_path_.poses[i].pose,
+                             /*allow_start_unknown=*/false)) return false;
         }
         return true;
     }
 
-    void republishTerminalTrajectory() {
+    void republishRetainedTrajectory(bool after_failed_replan = false) {
         nav_msgs::Path path = last_valid_path_;
         path.header.stamp = ros::Time::now();
         for(auto& pose : path.poses) pose.header = path.header;
         last_path_ = path;
         publishPlanOutputs(path, last_valid_profile_);
-        last_plan_ms_ = 0.0;
-        last_fail_reason_.clear();
-        publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
+        if(after_failed_replan) {
+            if(last_fail_reason_.empty()) last_fail_reason_ = "replan_failed_reused";
+            else last_fail_reason_ += "_reused";
+        } else {
+            last_plan_ms_ = 0.0;
+            last_fail_reason_.clear();
+        }
+        publishStatus(last_valid_was_snapped_ ? "success_snapped" : "success");
         publishDiagnostics();
     }
 
@@ -523,7 +559,7 @@ private:
         if(terminalTrajectoryReuseAllowed(
                goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
                /*retained_path_valid=*/true)) {
-            const bool terminal_path_valid = terminalTrajectoryStillValid(start);
+            const bool terminal_path_valid = retainedTrajectoryStillValid(start);
             if(terminalTrajectoryReuseAllowed(
                    goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
                    terminal_path_valid)) {
@@ -531,7 +567,7 @@ private:
                                   "plan: reusing stable terminal trajectory (%zu poses, "
                                   "goal_dist=%.3fm)",
                                   last_valid_path_.poses.size(), goal_dist);
-                republishTerminalTrajectory();
+                republishRetainedTrajectory();
                 return;
             }
         }
@@ -575,6 +611,7 @@ private:
             if(!in_recovery) {
                 last_valid_path_ = path;
                 last_valid_profile_ = vel;
+                last_valid_was_snapped_ = snapped_goal_used_;
             }
             publishPlanOutputs(path, vel);
             if(in_recovery) {
@@ -594,6 +631,25 @@ private:
                 publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
             }
         } else {
+            // Search can transiently time out as the rolling perception map changes. Do not
+            // turn that into a stop/recovery if the route already being executed is still a
+            // complete safe solution on this exact map. Its untraversed body+clearance and
+            // every inter-pose sweep are revalidated above; a changed hazard therefore
+            // still withdraws the route immediately. No-progress remains an independent
+            // recovery trigger if the rover keeps a valid route but fails to advance.
+            const bool retained_valid = !in_recovery && retainedTrajectoryStillValid(start);
+            if(retainedTrajectoryFallbackAllowed(mode_ == PlannerMode::Nominal,
+                                                 retained_valid)) {
+                ROS_WARN_THROTTLE(1.0,
+                                  "plan: fresh search failed (%s); continuing revalidated "
+                                  "trajectory (%zu poses)",
+                                  last_fail_reason_.empty() ? "unknown" : last_fail_reason_.c_str(),
+                                  last_valid_path_.poses.size());
+                consecutive_failures_ = 0;
+                confirm_count_ = 0;
+                republishRetainedTrajectory(/*after_failed_replan=*/true);
+                return;
+            }
             ++consecutive_failures_; confirm_count_ = 0;
             last_path_.poses.clear();
             publishPlanOutputs(last_path_, std_msgs::Float32MultiArray());
@@ -1302,6 +1358,7 @@ private:
     double trajectory_clearance_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
+    bool last_valid_was_snapped_=false;
 
     PlannerMode mode_ = PlannerMode::Nominal;
     RecoveryAction action_ = RecoveryAction::None;

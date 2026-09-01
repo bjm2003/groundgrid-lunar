@@ -14,6 +14,7 @@ using groundgrid::blendTrajectoryCommand;
 using groundgrid::geometricAngularFeedback;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
+using groundgrid::retainedTrajectoryFallbackAllowed;
 using groundgrid::selectTrajectoryCommandIndex;
 using groundgrid::terminalTrajectoryReuseAllowed;
 
@@ -146,7 +147,17 @@ int main() {
               "terminal reuse rejects non-finite input");
     }
 
-    // 10) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 10) A transient search failure may keep a revalidated nominal route, never an unsafe
+    // route or a route while recovery owns the controller.
+    {
+        check(retainedTrajectoryFallbackAllowed(true, true),
+              "valid retained trajectory survives a transient replan failure");
+        check(!retainedTrajectoryFallbackAllowed(false, true) &&
+              !retainedTrajectoryFallbackAllowed(true, false),
+              "retained fallback never bypasses recovery or map validation");
+    }
+
+    // 11) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;

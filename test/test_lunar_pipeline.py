@@ -553,6 +553,11 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  path poses / vel = %d / %d", n_poses, n_vel)
 
         self.assertGreater(trial["moved"], 1.0)
+        self.assertFalse(
+            trial["collided"],
+            "closed-loop diagnostic put the body inside a ground-truth hazard: "
+            "clearance=%.3f at %s against %s" %
+            (trial["clearance_min"], trial["worst_at"], trial["worst_obstacle"]))
         if diagnostic_hard_goal:
             # This goal is deliberately inside the raw body+clearance envelope. The safe
             # outcome is a snapped endpoint, so distance to the operator's original click
@@ -564,8 +569,6 @@ class LunarPipelineTest(unittest.TestCase):
                             "snapped endpoint exceeded max_snap_distance")
         else:
             self.assertLess(trial["final_err"], 0.5)
-        self.assertFalse(trial["collided"],
-                         "closed-loop diagnostic put the body inside a ground-truth hazard")
         # Required in both modes: 3.2 lists the desired linear and angular velocity as a
         # planner output, and the arc mode is the shipping default.
         self.assertGreater(n_poses, 0, "planner published no path")
