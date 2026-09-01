@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 using groundgrid::Pose2D;
 using groundgrid::SkidSteerModel;
@@ -13,6 +14,7 @@ using groundgrid::blendTrajectoryCommand;
 using groundgrid::geometricAngularFeedback;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
+using groundgrid::selectTrajectoryCommandIndex;
 
 namespace {
 
@@ -113,7 +115,25 @@ int main() {
               "lookahead releases an acquired terminal waypoint");
     }
 
-    // 8) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 8) Lookahead must not apply a future zero-speed boundary before reaching it.
+    {
+        const std::vector<double> speeds{0.0, 0.6, 0.0, 0.0};
+        std::size_t command = 99;
+        const auto speed_at = [&speeds](std::size_t i) { return speeds[i]; };
+        check(selectTrajectoryCommandIndex(3, speeds.size(), 0.8, 0.2,
+                                           speed_at, command) && command == 1,
+              "distant zero-speed boundary retains translation");
+        check(selectTrajectoryCommandIndex(3, speeds.size(), 0.1, 0.2,
+                                           speed_at, command) && command == 3,
+              "acquired zero-speed boundary is released");
+        const std::vector<double> rotation_only{0.0, 0.0};
+        check(!selectTrajectoryCommandIndex(
+                  1, rotation_only.size(), 0.8, 0.2,
+                  [&rotation_only](std::size_t i) { return rotation_only[i]; }, command),
+              "distant pose without translation is rejected");
+    }
+
+    // 9) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;

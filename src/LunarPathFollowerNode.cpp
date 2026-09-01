@@ -220,12 +220,15 @@ private:
         const double dy = tp.position.y-y;
         const double dist = std::hypot(dx,dy);
 
-        // The final profile sample is a required zero-speed boundary. While the vehicle is
-        // still translating, use the preceding sample and apply the braking envelope below;
-        // otherwise an index-based follower would stop one lookahead distance before goal.
         size_t command_index = target;
-        if(dist >= 0.20 && command_index+1 == twists_.size() && command_index > 0)
-            --command_index;
+        if(!selectTrajectoryCommandIndex(
+               target, twists_.size(), dist, 0.20,
+               [this](size_t i) { return twists_[i].linear.x; }, command_index)) {
+            path_.poses.clear();
+            twists_.clear();
+            stop("invalid_trajectory");
+            return;
+        }
         double planned_v = twists_[command_index].linear.x;
         const double planned_w = twists_[command_index].angular.z;
 
@@ -281,11 +284,12 @@ private:
             ROS_INFO_THROTTLE(
                 0.5,
                 "follow_debug x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
-                "goal_d=%.3f nearest=%zu target=%zu target_d=%.3f "
+                "goal_d=%.3f path_n=%zu nearest=%zu target=%zu command=%zu target_d=%.3f "
                 "planned_v=%.3f planned_w=%.3f feedback_w=%.3f "
                 "desired_v=%.3f desired_w=%.3f cmd_v=%.3f cmd_w=%.3f",
                 x, y, yaw, goal.position.x, goal.position.y, goal_d,
-                nearest, target, dist, planned_v, planned_w, feedback_w,
+                path_.poses.size(), nearest, target, command_index, dist,
+                planned_v, planned_w, feedback_w,
                 desired_v, desired_w, v_cmd, w_cmd);
         }
         cmd_pub_.publish(cmd);

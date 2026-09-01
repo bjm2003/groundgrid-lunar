@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 
 namespace groundgrid {
@@ -10,6 +11,38 @@ struct TrajectoryControlParams {
     double max_linear_speed = 1.39;
     double max_angular_speed = 0.8;
 };
+
+// A zero linear speed at a pose is a boundary condition, not a command to apply while
+// that pose is still spatially ahead of the rover. This matters at internal
+// translation/rotation junctions as well as at the final goal: lookahead can legitimately
+// select the zero-speed pose before the body has arrived there. In that case retain the
+// closest preceding translating sample from the same trajectory. Returns false when the
+// trajectory asks the rover to reach a distant pose without any translating command.
+template<typename LinearSpeedAt>
+inline bool selectTrajectoryCommandIndex(std::size_t target_index,
+                                         std::size_t trajectory_size,
+                                         double target_distance,
+                                         double arrival_distance,
+                                         LinearSpeedAt linear_speed_at,
+                                         std::size_t& command_index) {
+    if(trajectory_size == 0 || target_index >= trajectory_size ||
+       !std::isfinite(target_distance) || !std::isfinite(arrival_distance) ||
+       target_distance < 0.0 || arrival_distance < 0.0) {
+        return false;
+    }
+    command_index = target_index;
+    double speed = linear_speed_at(command_index);
+    if(!std::isfinite(speed)) return false;
+    if(target_distance < arrival_distance || std::abs(speed) > 1e-3) return true;
+
+    while(command_index > 0) {
+        --command_index;
+        speed = linear_speed_at(command_index);
+        if(!std::isfinite(speed)) return false;
+        if(std::abs(speed) > 1e-3) return true;
+    }
+    return false;
+}
 
 // A lookahead may advance onto this pose, but it must not skip beyond it while a
 // co-located heading change is unfinished. Invalid inputs conservatively stop traversal.
