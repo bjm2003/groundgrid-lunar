@@ -65,7 +65,11 @@ public:
         pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
         pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
         pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
-        pnh_.param("goal_snap_clearance", goal_snap_clearance_, 0.25);
+        // Keep the old goal-only parameter as a compatibility fallback. Clearance is a
+        // trajectory invariant, not merely an endpoint property: a safe snapped goal does
+        // not help if the final arc clips the obstacle on its way there.
+        pnh_.param("goal_snap_clearance", trajectory_clearance_, 0.25);
+        pnh_.param("trajectory_clearance", trajectory_clearance_, trajectory_clearance_);
         pnh_.param("recovery_fail_threshold", recovery_fail_threshold_, 3);
         pnh_.param("no_progress_timeout", no_progress_timeout_, 6.0);
         pnh_.param("progress_epsilon", progress_epsilon_, 0.10);
@@ -291,9 +295,9 @@ private:
             // Only the pose occupied by the rover receives the same unknown-cell
             // exception as an ordinary planning start. Every future pose remains strict;
             // known hazards and over-limit slopes are invalid in either case.
-            if(!footprintValid(pose.position.x, pose.position.y,
-                               tf2::getYaw(pose.orientation), cost,
-                               /*allow_unknown=*/i == nearest)) {
+            if(!trajectoryFootprintValid(pose.position.x, pose.position.y,
+                                         tf2::getYaw(pose.orientation), cost,
+                                         /*allow_body_unknown=*/i == nearest)) {
                 return false;
             }
         }
@@ -439,8 +443,8 @@ private:
             // that puts the vehicle into space it cannot currently see -- so re-check every
             // pose strictly (no allow_unknown) and abandon the rung on the first rejection.
             float cost;
-            if(!footprintValid(src.pose.position.x, src.pose.position.y,
-                               tf2::getYaw(src.pose.orientation), cost)) return false;
+            if(!trajectoryFootprintValid(src.pose.position.x, src.pose.position.y,
+                                         tf2::getYaw(src.pose.orientation), cost)) return false;
             const auto& prev = path.poses.back().pose.position;
             travelled += std::hypot(src.pose.position.x - prev.x, src.pose.position.y - prev.y);
             geometry_msgs::PoseStamped pose = src; pose.header = path.header;
@@ -658,6 +662,21 @@ private:
         return true;
     }
 
+    // Validate the physical body strictly, then reserve a configurable band around it from
+    // every *known* hazard. Unknown cells are tolerated only in that extra band: requiring
+    // observed terrain beyond the body would make goals in a LiDAR occlusion shadow
+    // impossible, while allowing unknown cells under the body would weaken the normal
+    // planner invariant. The returned terrain cost remains the body's cost, so adding a
+    // safety band does not also apply terrain speed scaling a second time.
+    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
+                                  bool allow_body_unknown = false) const {
+        if(!footprintValid(x, y, yaw, cost, allow_body_unknown)) return false;
+        if(trajectory_clearance_ <= 0.0) return true;
+        float inflated_cost;
+        return footprintValid(x, y, yaw, inflated_cost,
+                              /*allow_unknown=*/true, trajectory_clearance_);
+    }
+
     // Half the body diagonal: how far a corner stands from the centre, and therefore the
     // radius its arc has when the body turns on the spot.
     double cornerRadius() const {
@@ -678,7 +697,8 @@ private:
                                                              map_.getResolution())));
         cost = 0.0f;
         for(int i = 1; i <= n; ++i)
-            if(!footprintValid(x, y, wrap(yaw0 + dyaw*i/n), cost, allow_unknown)) return false;
+            if(!trajectoryFootprintValid(x, y, wrap(yaw0 + dyaw*i/n), cost,
+                                         allow_unknown)) return false;
         return true;  // cost is the end pose's, which is what the caller charges for
     }
 
@@ -704,7 +724,7 @@ private:
             const double wy = py + s*smp.x + c*smp.y;
             const double wyaw = wrap(pyaw + smp.yaw);
             float terrain;
-            if(!footprintValid(wx, wy, wyaw, terrain)) return false;
+            if(!trajectoryFootprintValid(wx, wy, wyaw, terrain)) return false;
             cost_sum += terrain; ++checks;
         }
         const auto& last = prim.samples[n-1];
@@ -712,7 +732,7 @@ private:
         ey = py + s*last.x + c*last.y;
         eyaw = wrap(pyaw + last.yaw);
         float terrain_end;
-        if(!footprintValid(ex, ey, eyaw, terrain_end)) return false;
+        if(!trajectoryFootprintValid(ex, ey, eyaw, terrain_end)) return false;
         if((n-1) % stride != 0) { cost_sum += terrain_end; ++checks; }
         avg_cost = checks ? cost_sum / checks : terrain_end;
         return true;
@@ -748,7 +768,7 @@ private:
             const double x = p.x() + d*std::cos(yaw0 + q*dyaw*0.5);
             const double y = p.y() + d*std::sin(yaw0 + q*dyaw*0.5);
             float terrain;
-            if(!footprintValid(x, y, yaw, terrain)) return false;
+            if(!trajectoryFootprintValid(x, y, yaw, terrain)) return false;
             terrain_sum += terrain;
         }
         const double x1 = p.x() + direction*primitive_length_*std::cos(yaw0 + dyaw*0.5);
@@ -982,7 +1002,8 @@ private:
     // This moves the goal; it does NOT relax the collision test. Rings are ordered by distance,
     // so the first ring containing any valid candidate is the best one and the search stops there.
     //
-    // Candidates are checked with the footprint inflated by goal_snap_clearance_, because
+    // Candidates, like every trajectory pose, are checked with the footprint inflated by
+    // trajectory_clearance_, because
     // "nearest pose that validates" is by construction a pose on the lethal boundary, and
     // parking there leaves nothing to absorb the two errors that are always present: the
     // hazard map is quantised to one cell (a corner can sit 0.106 m past the last cell centre
@@ -1018,18 +1039,10 @@ private:
                     if(dist > max_distance) continue;
                     for(int db = -goal_snap_heading_span_; db <= goal_snap_heading_span_; ++db) {
                         const int t = ((requested.t + db) % bins_ + bins_) % bins_;
-                        float cost, dummy;
-                        // The body itself must stand on known drivable ground, strictly.
-                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
-                        // The margin band only has to be free of *known* hazards. Applying
-                        // the strict test to it as well would have demanded 0.25 m of
-                        // observed ground beyond the body, which is precisely what a goal in
-                        // an occlusion shadow cannot offer -- and standing 0.25 m from an
-                        // unobserved cell is a knowledge gap, not a collision risk. The band
-                        // exists to absorb cell quantisation and the follower's yaw
-                        // tolerance against hazards the map does show.
-                        if(!footprintValid(cp.x(), cp.y(), yawForBin(t), dummy, true,
-                                           goal_snap_clearance_)) continue;
+                        float cost;
+                        // The body itself must stand on known drivable ground, strictly;
+                        // only the clearance band may contain unknown cells.
+                        if(!trajectoryFootprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
                         const double score = dist
                             + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
                             + goal_snap_cost_weight_*(cost/99.0);
@@ -1083,7 +1096,8 @@ private:
         grid_map::Position sp, gp;
         map_.getPosition(grid_map::Index(start.x,start.y),sp);
         map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,/*allow_unknown=*/true)) {
+        if(!trajectoryFootprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
+                                     /*allow_body_unknown=*/true)) {
             ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
                               "(a LETHAL cell or over-limit slope lies under the vehicle; "
                               "unobserved cells are tolerated at the start)",
@@ -1091,7 +1105,7 @@ private:
             last_fail_reason_ = "start_footprint";
             return false;
         }
-        if(!footprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
+        if(!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
             State snapped; double snap_dist;
             if(!snapGoal(goal, max_snap_distance_, max_planning_time_*0.2, begin, snapped, snap_dist)) {
                 ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f and no "
@@ -1284,7 +1298,8 @@ private:
     std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
     SkidSteerParams sp_;
     double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
-    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_, goal_snap_clearance_;
+    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
+    double trajectory_clearance_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
 

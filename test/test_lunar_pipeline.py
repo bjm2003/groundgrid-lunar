@@ -522,7 +522,12 @@ class LunarPipelineTest(unittest.TestCase):
         self.assertGreater(sum(1 for v in cost.data if 0 <= v < 100), 1000)
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
         diagnostic_turn = bool(rospy.get_param("~diagnostic_turn", False))
-        if diagnostic_turn:
+        diagnostic_hard_goal = bool(rospy.get_param("~diagnostic_hard_goal", False))
+        if diagnostic_hard_goal:
+            self.assertEqual(self.scenario, "mixed",
+                             "diagnostic_hard_goal requires scenario:=mixed")
+            trial = self._run_trial(*HARD_GOALS[0], 35.0)
+        elif diagnostic_turn:
             # Match the first failing mixed-tour corner: the previous leg is accepted
             # about 0.5 m before its exact goal, so the next southbound goal is also
             # offset east of the rover instead of lying exactly on its lateral axis.
@@ -543,11 +548,14 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  planner statuses = %s", ",".join(sorted(trial["statuses"])))
         rospy.loginfo("  planner diag     = %s", trial["diagnostics"])
         rospy.loginfo("  tracking RMSE    = %.3f m", trial["rmse"])
+        rospy.loginfo("  clearance min   = %.3f m", trial["clearance_min"])
         rospy.loginfo("  plan latency     = %.3f s", trial["latency"])
         rospy.loginfo("  path poses / vel = %d / %d", n_poses, n_vel)
 
         self.assertGreater(trial["moved"], 1.0)
         self.assertLess(trial["final_err"], 0.5)
+        self.assertFalse(trial["collided"],
+                         "closed-loop diagnostic put the body inside a ground-truth hazard")
         # Required in both modes: 3.2 lists the desired linear and angular velocity as a
         # planner output, and the arc mode is the shipping default.
         self.assertGreater(n_poses, 0, "planner published no path")
@@ -561,8 +569,9 @@ class LunarPipelineTest(unittest.TestCase):
                          "follower stopped on a nominal GroundGrid publication interval")
 
     def test_metrics_over_trials(self):
-        if bool(rospy.get_param("~diagnostic_turn", False)):
-            self.skipTest("short turn diagnostic requested")
+        if (bool(rospy.get_param("~diagnostic_turn", False)) or
+                bool(rospy.get_param("~diagnostic_hard_goal", False))):
+            self.skipTest("short controller/safety diagnostic requested")
         n_trials = int(rospy.get_param("~n_trials", 3))
         spec = SCENARIOS[self.scenario]
         rospy.wait_for_message("/terrain/costmap", OccupancyGrid, timeout=20)

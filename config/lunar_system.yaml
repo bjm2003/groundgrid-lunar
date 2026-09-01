@@ -76,13 +76,13 @@ state_lattice_planner:
   # body half-diagonal (hypot(0.9,0.75)=1.17m) plus margin -- past that the goal really was
   # unreachable and failing is the honest answer.
   max_snap_distance: 1.5
-  # Clearance the snapped pose must hold on top of the body rectangle. "Nearest pose that
-  # validates" always lands on the lethal boundary, and two errors then push the body over
-  # it: the hazard map is quantised to one 0.15 m cell (a corner can sit 0.106 m past the
-  # last cell centre tested) and the follower parks within goal_yaw_tolerance of the
-  # commanded heading (10 deg swings a corner 0.12 m further out). Measured at 0: the rover
-  # parked 0.13 m inside the (0,-2) boulder with every footprint check passing.
-  goal_snap_clearance: 0.25
+  # Clearance every planned/reused trajectory pose must hold on top of the body rectangle.
+  # Applying it only to a snapped endpoint still allowed the final arc to clip a rock. The
+  # map is quantised to one 0.15 m cell (a corner can sit 0.106 m past the last sampled cell)
+  # and the follower's heading/tracking tolerance consumes another ~0.12 m. The physical body
+  # stays strict-known; only this extra band may contain unknown cells in an occlusion shadow.
+  # `goal_snap_clearance` remains a code-level compatibility fallback for older configs.
+  trajectory_clearance: 0.25
   goal_snap_heading_span: 2       # heading bins searched either side of the requested one
   goal_snap_heading_weight: 0.25  # penalty per bin of heading deviation
   goal_snap_cost_weight: 0.5      # prefer low-terrain-cost snap targets
