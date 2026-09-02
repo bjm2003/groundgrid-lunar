@@ -109,6 +109,11 @@ state_lattice_planner:
   # Inside one follower lookahead, reuse the last safe terminal trajectory instead of
   # allowing equivalent replans to alternate their initial forward/reverse direction.
   terminal_replan_distance: 0.8
+  # Match the follower's terminal gate. Once the actual retained endpoint (including a
+  # snapped endpoint) is acquired, retire the operator goal so the next rolling-map update
+  # cannot issue another trajectory after goal_reached.
+  execution_goal_position_tolerance: 0.25
+  execution_goal_yaw_tolerance: 0.174532925
 
 lunar_path_follower:
   map_frame: map

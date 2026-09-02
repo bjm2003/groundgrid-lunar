@@ -82,6 +82,11 @@ public:
         pnh_.param("recovery_rotate_step", recovery_rotate_step_, 0.6);
         pnh_.param("recovery_backout_distance", recovery_backout_distance_, 1.0);
         pnh_.param("terminal_replan_distance", terminal_replan_distance_, 0.8);
+        pnh_.param("execution_goal_position_tolerance", execution_goal_pos_tolerance_, 0.25);
+        pnh_.param("execution_goal_yaw_tolerance", execution_goal_yaw_tolerance_,
+                   10.0*M_PI/180.0);
+        execution_goal_pos_tolerance_ = std::max(0.0, execution_goal_pos_tolerance_);
+        execution_goal_yaw_tolerance_ = std::max(0.0, execution_goal_yaw_tolerance_);
 
         // Escalation ladder, tried in order: cheapest and safest first. Relax and Abort
         // command no motion at all; Rotate turns in place; BackOut is the only rung that
@@ -561,6 +566,36 @@ private:
         // saying "aborted" so `rostopic echo /lunar_planner/status` explains the silence.
         if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); publishDiagnostics(); return; }
         if(!have_goal_) return;
+        geometry_msgs::PoseStamped start;
+        if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
+
+        // The follower stops against the retained path's actual endpoint, which may be a
+        // snapped lattice pose rather than the operator click. Retire that operator goal at
+        // the same position/yaw tolerances before considering a fresh map. Without this
+        // lifecycle hand-off, a map arriving just after follower goal_reached could reject
+        // the completed terminal sweep and publish a different snapped route, restarting
+        // motion and leaking it into the next trial.
+        if(!last_valid_path_.poses.empty()) {
+            const auto& endpoint = last_valid_path_.poses.back().pose;
+            const double endpoint_dist = std::hypot(
+                endpoint.position.x-start.pose.position.x,
+                endpoint.position.y-start.pose.position.y);
+            const double endpoint_yaw_error = wrap(
+                tf2::getYaw(endpoint.orientation)-tf2::getYaw(start.pose.orientation));
+            if(trajectoryEndpointReached(endpoint_dist, endpoint_yaw_error,
+                                         execution_goal_pos_tolerance_,
+                                         execution_goal_yaw_tolerance_)) {
+                ROS_INFO("plan: execution endpoint reached (position_error=%.3fm, "
+                         "yaw_error=%.3frad); retiring goal",
+                         endpoint_dist, std::abs(endpoint_yaw_error));
+                have_goal_ = false;
+                replan_requested_ = false;
+                last_valid_path_.poses.clear();
+                last_valid_profile_.data.clear();
+                last_valid_was_snapped_ = false;
+                return;
+            }
+        }
         if((ros::Time::now() - map_stamp_).toSec() > max_map_age_) {
             publishStatus("stale_map"); return;
         }
@@ -569,8 +604,6 @@ private:
         // is what lets consecutive plans disagree and the rover oscillate.
         if(!replan_requested_) return;
         replan_requested_ = false;
-        geometry_msgs::PoseStamped start;
-        if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
 
         const double requested_goal_dist = std::hypot(
             goal_.pose.position.x - start.pose.position.x,
@@ -1446,6 +1479,7 @@ private:
     int recovery_fail_threshold_, recovery_confirm_count_;
     double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
     double recovery_rotate_step_, recovery_backout_distance_, terminal_replan_distance_;
+    double execution_goal_pos_tolerance_, execution_goal_yaw_tolerance_;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
     int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();

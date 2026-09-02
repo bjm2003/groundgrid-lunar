@@ -46,6 +46,23 @@ inline bool terminalTrajectoryReuseAllowed(double goal_distance,
            goal_distance <= terminal_replan_distance;
 }
 
+// Once the follower has acquired the actual endpoint of a retained trajectory, the planner
+// must retire the operator goal as well. Otherwise the next rolling-map update can replace an
+// already completed snapped route and start the rover moving again. The caller supplies a
+// wrapped yaw error; this pure gate mirrors the follower's strict terminal tolerances.
+inline bool trajectoryEndpointReached(double position_error,
+                                      double yaw_error,
+                                      double position_tolerance,
+                                      double yaw_tolerance) {
+    if(!std::isfinite(position_error) || !std::isfinite(yaw_error) ||
+       !std::isfinite(position_tolerance) || !std::isfinite(yaw_tolerance) ||
+       position_error < 0.0 || position_tolerance < 0.0 || yaw_tolerance < 0.0) {
+        return false;
+    }
+    return position_error < position_tolerance &&
+           std::abs(yaw_error) < yaw_tolerance;
+}
+
 // A zero linear speed at a pose is a boundary condition, not a command to apply while
 // that pose is still spatially ahead of the rover. This matters at internal
 // translation/rotation junctions as well as at the final goal: lookahead can legitimately

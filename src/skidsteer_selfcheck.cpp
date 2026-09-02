@@ -18,6 +18,7 @@ using groundgrid::retainedTrajectoryFallbackAllowed;
 using groundgrid::selectTrajectoryCommandIndex;
 using groundgrid::stableTrajectoryReuseAllowed;
 using groundgrid::terminalTrajectoryReuseAllowed;
+using groundgrid::trajectoryEndpointReached;
 
 namespace {
 
@@ -170,7 +171,17 @@ int main() {
               "stable reuse preserves progress, recovery, and map safety gates");
     }
 
-    // 12) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 12) Planner and follower agree on when the retained endpoint is complete.
+    {
+        check(trajectoryEndpointReached(0.20, 0.10, 0.25, 0.17),
+              "completed endpoint retires the planner goal");
+        check(!trajectoryEndpointReached(0.25, 0.10, 0.25, 0.17) &&
+              !trajectoryEndpointReached(0.20, 0.17, 0.25, 0.17) &&
+              !trajectoryEndpointReached(NAN, 0.10, 0.25, 0.17),
+              "endpoint completion preserves strict tolerances and rejects invalid input");
+    }
+
+    // 13) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;
