@@ -184,6 +184,7 @@ class LunarPipelineTest(unittest.TestCase):
         self.atomic_profile_invalid = False
         self.angular_profile_seen = False
         self.follower_tracking_seen = False
+        self.follower_goal_reached = False
         self.follower_stale = False
         self.cpu_pct = []
         self.rss_mb = []
@@ -279,6 +280,8 @@ class LunarPipelineTest(unittest.TestCase):
         with self.lock:
             if msg.data == "tracking":
                 self.follower_tracking_seen = True
+            elif msg.data == "goal_reached" and self.follower_tracking_seen:
+                self.follower_goal_reached = True
             elif (self.follower_tracking_seen and
                   msg.data in ("stale_trajectory", "stale_terrain")):
                 self.follower_stale = True
@@ -372,6 +375,7 @@ class LunarPipelineTest(unittest.TestCase):
             self.atomic_profile_invalid = False
             self.angular_profile_seen = False
             self.follower_tracking_seen = False
+            self.follower_goal_reached = False
             self.follower_stale = False
 
     def _run_trial(self, gx, gy, gyaw, timeout):
@@ -425,11 +429,17 @@ class LunarPipelineTest(unittest.TestCase):
                 clearances.append(near[0])
                 if worst is None or near[0] < worst[0]:
                     worst = (near[0], near[1], (fx, fy))
+            # Keep the task-book reach metric tied to the operator's requested goal, but do
+            # not stop observing there. A snapped path deliberately ends elsewhere and may
+            # pass through this radius en route; ending the trial here hid later collisions
+            # and leaked the still-moving rover into the next trial.
             if math.hypot(fx - gx, fy - gy) < REACH_TOLERANCE:
                 reached = True
-                break
             with self.lock:
                 aborted = self.status == "aborted"
+                follower_done = self.follower_goal_reached
+            if follower_done:
+                break
             # The planner has given up and will stay silent until a new goal; waiting out
             # the rest of the timeout would only inflate the test runtime.
             if aborted:
@@ -448,6 +458,7 @@ class LunarPipelineTest(unittest.TestCase):
                           not self.atomic_profile_invalid)
             angular_profile_seen = self.angular_profile_seen
             follower_stale = self.follower_stale
+            follower_goal_reached = self.follower_goal_reached
             diagnostics = dict(self.diag)
         # Relative, so legs of different lengths are comparable. Undefined when no route
         # for this goal was captured, or when it was a turn on the spot.
@@ -468,6 +479,7 @@ class LunarPipelineTest(unittest.TestCase):
             "profile_ok": profile_ok,
             "angular_profile_seen": angular_profile_seen,
             "follower_stale": follower_stale,
+            "follower_goal_reached": follower_goal_reached,
             "diagnostics": diagnostics,
             "latency": latency,
             "plan_ms": plan_ms,
@@ -565,6 +577,8 @@ class LunarPipelineTest(unittest.TestCase):
             self.assertTrue(trial["planned"], "hard-goal diagnostic produced no nominal plan")
             self.assertNotIn("aborted", trial["statuses"],
                              "first hard goal should be solved by snapping, not aborted")
+            self.assertTrue(trial["follower_goal_reached"],
+                            "snapped trajectory never reached its actual endpoint")
             self.assertLess(trial["final_err"], 1.5,
                             "snapped endpoint exceeded max_snap_distance")
         else:
@@ -747,6 +761,7 @@ class LunarPipelineTest(unittest.TestCase):
              "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
              "angular_profile_seen": t["angular_profile_seen"],
              "follower_stale": t["follower_stale"],
+             "follower_goal_reached": t["follower_goal_reached"],
              "statuses": sorted(t["statuses"]),
              "latency_s": t["latency"], "path_len_m": t["path_len"],
              "chord_m": t["chord"], "detour_ratio": t["detour"],
