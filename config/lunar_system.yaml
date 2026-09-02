@@ -82,10 +82,11 @@ state_lattice_planner:
   # and the follower's heading/tracking tolerance consumes another ~0.12 m. The physical body
   # stays strict-known; only this extra band may contain unknown cells in an occlusion shadow.
   trajectory_clearance: 0.25
-  # A snapped endpoint lies beside an invalid/occluded requested goal. In the mixed hard-goal
-  # diagnostic the perceived boulder boundary grew by about 0.25 m between far and near maps,
-  # invalidating an endpoint that held only the ordinary margin. Reserve that map-refinement
-  # allowance at snapped/tolerance endpoints without narrowing every corridor in the route.
+  # A snapped route lies beside an invalid/occluded requested goal. In the mixed hard-goal
+  # diagnostic the perceived boulder boundary grew by about 0.25 m between far and near maps.
+  # Plan that entire route with 0.50 m, then revalidate retained poses against the ordinary
+  # 0.25 m requirement: the difference is explicit map-refinement hysteresis. Ordinary goals
+  # keep trajectory_clearance and therefore do not narrow every corridor in the system.
   goal_snap_clearance: 0.50
   goal_snap_heading_span: 2       # heading bins searched either side of the requested one
   goal_snap_heading_weight: 0.25  # penalty per bin of heading deviation

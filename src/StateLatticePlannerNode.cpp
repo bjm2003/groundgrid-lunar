@@ -71,6 +71,8 @@ public:
         // between far and near observations in the mixed hard-goal diagnostic.
         pnh_.param("trajectory_clearance", trajectory_clearance_, 0.25);
         pnh_.param("goal_snap_clearance", goal_snap_clearance_, 0.50);
+        trajectory_clearance_ = std::max(0.0, trajectory_clearance_);
+        goal_snap_clearance_ = std::max(trajectory_clearance_, goal_snap_clearance_);
         pnh_.param("recovery_fail_threshold", recovery_fail_threshold_, 3);
         pnh_.param("no_progress_timeout", no_progress_timeout_, 6.0);
         pnh_.param("progress_epsilon", progress_epsilon_, 0.10);
@@ -782,8 +784,14 @@ private:
 
     bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
                                   bool allow_body_unknown = false) const {
+        // A route to a snapped goal is planned with an uncertainty reserve along its whole
+        // length, not only at the endpoint. Retained-path validation deliberately uses the
+        // ordinary trajectory_clearance_ explicitly: the difference is hysteresis that the
+        // far-to-near rolling-map refinement may consume without causing path churn.
+        const double clearance = snapped_goal_used_ ? goal_snap_clearance_
+                                                     : trajectory_clearance_;
         return footprintWithClearanceValid(x, y, yaw, cost, allow_body_unknown,
-                                           trajectory_clearance_);
+                                           clearance);
     }
 
     // Half the body diagonal: how far a corner stands from the centre, and therefore the
