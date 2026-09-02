@@ -77,12 +77,16 @@ state_lattice_planner:
   # unreachable and failing is the honest answer.
   max_snap_distance: 1.5
   # Clearance every planned/reused trajectory pose must hold on top of the body rectangle.
-  # Applying it only to a snapped endpoint still allowed the final arc to clip a rock. The
+  # Applying clearance only to a snapped endpoint allowed the final arc to clip a rock. The
   # map is quantised to one 0.15 m cell (a corner can sit 0.106 m past the last sampled cell)
   # and the follower's heading/tracking tolerance consumes another ~0.12 m. The physical body
   # stays strict-known; only this extra band may contain unknown cells in an occlusion shadow.
-  # `goal_snap_clearance` remains a code-level compatibility fallback for older configs.
   trajectory_clearance: 0.25
+  # A snapped endpoint lies beside an invalid/occluded requested goal. In the mixed hard-goal
+  # diagnostic the perceived boulder boundary grew by about 0.25 m between far and near maps,
+  # invalidating an endpoint that held only the ordinary margin. Reserve that map-refinement
+  # allowance at snapped/tolerance endpoints without narrowing every corridor in the route.
+  goal_snap_clearance: 0.50
   goal_snap_heading_span: 2       # heading bins searched either side of the requested one
   goal_snap_heading_weight: 0.25  # penalty per bin of heading deviation
   goal_snap_cost_weight: 0.5      # prefer low-terrain-cost snap targets

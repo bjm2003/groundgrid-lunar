@@ -65,11 +65,12 @@ public:
         pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
         pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
         pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
-        // Keep the old goal-only parameter as a compatibility fallback. Clearance is a
-        // trajectory invariant, not merely an endpoint property: a safe snapped goal does
-        // not help if the final arc clips the obstacle on its way there.
-        pnh_.param("goal_snap_clearance", trajectory_clearance_, 0.25);
-        pnh_.param("trajectory_clearance", trajectory_clearance_, trajectory_clearance_);
+        // All trajectory poses reserve the normal tracking/quantisation margin. A snapped
+        // endpoint reserves an additional band because it is selected exactly where a
+        // rolling, occlusion-limited map is least stable; the boundary grew by ~0.25 m
+        // between far and near observations in the mixed hard-goal diagnostic.
+        pnh_.param("trajectory_clearance", trajectory_clearance_, 0.25);
+        pnh_.param("goal_snap_clearance", goal_snap_clearance_, 0.50);
         pnh_.param("recovery_fail_threshold", recovery_fail_threshold_, 3);
         pnh_.param("no_progress_timeout", no_progress_timeout_, 6.0);
         pnh_.param("progress_epsilon", progress_epsilon_, 0.10);
@@ -1110,16 +1111,16 @@ private:
     // This moves the goal; it does NOT relax the collision test. Rings are ordered by distance,
     // so the first ring containing any valid candidate is the best one and the search stops there.
     //
-    // Candidates, like every trajectory pose, are checked with the footprint inflated by
-    // trajectory_clearance_, because
+    // Candidates are checked with the footprint inflated by goal_snap_clearance_, because
     // "nearest pose that validates" is by construction a pose on the lethal boundary, and
     // parking there leaves nothing to absorb the two errors that are always present: the
     // hazard map is quantised to one cell (a corner can sit 0.106 m past the last cell centre
     // the check looked at), and the follower stops within goal_yaw_tolerance of the commanded
     // heading (10 deg of yaw slews a corner 0.12 m further out than the yaw that was checked).
     // Measured without the margin: the rover parked 0.13 m inside the (0,-2) boulder having
-    // passed its own footprint test. 0.25 m covers both terms with a little left over. The
-    // margin band tolerates unobserved cells -- see the call site.
+    // passed its own footprint test. The ordinary 0.25 m trajectory band covers those two
+    // terms; the snapped endpoint adds the measured far-to-near map-boundary change, for a
+    // 0.50 m default. The margin band tolerates unobserved cells -- see the call site.
     bool snapGoal(const State& requested, double max_distance, double budget_s,
                   const std::chrono::steady_clock::time_point& begin,
                   State& snapped, double& snap_dist) const {
@@ -1150,7 +1151,9 @@ private:
                         float cost;
                         // The body itself must stand on known drivable ground, strictly;
                         // only the clearance band may contain unknown cells.
-                        if(!trajectoryFootprintValid(cp.x(), cp.y(), yawForBin(t), cost)) continue;
+                        if(!footprintWithClearanceValid(cp.x(), cp.y(), yawForBin(t), cost,
+                                                       /*allow_body_unknown=*/false,
+                                                       goal_snap_clearance_)) continue;
                         const double score = dist
                             + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
                             + goal_snap_cost_weight_*(cost/99.0);
@@ -1269,8 +1272,20 @@ private:
                 // retain the closest safe tolerance candidate found so recovery/goal
                 // snapping still have their intended escape hatch.
                 if(error <= goal_tolerance_ && error < reached_error) {
-                    reached=ck;
-                    reached_error=error;
+                    bool endpoint_safe = true;
+                    if(snapped_goal_used_) {
+                        grid_map::Position candidate;
+                        float endpoint_cost;
+                        endpoint_safe = map_.getPosition(grid_map::Index(cur.x, cur.y), candidate) &&
+                            footprintWithClearanceValid(candidate.x(), candidate.y(),
+                                                        yawForBin(cur.t), endpoint_cost,
+                                                        /*allow_body_unknown=*/false,
+                                                        goal_snap_clearance_);
+                    }
+                    if(endpoint_safe) {
+                        reached=ck;
+                        reached_error=error;
+                    }
                 }
                 if(cur.x==goal.x && cur.y==goal.y) {
                     reached=ck;
@@ -1412,7 +1427,7 @@ private:
     SkidSteerParams sp_;
     double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
     double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
-    double trajectory_clearance_;
+    double trajectory_clearance_, goal_snap_clearance_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
     bool last_valid_was_snapped_=false;
