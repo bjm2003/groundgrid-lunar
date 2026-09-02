@@ -18,8 +18,11 @@
     <node pkg="groundgrid" type="lunar_surface_sim.py" name="lunar_surface_sim">
         <param name="scenario" value="$(arg scenario)"/>
     </node>
+    <!-- roslaunch may expose boolean args to $(eval) as bools rather than the literal
+         strings "true"/"false". Normalise both forms so diagnostic runs reliably enable
+         the follower trace instead of silently inheriting the production default. -->
     <param name="/lunar_path_follower/debug_control"
-           value="$(eval arg('diagnostic_turn') == 'true' or arg('diagnostic_hard_goal') == 'true')"/>
+           value="$(eval str(arg('diagnostic_turn')).lower() == 'true' or str(arg('diagnostic_hard_goal')).lower() == 'true')"/>
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
           time-limit="3600">

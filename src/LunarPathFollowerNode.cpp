@@ -284,11 +284,11 @@ private:
             ROS_INFO_THROTTLE(
                 0.5,
                 "follow_debug x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
-                "goal_d=%.3f path_n=%zu nearest=%zu target=%zu command=%zu target_d=%.3f "
+                "goal_d=%.3f path_n=%zu nearest=%zu nearest_d=%.3f target=%zu command=%zu target_d=%.3f "
                 "planned_v=%.3f planned_w=%.3f feedback_w=%.3f "
                 "desired_v=%.3f desired_w=%.3f cmd_v=%.3f cmd_w=%.3f",
                 x, y, yaw, goal.position.x, goal.position.y, goal_d,
-                path_.poses.size(), nearest, target, command_index, dist,
+                path_.poses.size(), nearest, nearest_d, target, command_index, dist,
                 planned_v, planned_w, feedback_w,
                 desired_v, desired_w, v_cmd, w_cmd);
         }
