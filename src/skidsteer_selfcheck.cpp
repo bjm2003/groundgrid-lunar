@@ -12,6 +12,7 @@ using groundgrid::SkidSteerParams;
 using groundgrid::TrajectoryControlParams;
 using groundgrid::blendTrajectoryCommand;
 using groundgrid::geometricAngularFeedback;
+using groundgrid::missionGoalReached;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
 using groundgrid::retainedTrajectoryFallbackAllowed;
@@ -181,7 +182,18 @@ int main() {
               "endpoint completion preserves strict tolerances and rejects invalid input");
     }
 
-    // 13) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 13) Mission completion excludes recovery and unfinished ordinary goals.
+    {
+        check(missionGoalReached(true, true, false, 0.40, 0.50) &&
+              missionGoalReached(true, true, true, 1.20, 0.50),
+              "ordinary and snapped routes use their intended mission completion gates");
+        check(!missionGoalReached(true, false, false, 0.10, 0.50) &&
+              !missionGoalReached(true, true, false, 0.60, 0.50) &&
+              !missionGoalReached(false, true, true, 1.20, 0.50),
+              "recovery and intermediate endpoints cannot complete the mission");
+    }
+
+    // 14) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;

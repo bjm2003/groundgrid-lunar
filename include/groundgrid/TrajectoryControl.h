@@ -63,6 +63,24 @@ inline bool trajectoryEndpointReached(double position_error,
            std::abs(yaw_error) < yaw_tolerance;
 }
 
+// A follower endpoint is a mission completion only when the active trajectory was a route
+// to the task goal, rather than a recovery rotate/back-out. Ordinary routes must also leave
+// the rover inside the requested-goal tolerance; a deliberately snapped route is the narrow
+// exception because its original goal is known to be unsafe.
+inline bool missionGoalReached(bool endpoint_reached,
+                               bool trajectory_reaches_goal,
+                               bool trajectory_was_snapped,
+                               double requested_goal_error,
+                               double requested_goal_tolerance) {
+    if(!endpoint_reached || !trajectory_reaches_goal ||
+       !std::isfinite(requested_goal_error) ||
+       !std::isfinite(requested_goal_tolerance) ||
+       requested_goal_error < 0.0 || requested_goal_tolerance < 0.0) {
+        return false;
+    }
+    return trajectory_was_snapped || requested_goal_error < requested_goal_tolerance;
+}
+
 // A zero linear speed at a pose is a boundary condition, not a command to apply while
 // that pose is still spatially ahead of the rover. This matters at internal
 // translation/rotation junctions as well as at the final goal: lookahead can legitimately

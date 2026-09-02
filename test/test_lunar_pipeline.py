@@ -117,7 +117,7 @@ SCENARIOS = {
 STRICT_SCENARIOS = ("mixed", "flat")
 
 REACH_TOLERANCE = 0.5
-NOMINAL_STATUSES = ("success", "success_snapped")
+NOMINAL_STATUSES = ("success", "success_snapped", "goal_reached")
 
 # A published path counts as "the route for this trial" only if it starts where the trial
 # started and ends at the trial's goal. Without this, 路径长度偏差 measured whatever path
@@ -185,6 +185,7 @@ class LunarPipelineTest(unittest.TestCase):
         self.angular_profile_seen = False
         self.follower_tracking_seen = False
         self.follower_goal_reached = False
+        self.planner_goal_reached = False
         self.follower_stale = False
         self.cpu_pct = []
         self.rss_mb = []
@@ -290,6 +291,8 @@ class LunarPipelineTest(unittest.TestCase):
         with self.lock:
             self.status = msg.data
             self.statuses.add(msg.data)
+            if msg.data == "goal_reached" and self.path_seen:
+                self.planner_goal_reached = True
             if msg.data.startswith("success") and self.first_success_time is None:
                 self.first_success_time = rospy.Time.now()
 
@@ -376,6 +379,7 @@ class LunarPipelineTest(unittest.TestCase):
             self.angular_profile_seen = False
             self.follower_tracking_seen = False
             self.follower_goal_reached = False
+            self.planner_goal_reached = False
             self.follower_stale = False
 
     def _run_trial(self, gx, gy, gyaw, timeout):
@@ -437,8 +441,13 @@ class LunarPipelineTest(unittest.TestCase):
                 reached = True
             with self.lock:
                 aborted = self.status == "aborted"
-                follower_done = self.follower_goal_reached
-            if follower_done:
+                # Planner completion classifies the active path as a task route (rather
+                # than a recovery manoeuvre); follower completion proves the controller has
+                # actually stopped on that path. Require both so neither status can race the
+                # other and leak a residual command into the next trial.
+                mission_done = (self.planner_goal_reached and
+                                self.follower_goal_reached)
+            if mission_done:
                 break
             # The planner has given up and will stay silent until a new goal; waiting out
             # the rest of the timeout would only inflate the test runtime.
@@ -459,6 +468,7 @@ class LunarPipelineTest(unittest.TestCase):
             angular_profile_seen = self.angular_profile_seen
             follower_stale = self.follower_stale
             follower_goal_reached = self.follower_goal_reached
+            planner_goal_reached = self.planner_goal_reached
             diagnostics = dict(self.diag)
         # Relative, so legs of different lengths are comparable. Undefined when no route
         # for this goal was captured, or when it was a turn on the spot.
@@ -480,6 +490,7 @@ class LunarPipelineTest(unittest.TestCase):
             "angular_profile_seen": angular_profile_seen,
             "follower_stale": follower_stale,
             "follower_goal_reached": follower_goal_reached,
+            "planner_goal_reached": planner_goal_reached,
             "diagnostics": diagnostics,
             "latency": latency,
             "plan_ms": plan_ms,
@@ -579,6 +590,8 @@ class LunarPipelineTest(unittest.TestCase):
                              "first hard goal should be solved by snapping, not aborted")
             self.assertTrue(trial["follower_goal_reached"],
                             "snapped trajectory never reached its actual endpoint")
+            self.assertTrue(trial["planner_goal_reached"],
+                            "planner never confirmed snapped mission completion")
             self.assertLess(trial["final_err"], 1.5,
                             "snapped endpoint exceeded max_snap_distance")
         else:
@@ -762,6 +775,7 @@ class LunarPipelineTest(unittest.TestCase):
              "angular_profile_seen": t["angular_profile_seen"],
              "follower_stale": t["follower_stale"],
              "follower_goal_reached": t["follower_goal_reached"],
+             "planner_goal_reached": t["planner_goal_reached"],
              "statuses": sorted(t["statuses"]),
              "latency_s": t["latency"], "path_len_m": t["path_len"],
              "chord_m": t["chord"], "detour_ratio": t["detour"],

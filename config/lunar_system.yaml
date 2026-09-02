@@ -114,6 +114,10 @@ state_lattice_planner:
   # cannot issue another trajectory after goal_reached.
   execution_goal_position_tolerance: 0.25
   execution_goal_yaw_tolerance: 0.174532925
+  # An ordinary trajectory endpoint is only mission-complete inside the operator goal's
+  # acceptance radius. A relaxed endpoint outside it becomes an intermediate waypoint and
+  # is refined; snapped paths remain the explicit unsafe-goal exception.
+  requested_goal_position_tolerance: 0.50
 
 lunar_path_follower:
   map_frame: map

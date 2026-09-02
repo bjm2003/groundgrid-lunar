@@ -85,8 +85,11 @@ public:
         pnh_.param("execution_goal_position_tolerance", execution_goal_pos_tolerance_, 0.25);
         pnh_.param("execution_goal_yaw_tolerance", execution_goal_yaw_tolerance_,
                    10.0*M_PI/180.0);
+        pnh_.param("requested_goal_position_tolerance",
+                   requested_goal_pos_tolerance_, 0.50);
         execution_goal_pos_tolerance_ = std::max(0.0, execution_goal_pos_tolerance_);
         execution_goal_yaw_tolerance_ = std::max(0.0, execution_goal_yaw_tolerance_);
+        requested_goal_pos_tolerance_ = std::max(0.0, requested_goal_pos_tolerance_);
 
         // Escalation ladder, tried in order: cheapest and safest first. Relax and Abort
         // command no motion at all; Rotate turns in place; BackOut is the only rung that
@@ -156,7 +159,9 @@ private:
     // RViz and existing metric tooling. Invalid planner output becomes an empty trajectory,
     // which makes the follower fail safe instead of pairing unrelated latched messages.
     void publishPlanOutputs(const nav_msgs::Path& path,
-                            const std_msgs::Float32MultiArray& profile) {
+                            const std_msgs::Float32MultiArray& profile,
+                            bool reaches_goal,
+                            bool was_snapped) {
         path_pub_.publish(path);
         vel_pub_.publish(profile);
 
@@ -194,6 +199,8 @@ private:
             trajectory.path.poses.clear();
             trajectory.twists.clear();
         }
+        active_trajectory_reaches_goal_ = finite && !path.poses.empty() && reaches_goal;
+        active_trajectory_was_snapped_ = active_trajectory_reaches_goal_ && was_snapped;
         trajectory_pub_.publish(trajectory);
     }
 
@@ -280,6 +287,9 @@ private:
         last_valid_path_.poses.clear();
         last_valid_profile_.data.clear();
         last_valid_was_snapped_ = false;
+        active_trajectory_reaches_goal_ = false;
+        active_trajectory_was_snapped_ = false;
+        last_path_.poses.clear();
     }
 
     bool retainedTrajectoryStillValid(const geometry_msgs::PoseStamped& start) const {
@@ -373,7 +383,8 @@ private:
         path.header.stamp = ros::Time::now();
         for(auto& pose : path.poses) pose.header = path.header;
         last_path_ = path;
-        publishPlanOutputs(path, last_valid_profile_);
+        publishPlanOutputs(path, last_valid_profile_,
+                           /*reaches_goal=*/true, last_valid_was_snapped_);
         if(after_failed_replan) {
             if(last_fail_reason_.empty()) last_fail_reason_ = "replan_failed_reused";
             else last_fail_reason_ += "_reused";
@@ -569,30 +580,62 @@ private:
         geometry_msgs::PoseStamped start;
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
 
-        // The follower stops against the retained path's actual endpoint, which may be a
-        // snapped lattice pose rather than the operator click. Retire that operator goal at
-        // the same position/yaw tolerances before considering a fresh map. Without this
-        // lifecycle hand-off, a map arriving just after follower goal_reached could reject
-        // the completed terminal sweep and publish a different snapped route, restarting
-        // motion and leaking it into the next trial.
-        if(!last_valid_path_.poses.empty()) {
-            const auto& endpoint = last_valid_path_.poses.back().pose;
+        // The follower stops against the *active* trajectory endpoint. That can differ from
+        // last_valid_path_ while recovery owns a rotate/back-out or a relaxed goal plan, so
+        // completion must be classified with the exact trajectory currently at the follower.
+        // A recovery manoeuvre ending is not mission success. An ordinary tolerance endpoint
+        // outside the requested-goal radius is an intermediate waypoint and triggers a fresh
+        // refinement; a snapped route is the deliberate unsafe-goal exception.
+        if(active_trajectory_reaches_goal_ && !last_path_.poses.empty()) {
+            const auto& endpoint = last_path_.poses.back().pose;
             const double endpoint_dist = std::hypot(
                 endpoint.position.x-start.pose.position.x,
                 endpoint.position.y-start.pose.position.y);
             const double endpoint_yaw_error = wrap(
                 tf2::getYaw(endpoint.orientation)-tf2::getYaw(start.pose.orientation));
-            if(trajectoryEndpointReached(endpoint_dist, endpoint_yaw_error,
-                                         execution_goal_pos_tolerance_,
-                                         execution_goal_yaw_tolerance_)) {
+            const bool endpoint_reached = trajectoryEndpointReached(
+                endpoint_dist, endpoint_yaw_error,
+                execution_goal_pos_tolerance_, execution_goal_yaw_tolerance_);
+            const double requested_goal_dist = std::hypot(
+                goal_.pose.position.x-start.pose.position.x,
+                goal_.pose.position.y-start.pose.position.y);
+            if(missionGoalReached(endpoint_reached,
+                                  active_trajectory_reaches_goal_,
+                                  active_trajectory_was_snapped_,
+                                  requested_goal_dist,
+                                  requested_goal_pos_tolerance_)) {
                 ROS_INFO("plan: execution endpoint reached (position_error=%.3fm, "
-                         "yaw_error=%.3frad); retiring goal",
-                         endpoint_dist, std::abs(endpoint_yaw_error));
+                         "yaw_error=%.3frad, requested_error=%.3fm, snapped=%s); "
+                         "retiring goal",
+                         endpoint_dist, std::abs(endpoint_yaw_error), requested_goal_dist,
+                         active_trajectory_was_snapped_ ? "true" : "false");
+                publishStatus("goal_reached");
                 have_goal_ = false;
                 replan_requested_ = false;
                 last_valid_path_.poses.clear();
                 last_valid_profile_.data.clear();
                 last_valid_was_snapped_ = false;
+                active_trajectory_reaches_goal_ = false;
+                active_trajectory_was_snapped_ = false;
+                return;
+            }
+            if(endpoint_reached && !active_trajectory_was_snapped_) {
+                ROS_INFO("plan: intermediate tolerance endpoint reached %.3fm from requested "
+                         "goal; replanning for final accuracy", requested_goal_dist);
+                mode_ = PlannerMode::Nominal;
+                action_ = RecoveryAction::None;
+                consecutive_failures_ = 0;
+                recovery_escalation_ = 0;
+                confirm_count_ = 0;
+                best_goal_dist_ = requested_goal_dist;
+                last_progress_time_ = ros::Time::now();
+                last_valid_path_.poses.clear();
+                last_valid_profile_.data.clear();
+                last_valid_was_snapped_ = false;
+                active_trajectory_reaches_goal_ = false;
+                active_trajectory_was_snapped_ = false;
+                last_path_.poses.clear();
+                replan_requested_ = true;
                 return;
             }
         }
@@ -681,7 +724,8 @@ private:
             // never escalate to Abort -- a hopeless goal would be retried forever, and the
             // 避障恢复率 metric would score a manoeuvre as a recovery.
             last_path_ = path;
-            publishPlanOutputs(path, vel);
+            publishPlanOutputs(path, vel,
+                               /*reaches_goal=*/false, /*was_snapped=*/false);
             publishStatus(recoveryStatus());
         } else if(ok) {
             consecutive_failures_ = 0;
@@ -693,7 +737,8 @@ private:
                 last_valid_profile_ = vel;
                 last_valid_was_snapped_ = snapped_goal_used_;
             }
-            publishPlanOutputs(path, vel);
+            publishPlanOutputs(path, vel,
+                               /*reaches_goal=*/true, snapped_goal_used_);
             if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
                 // marginal situation chatters between recovery and nominal every cycle.
@@ -733,7 +778,8 @@ private:
             }
             ++consecutive_failures_; confirm_count_ = 0;
             last_path_.poses.clear();
-            publishPlanOutputs(last_path_, std_msgs::Float32MultiArray());
+            publishPlanOutputs(last_path_, std_msgs::Float32MultiArray(),
+                               /*reaches_goal=*/false, /*was_snapped=*/false);
             publishStatus(mode_ == PlannerMode::Aborted ? "aborted"
                           : (in_recovery ? recoveryStatus() : "no_path"));
         }
@@ -1480,6 +1526,8 @@ private:
     double no_progress_timeout_, progress_epsilon_, recovery_step_timeout_, min_recovery_interval_;
     double recovery_rotate_step_, recovery_backout_distance_, terminal_replan_distance_;
     double execution_goal_pos_tolerance_, execution_goal_yaw_tolerance_;
+    double requested_goal_pos_tolerance_;
+    bool active_trajectory_reaches_goal_=false, active_trajectory_was_snapped_=false;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
     int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
