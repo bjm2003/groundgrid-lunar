@@ -83,6 +83,7 @@ private:
         if(msg->path.poses.empty()) {
             path_ = msg->path;
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("empty_trajectory");
             return;
         }
@@ -114,11 +115,28 @@ private:
         if(!valid) {
             path_.poses.clear();
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("invalid_trajectory");
             return;
         }
+        bool same_geometry = path_.poses.size() == msg->path.poses.size();
+        if(same_geometry) {
+            for(size_t i=0; i<path_.poses.size(); ++i) {
+                const auto& old_pose = path_.poses[i].pose;
+                const auto& new_pose = msg->path.poses[i].pose;
+                if(std::hypot(old_pose.position.x-new_pose.position.x,
+                              old_pose.position.y-new_pose.position.y) > 1e-6 ||
+                   std::abs(wrap(tf2::getYaw(old_pose.orientation)-
+                                 tf2::getYaw(new_pose.orientation))) > 1e-6) {
+                    same_geometry = false;
+                    break;
+                }
+            }
+        }
+        if(!same_geometry) completed_rotation_floor_ = 0;
         path_ = msg->path;
         twists_ = msg->twists;
+        completed_rotation_floor_ = std::min(completed_rotation_floor_, path_.poses.size()-1);
         // Force one fresh tracking status for every accepted atomic trajectory so external
         // tests can scope subsequent stale-stop events to the plan that caused them.
         last_status_.clear();
@@ -162,10 +180,10 @@ private:
         const double y = tf.transform.translation.y;
         const double yaw = tf2::getYaw(tf.transform.rotation);
 
-        size_t nearest = 0;
+        size_t nearest = completed_rotation_floor_;
         double nearest_d = std::numeric_limits<double>::infinity();
         double nearest_yaw_error = std::numeric_limits<double>::infinity();
-        for(size_t i=0; i<path_.poses.size(); ++i) {
+        for(size_t i=completed_rotation_floor_; i<path_.poses.size(); ++i) {
             const double d = std::hypot(path_.poses[i].pose.position.x-x,
                                         path_.poses[i].pose.position.y-y);
             const double yaw_error = std::abs(wrap(
@@ -187,6 +205,7 @@ private:
         if(goal_d < goal_pos_tol_ && std::abs(wrap(goal_yaw-yaw)) < goal_yaw_tol_) {
             path_.poses.clear();
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("goal_reached");
             return;
         }
@@ -209,10 +228,14 @@ private:
             // A distance-only lookahead skips every co-located rotation pose and starts
             // translating before its heading is established. Track one rotation step at a
             // time until the rover is within the configured yaw tolerance.
+            const double next_yaw_error = wrap(tf2::getYaw(next_pose.orientation)-yaw);
             if(requiresInPlaceRotationTracking(
-                   segment_distance,
-                   wrap(tf2::getYaw(next_pose.orientation)-yaw), goal_yaw_tol_)) {
+                   segment_distance, next_yaw_error, goal_yaw_tol_)) {
                 break;
+            }
+            if(inPlaceRotationCompleted(segment_distance, next_yaw_error,
+                                        goal_yaw_tol_)) {
+                completed_rotation_floor_ = std::max(completed_rotation_floor_, target);
             }
         }
         const auto& tp = path_.poses[target].pose;
@@ -226,6 +249,7 @@ private:
                [this](size_t i) { return twists_[i].linear.x; }, command_index)) {
             path_.poses.clear();
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("invalid_trajectory");
             return;
         }
@@ -249,6 +273,7 @@ private:
             if(!geometricAngularFeedback(planned_v, alpha, dist, max_w_, feedback_w)) {
                 path_.poses.clear();
                 twists_.clear();
+                completed_rotation_floor_ = 0;
                 stop("invalid_trajectory");
                 return;
             }
@@ -264,6 +289,7 @@ private:
                                    desired_v, desired_w)) {
             path_.poses.clear();
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("invalid_trajectory");
             return;
         }
@@ -274,6 +300,7 @@ private:
         if(!std::isfinite(v_cmd) || !std::isfinite(w_cmd)) {
             path_.poses.clear();
             twists_.clear();
+            completed_rotation_floor_ = 0;
             stop("invalid_trajectory");
             return;
         }
@@ -284,11 +311,13 @@ private:
             ROS_INFO_THROTTLE(
                 0.5,
                 "follow_debug x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
-                "goal_d=%.3f path_n=%zu nearest=%zu nearest_d=%.3f target=%zu command=%zu target_d=%.3f "
+                "goal_d=%.3f path_n=%zu rotation_floor=%zu nearest=%zu nearest_d=%.3f "
+                "target=%zu command=%zu target_d=%.3f "
                 "planned_v=%.3f planned_w=%.3f feedback_w=%.3f "
                 "desired_v=%.3f desired_w=%.3f cmd_v=%.3f cmd_w=%.3f",
                 x, y, yaw, goal.position.x, goal.position.y, goal_d,
-                path_.poses.size(), nearest, nearest_d, target, command_index, dist,
+                path_.poses.size(), completed_rotation_floor_, nearest, nearest_d,
+                target, command_index, dist,
                 planned_v, planned_w, feedback_w,
                 desired_v, desired_w, v_cmd, w_cmd);
         }
@@ -311,6 +340,7 @@ private:
     double lookahead_,max_v_,max_w_,goal_pos_tol_,goal_yaw_tol_;
     double path_timeout_,terrain_timeout_,angular_feedforward_weight_;
     bool debug_control_;
+    size_t completed_rotation_floor_=0;
 };
 
 } // namespace groundgrid

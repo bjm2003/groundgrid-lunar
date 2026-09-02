@@ -125,6 +125,20 @@ inline bool requiresInPlaceRotationTracking(double segment_distance,
     return segment_distance < 1e-3 && std::abs(next_yaw_error) >= yaw_tolerance;
 }
 
+// Once an in-place rotation pose is aligned, subsequent pure-pursuit nearest-point searches
+// on the same trajectory must not fall back across that boundary. Otherwise a small heading
+// change on the following translation can make the completed rotation look unfinished again
+// and command the rover back around a terminal loop.
+inline bool inPlaceRotationCompleted(double segment_distance,
+                                     double next_yaw_error,
+                                     double yaw_tolerance) {
+    if(!std::isfinite(segment_distance) || !std::isfinite(next_yaw_error) ||
+       !std::isfinite(yaw_tolerance) || segment_distance < 0.0 || yaw_tolerance < 0.0) {
+        return false;
+    }
+    return segment_distance < 1e-3 && std::abs(next_yaw_error) < yaw_tolerance;
+}
+
 // Do not let ordinary lookahead replace the penultimate waypoint with the fixed goal while
 // the rover is still far from that waypoint. With zero terminal feed-forward, doing so turns
 // half-weight pure pursuit into a limit cycle whose radius is approximately the lookahead.

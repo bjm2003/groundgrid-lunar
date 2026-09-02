@@ -12,6 +12,7 @@ using groundgrid::SkidSteerParams;
 using groundgrid::TrajectoryControlParams;
 using groundgrid::blendTrajectoryCommand;
 using groundgrid::geometricAngularFeedback;
+using groundgrid::inPlaceRotationCompleted;
 using groundgrid::missionGoalReached;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
@@ -111,7 +112,17 @@ int main() {
               "lookahead advances after rotation or along translation");
     }
 
-    // 7) The final waypoint is exposed only after the penultimate one is acquired.
+    // 7) Completed rotation boundaries are monotonic within one trajectory.
+    {
+        check(inPlaceRotationCompleted(0.0, 0.1, 0.17) &&
+              !inPlaceRotationCompleted(0.0, 0.3, 0.17) &&
+              !inPlaceRotationCompleted(0.45, 0.1, 0.17),
+              "completed in-place rotations create a monotonic path boundary");
+        check(!inPlaceRotationCompleted(NAN, 0.1, 0.17),
+              "rotation completion rejects invalid input");
+    }
+
+    // 8) The final waypoint is exposed only after the penultimate one is acquired.
     {
         check(requiresTerminalWaypointTracking(true, 0.8, 0.25),
               "lookahead cannot skip a distant penultimate waypoint");
@@ -120,7 +131,7 @@ int main() {
               "lookahead releases an acquired terminal waypoint");
     }
 
-    // 8) Lookahead must not apply a future zero-speed boundary before reaching it.
+    // 9) Lookahead must not apply a future zero-speed boundary before reaching it.
     {
         const std::vector<double> speeds{0.0, 0.6, 0.0, 0.0};
         std::size_t command = 99;
@@ -138,7 +149,7 @@ int main() {
               "distant pose without translation is rejected");
     }
 
-    // 9) Terminal trajectory locking is allowed only for a fresh, valid nominal remainder.
+    // 10) Terminal trajectory locking is allowed only for a fresh, valid nominal remainder.
     {
         check(terminalTrajectoryReuseAllowed(0.6, 0.8, true, true),
               "valid terminal trajectory can be retained");
@@ -150,7 +161,7 @@ int main() {
               "terminal reuse rejects non-finite input");
     }
 
-    // 10) A transient search failure may keep a revalidated nominal route, never an unsafe
+    // 11) A transient search failure may keep a revalidated nominal route, never an unsafe
     // route or a route while recovery owns the controller.
     {
         check(retainedTrajectoryFallbackAllowed(true, true),
@@ -160,7 +171,7 @@ int main() {
               "retained fallback never bypasses recovery or map validation");
     }
 
-    // 11) Snapped routes remain stable before the terminal region, but neither snapped nor
+    // 12) Snapped routes remain stable before the terminal region, but neither snapped nor
     // terminal reuse may hide no-progress, recovery ownership, or a failed map check.
     {
         check(stableTrajectoryReuseAllowed(true, false, false, true, true) &&
@@ -172,7 +183,7 @@ int main() {
               "stable reuse preserves progress, recovery, and map safety gates");
     }
 
-    // 12) Planner and follower agree on when the retained endpoint is complete.
+    // 13) Planner and follower agree on when the retained endpoint is complete.
     {
         check(trajectoryEndpointReached(0.20, 0.10, 0.25, 0.17),
               "completed endpoint retires the planner goal");
@@ -182,7 +193,7 @@ int main() {
               "endpoint completion preserves strict tolerances and rejects invalid input");
     }
 
-    // 13) Mission completion excludes recovery and unfinished ordinary goals.
+    // 14) Mission completion excludes recovery and unfinished ordinary goals.
     {
         check(missionGoalReached(true, true, false, 0.40, 0.50) &&
               missionGoalReached(true, true, true, 1.20, 0.50),
@@ -193,7 +204,7 @@ int main() {
               "recovery and intermediate endpoints cannot complete the mission");
     }
 
-    // 14) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 15) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;
