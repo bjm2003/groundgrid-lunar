@@ -127,6 +127,10 @@ lunar_path_follower:
   max_angular_speed: 0.8
   goal_position_tolerance: 0.25
   goal_yaw_tolerance: 0.174532925
+  # Acquire the penultimate lattice sample more tightly than the final mission tolerance.
+  # Using 0.25 m for both exposed the endpoint before the last 0.225 m half-primitive was
+  # acquired, so the follower cut the final arc and then circled back toward the goal.
+  waypoint_arrival_distance: 0.20
   # GroundGrid publishes at about 1.1 s/frame on the Ubuntu test machine. These separate
   # freshness gates leave margin for one slow frame without allowing an old command to
   # survive indefinitely.

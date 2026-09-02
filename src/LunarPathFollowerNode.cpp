@@ -28,12 +28,15 @@ public:
         pnh_.param("max_angular_speed", max_w_, 0.6);
         pnh_.param("goal_position_tolerance", goal_pos_tol_, 0.25);
         pnh_.param("goal_yaw_tolerance", goal_yaw_tol_, 10.0*M_PI/180.0);
+        pnh_.param("waypoint_arrival_distance", waypoint_arrival_distance_, 0.20);
         pnh_.param("path_timeout", path_timeout_, 3.0);
         pnh_.param("terrain_timeout", terrain_timeout_, 3.0);
         pnh_.param("angular_feedforward_weight", angular_feedforward_weight_, 0.5);
         pnh_.param("debug_control", debug_control_, false);
         pnh_.param<std::string>("map_frame", map_frame_, "map");
         pnh_.param<std::string>("base_frame", base_frame_, "base_link");
+        waypoint_arrival_distance_ = std::clamp(
+            waypoint_arrival_distance_, 0.01, std::max(0.01, goal_pos_tol_));
 
         // Slip parameters (loaded globally from the skid_steer_model block) drive the
         // one and only inverse-command conversion in the local-navigation pipeline.
@@ -218,7 +221,8 @@ private:
                 current_pose.position.x-x, current_pose.position.y-y);
             if(current_target_distance >= lookahead_ ||
                requiresTerminalWaypointTracking(
-                   target+2 == path_.poses.size(), current_target_distance, goal_pos_tol_)) {
+                   target+2 == path_.poses.size(), current_target_distance,
+                   waypoint_arrival_distance_)) {
                 break;
             }
             const double segment_distance = std::hypot(
@@ -242,10 +246,17 @@ private:
         const double dx = tp.position.x-x;
         const double dy = tp.position.y-y;
         const double dist = std::hypot(dx,dy);
+        const bool target_is_goal = target+1 == path_.poses.size();
+        // Intermediate samples need a tight acquisition gate so lookahead cannot cut the
+        // final lattice arc. At the actual endpoint, however, entering the configured
+        // position tolerance is success in translation: hold position and finish yaw in
+        // place instead of replaying the preceding translating command and overshooting.
+        const double arrival_distance = target_is_goal ? goal_pos_tol_
+                                                       : waypoint_arrival_distance_;
 
         size_t command_index = target;
         if(!selectTrajectoryCommandIndex(
-               target, twists_.size(), dist, 0.20,
+               target, twists_.size(), dist, arrival_distance,
                [this](size_t i) { return twists_[i].linear.x; }, command_index)) {
             path_.poses.clear();
             twists_.clear();
@@ -257,7 +268,7 @@ private:
         const double planned_w = twists_[command_index].angular.z;
 
         double feedback_w = 0.0;
-        if(dist < 0.20) {
+        if(dist < arrival_distance) {
             feedback_w = std::clamp(1.5*wrap(tf2::getYaw(tp.orientation)-yaw),
                                     -max_w_, max_w_);
             planned_v = 0.0;
@@ -338,6 +349,7 @@ private:
     std::string map_frame_,base_frame_,last_status_;
     SkidSteerModel model_;
     double lookahead_,max_v_,max_w_,goal_pos_tol_,goal_yaw_tol_;
+    double waypoint_arrival_distance_;
     double path_timeout_,terrain_timeout_,angular_feedforward_weight_;
     bool debug_control_;
     size_t completed_rotation_floor_=0;

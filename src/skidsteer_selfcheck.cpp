@@ -124,10 +124,10 @@ int main() {
 
     // 8) The final waypoint is exposed only after the penultimate one is acquired.
     {
-        check(requiresTerminalWaypointTracking(true, 0.8, 0.25),
+        check(requiresTerminalWaypointTracking(true, 0.25, 0.20),
               "lookahead cannot skip a distant penultimate waypoint");
-        check(!requiresTerminalWaypointTracking(true, 0.2, 0.25) &&
-              !requiresTerminalWaypointTracking(false, 0.8, 0.25),
+        check(!requiresTerminalWaypointTracking(true, 0.19, 0.20) &&
+              !requiresTerminalWaypointTracking(false, 0.8, 0.20),
               "lookahead releases an acquired terminal waypoint");
     }
 
@@ -142,6 +142,9 @@ int main() {
         check(selectTrajectoryCommandIndex(3, speeds.size(), 0.1, 0.2,
                                            speed_at, command) && command == 3,
               "acquired zero-speed boundary is released");
+        check(selectTrajectoryCommandIndex(3, speeds.size(), 0.24, 0.25,
+                                           speed_at, command) && command == 3,
+              "goal position tolerance releases translation for terminal yaw capture");
         const std::vector<double> rotation_only{0.0, 0.0};
         check(!selectTrajectoryCommandIndex(
                   1, rotation_only.size(), 0.8, 0.2,
