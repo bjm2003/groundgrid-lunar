@@ -12,6 +12,9 @@
     <!-- Short one-turn controller diagnosis. Skips the multi-trial sweep and enables
          throttled follower command traces; normal package/formal tests leave it false. -->
     <arg name="diagnostic_turn" default="false"/>
+    <!-- Isolate the default two-metre straight closed-loop check and skip the sweep. This
+         diagnoses intermittent terminal non-convergence without paying for n_trials=3. -->
+    <arg name="diagnostic_straight" default="false"/>
     <!-- Short mixed-terrain safety diagnosis: drive only to the first hard goal beside the
          (0,-2) boulder, assert ground-truth clearance, and skip the long sweep. -->
     <arg name="diagnostic_hard_goal" default="false"/>
@@ -22,7 +25,7 @@
          strings "true"/"false". Normalise both forms so diagnostic runs reliably enable
          the follower trace instead of silently inheriting the production default. -->
     <param name="/lunar_path_follower/debug_control"
-           value="$(eval str(arg('diagnostic_turn')).lower() == 'true' or str(arg('diagnostic_hard_goal')).lower() == 'true')"/>
+           value="$(eval str(arg('diagnostic_turn')).lower() == 'true' or str(arg('diagnostic_straight')).lower() == 'true' or str(arg('diagnostic_hard_goal')).lower() == 'true')"/>
     <include file="$(find groundgrid)/launch/LunarSystem.launch" />
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
           time-limit="3600">
@@ -30,6 +33,7 @@
         <param name="scenario" value="$(arg scenario)"/>
         <param name="metrics_out" value="$(arg metrics_out)"/>
         <param name="diagnostic_turn" value="$(arg diagnostic_turn)"/>
+        <param name="diagnostic_straight" value="$(arg diagnostic_straight)"/>
         <param name="diagnostic_hard_goal" value="$(arg diagnostic_hard_goal)"/>
     </test>
 </launch>

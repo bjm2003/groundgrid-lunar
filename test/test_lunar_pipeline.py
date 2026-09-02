@@ -610,6 +610,7 @@ class LunarPipelineTest(unittest.TestCase):
 
     def test_metrics_over_trials(self):
         if (bool(rospy.get_param("~diagnostic_turn", False)) or
+                bool(rospy.get_param("~diagnostic_straight", False)) or
                 bool(rospy.get_param("~diagnostic_hard_goal", False))):
             self.skipTest("short controller/safety diagnostic requested")
         n_trials = int(rospy.get_param("~n_trials", 3))
