@@ -16,6 +16,7 @@ using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
 using groundgrid::retainedTrajectoryFallbackAllowed;
 using groundgrid::selectTrajectoryCommandIndex;
+using groundgrid::stableTrajectoryReuseAllowed;
 using groundgrid::terminalTrajectoryReuseAllowed;
 
 namespace {
@@ -157,7 +158,19 @@ int main() {
               "retained fallback never bypasses recovery or map validation");
     }
 
-    // 11) Trajectory control keeps planned v authoritative and actually consumes planned w.
+    // 11) Snapped routes remain stable before the terminal region, but neither snapped nor
+    // terminal reuse may hide no-progress, recovery ownership, or a failed map check.
+    {
+        check(stableTrajectoryReuseAllowed(true, false, false, true, true) &&
+              stableTrajectoryReuseAllowed(false, true, false, true, true),
+              "snapped and terminal routes remain stable while making progress");
+        check(!stableTrajectoryReuseAllowed(true, false, true, true, true) &&
+              !stableTrajectoryReuseAllowed(true, false, false, false, true) &&
+              !stableTrajectoryReuseAllowed(true, false, false, true, false),
+              "stable reuse preserves progress, recovery, and map safety gates");
+    }
+
+    // 12) Trajectory control keeps planned v authoritative and actually consumes planned w.
     {
         TrajectoryControlParams p;
         p.angular_feedforward_weight = 0.5;

@@ -21,6 +21,18 @@ inline bool retainedTrajectoryFallbackAllowed(bool nominal_mode,
     return nominal_mode && retained_path_valid;
 }
 
+// Stable execution is preferred for a snapped goal from the first accepted route, and for
+// an ordinary route inside the terminal lookahead. A no-progress condition must still hand
+// control to recovery, and fresh-map validation remains mandatory in both cases.
+inline bool stableTrajectoryReuseAllowed(bool retained_was_snapped,
+                                         bool terminal_region,
+                                         bool no_progress,
+                                         bool nominal_mode,
+                                         bool retained_path_valid) {
+    return !no_progress && (retained_was_snapped || terminal_region) &&
+           retainedTrajectoryFallbackAllowed(nominal_mode, retained_path_valid);
+}
+
 // Replanning remains mandatory outside the terminal region, in recovery, or whenever the
 // retained path fails validation on the newest map. Invalid distances conservatively deny
 // reuse. Kept pure so the safety gate can be exercised without ROS.

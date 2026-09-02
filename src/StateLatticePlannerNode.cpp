@@ -293,11 +293,18 @@ private:
         // A stale path that the rover has already departed cannot be made safe by choosing
         // an arbitrary nearest point and cutting back to it. Normal tracking error is much
         // smaller than the follower lookahead; this bound catches a genuinely lost route.
-        if(nearest_distance > terminal_replan_distance_) return false;
+        if(nearest_distance > terminal_replan_distance_) {
+            ROS_WARN_THROTTLE(1.0,
+                              "retained trajectory invalid: rover is %.3fm from nearest pose",
+                              nearest_distance);
+            return false;
+        }
 
         auto segmentValid = [this](const geometry_msgs::Pose& from,
                                    const geometry_msgs::Pose& to,
-                                   bool allow_start_unknown) {
+                                   bool allow_start_unknown,
+                                   double clearance0,
+                                   double clearance1) {
             const double dx = to.position.x-from.position.x;
             const double dy = to.position.y-from.position.y;
             const double yaw0 = tf2::getYaw(from.orientation);
@@ -311,10 +318,12 @@ private:
             for(int step=0; step<=steps; ++step) {
                 const double q = static_cast<double>(step)/steps;
                 float cost;
-                if(!trajectoryFootprintValid(from.position.x+q*dx,
-                                             from.position.y+q*dy,
-                                             wrap(yaw0+q*dyaw), cost,
-                                             allow_start_unknown && step==0)) {
+                const double clearance = clearance0+q*(clearance1-clearance0);
+                if(!footprintWithClearanceValid(from.position.x+q*dx,
+                                                from.position.y+q*dy,
+                                                wrap(yaw0+q*dyaw), cost,
+                                                allow_start_unknown && step==0,
+                                                clearance)) {
                     return false;
                 }
             }
@@ -326,11 +335,27 @@ private:
         // look ahead from there rather than replaying the path prefix.
         geometry_msgs::Pose from = start.pose;
         if(!segmentValid(from, last_valid_path_.poses[nearest].pose,
-                         /*allow_start_unknown=*/true)) return false;
+                         /*allow_start_unknown=*/true,
+                         /*clearance0=*/0.0, /*clearance1=*/0.0)) {
+            ROS_WARN_THROTTLE(1.0, "retained trajectory invalid on current-pose connector");
+            return false;
+        }
         for(size_t i=nearest+1; i<last_valid_path_.poses.size(); ++i) {
+            // The current/nearest pose may already sit inside the desired buffer because
+            // of tracking error or a newly refined obstacle boundary. It is not legal to
+            // ignore a lethal cell under the physical body, but it must be legal to follow
+            // a collision-free route *out* of the buffer. Restore the full margin over the
+            // first outgoing segment; all later segments remain fully inflated.
+            const double clearance0 = (i == nearest+1) ? 0.0 : trajectory_clearance_;
             if(!segmentValid(last_valid_path_.poses[i-1].pose,
                              last_valid_path_.poses[i].pose,
-                             /*allow_start_unknown=*/false)) return false;
+                             /*allow_start_unknown=*/false,
+                             clearance0, trajectory_clearance_)) {
+                ROS_WARN_THROTTLE(1.0,
+                                  "retained trajectory invalid on swept segment %zu -> %zu",
+                                  i-1, i);
+                return false;
+            }
         }
         return true;
     }
@@ -544,29 +569,50 @@ private:
         geometry_msgs::PoseStamped start;
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
 
-        const double goal_dist = std::hypot(goal_.pose.position.x - start.pose.position.x,
-                                            goal_.pose.position.y - start.pose.position.y);
-        if(goal_dist < best_goal_dist_ - progress_epsilon_) {
-            best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
+        const double requested_goal_dist = std::hypot(
+            goal_.pose.position.x - start.pose.position.x,
+            goal_.pose.position.y - start.pose.position.y);
+        // Recovery/progress must measure the endpoint the rover is actually executing. A
+        // snapped goal can legitimately stop farther than goal_tolerance_ from the original
+        // operator click; measuring the click made a completed safe snap look permanently
+        // stuck and forced it through the recovery ladder into Abort.
+        double execution_goal_dist = requested_goal_dist;
+        if(!last_valid_path_.poses.empty()) {
+            const auto& endpoint = last_valid_path_.poses.back().pose.position;
+            execution_goal_dist = std::hypot(endpoint.x-start.pose.position.x,
+                                             endpoint.y-start.pose.position.y);
+        }
+        if(execution_goal_dist < best_goal_dist_ - progress_epsilon_) {
+            best_goal_dist_ = execution_goal_dist; last_progress_time_ = ros::Time::now();
         }
 
-        // Once the goal is within one follower lookahead, replacing a still-safe path on
-        // every rolling-map update is counterproductive: several equally short lattice
-        // solutions can start in opposite directions, so the rover alternates forward and
-        // reverse without converging. Keep the already collision-checked terminal
-        // trajectory authoritative while it remains valid on the fresh map, and refresh
-        // its atomic timestamp so the follower's freshness gate remains meaningful.
-        if(terminalTrajectoryReuseAllowed(
-               goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
-               /*retained_path_valid=*/true)) {
-            const bool terminal_path_valid = retainedTrajectoryStillValid(start);
-            if(terminalTrajectoryReuseAllowed(
-                   goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
-                   terminal_path_valid)) {
+        // Compute this before any path reuse. Otherwise a latched terminal route returns
+        // early forever and silently disables the independent no-progress recovery gate.
+        const bool no_progress = execution_goal_dist > goal_tolerance_ &&
+            (ros::Time::now() - last_progress_time_).toSec() > no_progress_timeout_;
+
+        // A snapped endpoint is a safety decision made against an invalid/occluded operator
+        // goal. Re-selecting it on every rolling map made the endpoint jump between several
+        // boundary cells and steered the rover into the conservative obstacle band. Keep a
+        // snapped route from the moment it is first accepted, just as ordinary routes are
+        // kept inside the terminal lookahead. A newly revealed hazard still invalidates the
+        // retained sweep immediately; no-progress also retains authority.
+        const bool terminal_region = terminalTrajectoryReuseAllowed(
+            execution_goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
+            /*retained_path_valid=*/true);
+        const bool stable_route_candidate = stableTrajectoryReuseAllowed(
+            last_valid_was_snapped_, terminal_region, no_progress,
+            mode_ == PlannerMode::Nominal, /*retained_path_valid=*/true);
+        if(stable_route_candidate) {
+            const bool retained_path_valid = retainedTrajectoryStillValid(start);
+            if(stableTrajectoryReuseAllowed(last_valid_was_snapped_, terminal_region,
+                                            no_progress,
+                                            mode_ == PlannerMode::Nominal,
+                                            retained_path_valid)) {
                 ROS_INFO_THROTTLE(1.0,
-                                  "plan: reusing stable terminal trajectory (%zu poses, "
-                                  "goal_dist=%.3fm)",
-                                  last_valid_path_.poses.size(), goal_dist);
+                                  "plan: reusing stable %s trajectory (%zu poses, goal_dist=%.3fm)",
+                                  last_valid_was_snapped_ ? "snapped" : "terminal",
+                                  last_valid_path_.poses.size(), execution_goal_dist);
                 republishRetainedTrajectory();
                 return;
             }
@@ -575,8 +621,6 @@ private:
         // Two independent triggers, because the task book names both failure modes: repeated
         // planning failure near obstacles, and making no headway while still producing paths
         // (an oscillating planner replans happily forever but never improves best_goal_dist_).
-        const bool no_progress = goal_dist > goal_tolerance_ &&
-            (ros::Time::now() - last_progress_time_).toSec() > no_progress_timeout_;
         if(mode_ == PlannerMode::Nominal) {
             const bool cooled_down = last_recovery_end_.isZero() ||
                 (ros::Time::now() - last_recovery_end_).toSec() > min_recovery_interval_;
@@ -621,7 +665,8 @@ private:
                     mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
                     recovery_escalation_ = 0; confirm_count_ = 0;
                     last_recovery_end_ = ros::Time::now();
-                    best_goal_dist_ = goal_dist; last_progress_time_ = ros::Time::now();
+                    best_goal_dist_ = execution_goal_dist;
+                    last_progress_time_ = ros::Time::now();
                     ++recovery_successes_;
                     publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
                 } else {
@@ -724,13 +769,20 @@ private:
     // impossible, while allowing unknown cells under the body would weaken the normal
     // planner invariant. The returned terrain cost remains the body's cost, so adding a
     // safety band does not also apply terrain speed scaling a second time.
-    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
-                                  bool allow_body_unknown = false) const {
+    bool footprintWithClearanceValid(double x, double y, double yaw, float& cost,
+                                     bool allow_body_unknown,
+                                     double clearance) const {
         if(!footprintValid(x, y, yaw, cost, allow_body_unknown)) return false;
-        if(trajectory_clearance_ <= 0.0) return true;
+        if(clearance <= 0.0) return true;
         float inflated_cost;
         return footprintValid(x, y, yaw, inflated_cost,
-                              /*allow_unknown=*/true, trajectory_clearance_);
+                              /*allow_unknown=*/true, clearance);
+    }
+
+    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
+                                  bool allow_body_unknown = false) const {
+        return footprintWithClearanceValid(x, y, yaw, cost, allow_body_unknown,
+                                           trajectory_clearance_);
     }
 
     // Half the body diagonal: how far a corner stands from the centre, and therefore the
@@ -1152,8 +1204,13 @@ private:
         grid_map::Position sp, gp;
         map_.getPosition(grid_map::Index(start.x,start.y),sp);
         map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-        if(!trajectoryFootprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
-                                     /*allow_body_unknown=*/true)) {
+        // The current body cannot be required to retroactively satisfy a clearance margin
+        // that a refined map has just moved across it. Known lethal terrain under the
+        // physical rectangle is still rejected; only the extra band is omitted here. Every
+        // successor is checked with the full trajectory clearance, so a plan can only move
+        // out of the band, never continue through it.
+        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
+                           /*allow_unknown=*/true)) {
             ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
                               "(a LETHAL cell or over-limit slope lies under the vehicle; "
                               "unobserved cells are tolerated at the start)",
