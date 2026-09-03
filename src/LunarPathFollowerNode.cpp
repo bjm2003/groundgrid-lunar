@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,6 +16,7 @@
 #include "groundgrid/LunarTrajectory.h"
 #include "groundgrid/SkidSteerModel.h"
 #include "groundgrid/TrajectoryControl.h"
+#include "groundgrid/TrajectoryTracking.h"
 
 namespace groundgrid {
 
@@ -64,8 +64,6 @@ public:
     ~LunarPathFollowerNode() { cmd_pub_.publish(geometry_msgs::Twist()); }
 
 private:
-    static double wrap(double a) { return std::atan2(std::sin(a),std::cos(a)); }
-
     void publishStatus(const std::string& status) {
         if(status == last_status_) return;
         last_status_ = status;
@@ -85,8 +83,7 @@ private:
                                                     : msg->path.header.stamp;
         if(msg->path.poses.empty()) {
             path_ = msg->path;
-            twists_.clear();
-            completed_rotation_floor_ = 0;
+            tracker_.clear();
             stop("empty_trajectory");
             return;
         }
@@ -117,29 +114,34 @@ private:
         }
         if(!valid) {
             path_.poses.clear();
-            twists_.clear();
-            completed_rotation_floor_ = 0;
+            tracker_.clear();
             stop("invalid_trajectory");
             return;
         }
-        bool same_geometry = path_.poses.size() == msg->path.poses.size();
-        if(same_geometry) {
-            for(size_t i=0; i<path_.poses.size(); ++i) {
-                const auto& old_pose = path_.poses[i].pose;
-                const auto& new_pose = msg->path.poses[i].pose;
-                if(std::hypot(old_pose.position.x-new_pose.position.x,
-                              old_pose.position.y-new_pose.position.y) > 1e-6 ||
-                   std::abs(wrap(tf2::getYaw(old_pose.orientation)-
-                                 tf2::getYaw(new_pose.orientation))) > 1e-6) {
-                    same_geometry = false;
-                    break;
+        std::vector<TrackingSample> samples;
+        samples.reserve(msg->path.poses.size());
+        for(size_t i=0; i<msg->path.poses.size(); ++i) {
+            const auto& pose = msg->path.poses[i].pose;
+            samples.push_back({{pose.position.x, pose.position.y, tf2::getYaw(pose.orientation)},
+                               msg->twists[i].linear.x, msg->twists[i].angular.z});
+        }
+        bool changed = false;
+        if(!tracker_.setTrajectory(std::move(samples), changed)) {
+            path_.poses.clear();
+            stop("invalid_trajectory");
+            return;
+        }
+        path_ = msg->path;
+        if(changed) {
+            ++trajectory_id_;
+            if(debug_control_) {
+                for(size_t i=0; i<tracker_.samples().size(); ++i) {
+                    const auto& s = tracker_.samples()[i];
+                    ROS_INFO("trajectory_debug id=%zu point=%zu x=%.6f y=%.6f yaw=%.6f v=%.6f w=%.6f",
+                             trajectory_id_, i, s.pose.x, s.pose.y, s.pose.yaw, s.v, s.w);
                 }
             }
         }
-        if(!same_geometry) completed_rotation_floor_ = 0;
-        path_ = msg->path;
-        twists_ = msg->twists;
-        completed_rotation_floor_ = std::min(completed_rotation_floor_, path_.poses.size()-1);
         // Force one fresh tracking status for every accepted atomic trajectory so external
         // tests can scope subsequent stale-stop events to the plan that caused them.
         last_status_.clear();
@@ -183,135 +185,37 @@ private:
         const double y = tf.transform.translation.y;
         const double yaw = tf2::getYaw(tf.transform.rotation);
 
-        size_t nearest = completed_rotation_floor_;
-        double nearest_d = std::numeric_limits<double>::infinity();
-        double nearest_yaw_error = std::numeric_limits<double>::infinity();
-        for(size_t i=completed_rotation_floor_; i<path_.poses.size(); ++i) {
-            const double d = std::hypot(path_.poses[i].pose.position.x-x,
-                                        path_.poses[i].pose.position.y-y);
-            const double yaw_error = std::abs(wrap(
-                tf2::getYaw(path_.poses[i].pose.orientation)-yaw));
-            // In-place rotations contain several poses at exactly the same position. Use
-            // heading to break those distance ties, otherwise nearest remains stuck on the
-            // first rotation pose even after the rover has turned through it.
-            if(d < nearest_d-1e-6 ||
-               (std::abs(d-nearest_d) <= 1e-6 && yaw_error < nearest_yaw_error)) {
-                nearest_d = d;
-                nearest_yaw_error = yaw_error;
-                nearest = i;
-            }
-        }
-
-        const auto& goal = path_.poses.back().pose;
-        const double goal_d = std::hypot(goal.position.x-x,goal.position.y-y);
-        const double goal_yaw = tf2::getYaw(goal.orientation);
-        if(goal_d < goal_pos_tol_ && std::abs(wrap(goal_yaw-yaw)) < goal_yaw_tol_) {
+        TrackingParams params;
+        params.lookahead = lookahead_;
+        params.waypoint_arrival_distance = waypoint_arrival_distance_;
+        params.goal_position_tolerance = goal_pos_tol_;
+        params.goal_yaw_tolerance = goal_yaw_tol_;
+        params.control.angular_feedforward_weight = angular_feedforward_weight_;
+        params.control.max_linear_speed = max_v_;
+        params.control.max_angular_speed = max_w_;
+        const TrackingStep step = tracker_.step({x,y,yaw}, params);
+        if(step.status == TrackingStatus::GoalReached) {
             path_.poses.clear();
-            twists_.clear();
-            completed_rotation_floor_ = 0;
+            tracker_.clear();
             stop("goal_reached");
             return;
         }
-
-        size_t target = nearest;
-        while(target+1 < path_.poses.size()) {
-            const auto& current_pose = path_.poses[target].pose;
-            const auto& next_pose = path_.poses[target+1].pose;
-            const double current_target_distance = std::hypot(
-                current_pose.position.x-x, current_pose.position.y-y);
-            if(current_target_distance >= lookahead_ ||
-               requiresTerminalWaypointTracking(
-                   target+2 == path_.poses.size(), current_target_distance,
-                   waypoint_arrival_distance_)) {
-                break;
-            }
-            const double segment_distance = std::hypot(
-                next_pose.position.x-current_pose.position.x,
-                next_pose.position.y-current_pose.position.y);
-            ++target;
-            // A distance-only lookahead skips every co-located rotation pose and starts
-            // translating before its heading is established. Track one rotation step at a
-            // time until the rover is within the configured yaw tolerance.
-            const double next_yaw_error = wrap(tf2::getYaw(next_pose.orientation)-yaw);
-            if(requiresInPlaceRotationTracking(
-                   segment_distance, next_yaw_error, goal_yaw_tol_)) {
-                break;
-            }
-            if(inPlaceRotationCompleted(segment_distance, next_yaw_error,
-                                        goal_yaw_tol_)) {
-                completed_rotation_floor_ = std::max(completed_rotation_floor_, target);
-            }
-        }
-        const auto& tp = path_.poses[target].pose;
-        const double dx = tp.position.x-x;
-        const double dy = tp.position.y-y;
-        const double dist = std::hypot(dx,dy);
-        const bool target_is_goal = target+1 == path_.poses.size();
-        // Intermediate samples need a tight acquisition gate so lookahead cannot cut the
-        // final lattice arc. At the actual endpoint, however, entering the configured
-        // position tolerance is success in translation: hold position and finish yaw in
-        // place instead of replaying the preceding translating command and overshooting.
-        const double arrival_distance = target_is_goal ? goal_pos_tol_
-                                                       : waypoint_arrival_distance_;
-
-        size_t command_index = target;
-        if(!selectTrajectoryCommandIndex(
-               target, twists_.size(), dist, arrival_distance,
-               [this](size_t i) { return twists_[i].linear.x; }, command_index)) {
+        if(step.status != TrackingStatus::Tracking) {
+            ROS_WARN("follow_phase_invalid id=%zu phase=%s begin=%zu end=%zu x=%.3f y=%.3f yaw=%.3f",
+                     trajectory_id_, motionPhaseName(step.phase), step.phase_begin, step.phase_end,
+                     x,y,yaw);
             path_.poses.clear();
-            twists_.clear();
-            completed_rotation_floor_ = 0;
-            stop("invalid_trajectory");
-            return;
-        }
-        double planned_v = twists_[command_index].linear.x;
-        const double planned_w = twists_[command_index].angular.z;
-
-        double feedback_w = 0.0;
-        if(dist < arrival_distance) {
-            feedback_w = std::clamp(1.5*wrap(tf2::getYaw(tp.orientation)-yaw),
-                                    -max_w_, max_w_);
-            planned_v = 0.0;
-        } else {
-            const double bearing = std::atan2(dy,dx);
-            bool reverse;
-            if(std::abs(planned_v) > 1e-3)
-                reverse = planned_v < 0.0;
-            else
-                reverse = std::cos(wrap(bearing-yaw)) < 0.0;
-            const double reference_yaw = reverse ? wrap(yaw+M_PI) : yaw;
-            const double alpha = wrap(bearing-reference_yaw);
-            if(!geometricAngularFeedback(planned_v, alpha, dist, max_w_, feedback_w)) {
-                path_.poses.clear();
-                twists_.clear();
-                completed_rotation_floor_ = 0;
-                stop("invalid_trajectory");
-                return;
-            }
-        }
-
-        TrajectoryControlParams control_params;
-        control_params.angular_feedforward_weight = angular_feedforward_weight_;
-        control_params.max_linear_speed = max_v_;
-        control_params.max_angular_speed = max_w_;
-        double desired_v = 0.0;
-        double desired_w = 0.0;
-        if(!blendTrajectoryCommand(planned_v, planned_w, feedback_w, control_params,
-                                   desired_v, desired_w)) {
-            path_.poses.clear();
-            twists_.clear();
-            completed_rotation_floor_ = 0;
+            tracker_.clear();
             stop("invalid_trajectory");
             return;
         }
 
-        double v_cmd = desired_v;
-        double w_cmd = desired_w;
-        model_.inverseCommand(desired_v,desired_w,v_cmd,w_cmd);
+        double v_cmd = step.desired_v;
+        double w_cmd = step.desired_w;
+        model_.inverseCommand(step.desired_v,step.desired_w,v_cmd,w_cmd);
         if(!std::isfinite(v_cmd) || !std::isfinite(w_cmd)) {
             path_.poses.clear();
-            twists_.clear();
-            completed_rotation_floor_ = 0;
+            tracker_.clear();
             stop("invalid_trajectory");
             return;
         }
@@ -319,18 +223,22 @@ private:
         cmd.linear.x = v_cmd;
         cmd.angular.z = w_cmd;
         if(debug_control_) {
+            const auto& target = tracker_.samples()[step.target].pose;
+            const auto& goal = tracker_.samples().back().pose;
             ROS_INFO_THROTTLE(
                 0.5,
-                "follow_debug x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
-                "goal_d=%.3f path_n=%zu rotation_floor=%zu nearest=%zu nearest_d=%.3f "
-                "target=%zu command=%zu target_d=%.3f "
+                "follow_debug id=%zu x=%.3f y=%.3f yaw=%.3f goal_x=%.3f goal_y=%.3f "
+                "goal_d=%.3f path_n=%zu phase=%s phase_begin=%zu phase_end=%zu "
+                "nearest=%zu nearest_d=%.3f target=%zu command=%zu target_d=%.3f "
+                "target_x=%.3f target_y=%.3f target_yaw=%.3f capture=%s "
                 "planned_v=%.3f planned_w=%.3f feedback_w=%.3f "
                 "desired_v=%.3f desired_w=%.3f cmd_v=%.3f cmd_w=%.3f",
-                x, y, yaw, goal.position.x, goal.position.y, goal_d,
-                path_.poses.size(), completed_rotation_floor_, nearest, nearest_d,
-                target, command_index, dist,
-                planned_v, planned_w, feedback_w,
-                desired_v, desired_w, v_cmd, w_cmd);
+                trajectory_id_, x, y, yaw, goal.x, goal.y, std::hypot(goal.x-x,goal.y-y),
+                path_.poses.size(), motionPhaseName(step.phase), step.phase_begin, step.phase_end,
+                step.nearest, step.nearest_distance, step.target, step.command, step.target_distance,
+                target.x, target.y, target.yaw, step.pose_capture ? "true" : "false",
+                step.planned_v, step.planned_w, step.feedback_w,
+                step.desired_v, step.desired_w, v_cmd, w_cmd);
         }
         cmd_pub_.publish(cmd);
         publishStatus("tracking");
@@ -344,7 +252,7 @@ private:
     tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_;
     nav_msgs::Path path_;
-    std::vector<geometry_msgs::Twist> twists_;
+    TrajectoryTracking tracker_;
     ros::Time received_,terrain_received_;
     std::string map_frame_,base_frame_,last_status_;
     SkidSteerModel model_;
@@ -352,7 +260,7 @@ private:
     double waypoint_arrival_distance_;
     double path_timeout_,terrain_timeout_,angular_feedforward_weight_;
     bool debug_control_;
-    size_t completed_rotation_floor_=0;
+    size_t trajectory_id_=0;
 };
 
 } // namespace groundgrid

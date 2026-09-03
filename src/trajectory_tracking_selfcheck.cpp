@@ -1,0 +1,211 @@
+// Stateful, multi-step controller regression tests. All fixtures below are synthetic;
+// they verify index/phase semantics, not ROS timing, perception, or collision clearance.
+#include "groundgrid/TrajectoryTracking.h"
+
+#include <cstdio>
+#include <vector>
+
+using namespace groundgrid;
+
+namespace {
+int failures = 0;
+void check(bool ok, const char* label) {
+    std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", label);
+    if(!ok) ++failures;
+}
+TrackingSample sample(double x, double y, double yaw, double v = 0.0, double w = 0.0) {
+    return {{x,y,yaw},v,w};
+}
+
+// Reproduce the former unbounded nearest/lookahead selection to establish the regression
+// fixture: lookahead crossed a reversing cusp and selected the later forward command.
+std::size_t legacyTarget(const std::vector<TrackingSample>& path, const Pose2D& pose) {
+    std::size_t target = 0;
+    double nearest = std::numeric_limits<double>::infinity();
+    for(std::size_t i = 0; i < path.size(); ++i) {
+        const double d = std::hypot(path[i].pose.x-pose.x, path[i].pose.y-pose.y);
+        if(d < nearest) { nearest = d; target = i; }
+    }
+    while(target+1 < path.size()) {
+        const auto& p = path[target].pose;
+        const auto& next = path[target+1].pose;
+        const double d = std::hypot(p.x-pose.x, p.y-pose.y);
+        if(d >= 0.8 || requiresTerminalWaypointTracking(target+2 == path.size(),d,0.20)) break;
+        ++target;
+        if(requiresInPlaceRotationTracking(std::hypot(next.x-p.x,next.y-p.y),
+                                          SkidSteerModel::wrap(next.yaw-pose.yaw),0.174532925)) break;
+    }
+    return target;
+}
+
+bool replay(const std::vector<TrackingSample>& path, Pose2D rover, bool republish = false) {
+    TrajectoryTracking tracker;
+    TrackingParams params;
+    bool changed = false;
+    if(!tracker.setTrajectory(path, changed)) return false;
+    SkidSteerModel model;
+    std::size_t last_begin = 0;
+    for(int tick = 0; tick < 1200; ++tick) {
+        if(republish && tick%10 == 0) {
+            if(!tracker.setTrajectory(path, changed) || changed) return false;
+        }
+        const auto out = tracker.step(rover, params);
+        if(out.status == TrackingStatus::GoalReached) return true;
+        if(out.status != TrackingStatus::Tracking || out.phase_begin < last_begin ||
+           out.target < out.phase_begin || out.target > out.phase_end ||
+           out.command < out.phase_begin || out.command > out.phase_end ||
+           !std::isfinite(out.desired_v) || !std::isfinite(out.desired_w) ||
+           std::abs(out.desired_v) > params.control.max_linear_speed+1e-12 ||
+           std::abs(out.desired_w) > params.control.max_angular_speed+1e-12) return false;
+        last_begin = out.phase_begin;
+        if((out.phase == MotionPhase::Reverse && out.desired_v > 0.0) ||
+           (out.phase == MotionPhase::Forward && out.desired_v < 0.0)) return false;
+        rover = model.integrate(rover, out.desired_v, out.desired_w, 0.05);
+    }
+    std::printf("  replay timed out at (%.3f, %.3f, %.3f)\n",rover.x,rover.y,rover.yaw);
+    return false;
+}
+}
+
+int main() {
+    const double pi = std::acos(-1.0);
+    TrackingParams p;
+    bool changed = false;
+    const std::vector<TrackingSample> cusp{
+        sample(1,0,0), sample(.75,0,0,-.5), sample(.5,0,0),
+        sample(.725,-.075,-pi/16,.5,-.4), sample(.95,-.15,-pi/8)};
+    {
+        const auto old_target = legacyTarget(cusp,{1,0,0});
+        check(old_target == 3 && cusp[old_target].v > 0,
+              "old selection reproduces future forward command across reverse cusp");
+        TrajectoryTracking tracker;
+        check(tracker.setTrajectory(cusp,changed) && changed, "accept finite atomic samples");
+        const auto out = tracker.step({1,0,0},p);
+        check(out.status == TrackingStatus::Tracking && out.phase == MotionPhase::Reverse &&
+              out.phase_end == 2 && out.command == 1 && out.desired_v < 0,
+              "lookahead and velocity lookup remain in active reversing phase");
+        check(replay(cusp,{1,0,0},true), "multi-step reverse cusp then forward arc reaches endpoint");
+    }
+    const std::vector<TrackingSample> turn{
+        sample(0,0,0), sample(.3,0,0,.5), sample(.6,0,0),
+        sample(.6,0,pi/4,0,.6), sample(.6,0,pi/2),
+        sample(.6,.3,pi/2,.5), sample(.6,.6,pi/2)};
+    {
+        TrajectoryTracking tracker;
+        tracker.setTrajectory(turn,changed);
+        auto out = tracker.step({.6,0,0},p);
+        check(out.phase == MotionPhase::RotateLeft && out.phase_begin == 2 && out.phase_end == 3 &&
+              out.desired_v == 0 && out.desired_w > 0,
+              "translation must acquire boundary before in-place rotation starts");
+        out = tracker.step({.6,.18,.2},p);
+        check(out.phase == MotionPhase::RotateLeft && out.target == 3 && out.nearest <= 3 &&
+              out.desired_v == 0,
+              "nearer future translation cannot bypass unfinished rotation");
+        tracker.setTrajectory(turn,changed);
+        tracker.step({.6,0,pi/4},p);
+        out = tracker.step({.6,0,pi/2},p);
+        check(!changed && out.phase == MotionPhase::Forward && out.phase_begin == 4,
+              "same-geometry republish preserves acquired phase progress");
+        out = tracker.step({.6,0,0},p);
+        check(out.phase_begin == 4, "later yaw change cannot reactivate completed rotation");
+        auto replacement = turn;
+        replacement.back().pose.y += .15;
+        tracker.setTrajectory(replacement,changed);
+        out = tracker.step({0,0,0},p);
+        check(changed && out.phase_begin == 0, "real geometric replan resets phase progress");
+        check(replay(turn,{0,0,0},true), "multi-step translation rotation translation reaches endpoint");
+    }
+    {
+        TrajectoryTracking tracker;
+        std::vector<TrackingSample> bad_phase{
+            sample(0,0,0),sample(.3,0,0,.5),sample(.6,0,0),
+            sample(.3,0,0),sample(0,0,pi/4)};
+        tracker.setTrajectory(bad_phase,changed);
+        const auto out = tracker.step({.6,0,0},p);
+        check(out.status == TrackingStatus::Invalid && out.desired_v == 0,
+              "missing reverse speed cannot borrow earlier forward command");
+    }
+    {
+        std::vector<TrackingSample> long_rotation;
+        for(int i = 0; i <= 12; ++i) {
+            long_rotation.push_back(sample(0,0,SkidSteerModel::wrap(i*pi/8),0,
+                                           i == 0 || i == 12 ? 0.0 : .6));
+        }
+        TrajectoryTracking tracker;
+        tracker.setTrajectory(long_rotation,changed);
+        Pose2D rover{0,0,0};
+        SkidSteerModel model;
+        double swept = 0.0;
+        bool correct_direction = true, reached = false;
+        for(int tick = 0; tick < 1000; ++tick) {
+            const auto out = tracker.step(rover,p);
+            if(out.status == TrackingStatus::GoalReached) { reached = true; break; }
+            if(out.status != TrackingStatus::Tracking || out.desired_v != 0 || out.desired_w < 0) {
+                correct_direction = false;
+                break;
+            }
+            swept += out.desired_w*.05;
+            rover = model.integrate(rover,out.desired_v,out.desired_w,.05);
+        }
+        check(correct_direction && reached && swept > pi,
+              "long rotation follows ordered swept headings across angle wrap");
+    }
+    {
+        TrajectoryTracking tracker;
+        std::vector<TrackingSample> rotation{
+            sample(0,0,.8),sample(0,0,.6,0,-.686),sample(0,0,.4)};
+        tracker.setTrajectory(rotation,changed);
+        const auto out = tracker.step({0,0,.1},p);
+        check(out.status == TrackingStatus::Tracking && out.planned_w == 0 && out.desired_w > 0,
+              "passed rotation feedforward cannot oppose yaw correction");
+        check(replay(rotation,{0,0,.1}), "overshot rotation still converges without biased equilibrium");
+        const auto disconnected = tracker.step({1,0,.1},p);
+        check(disconnected.status == TrackingStatus::Invalid,
+              "rotation cannot invent translation to a distant anchor");
+    }
+    {
+        TrajectoryTracking tracker;
+        const std::vector<TrackingSample> path{sample(0,0,0),sample(.5,0,0,.6,.4),sample(1,0,0)};
+        tracker.setTrajectory(path,changed);
+        const auto out = tracker.step({.81,0,.5},p);
+        check(out.pose_capture && out.desired_v == 0 && out.planned_w == 0 && out.desired_w < 0,
+              "terminal yaw capture does not replay translating curvature");
+        check(replay(path,{.81,0,.5}), "captured goal rotates to completion without leaving position tolerance");
+    }
+    for(int direction : {-1,1}) {
+        std::vector<TrackingSample> straight, arc;
+        for(int i = 0; i <= 8; ++i) {
+            const double v = (i == 0 || i == 8) ? 0.0 : direction*.4;
+            straight.push_back(sample(direction*.25*i,0,0,v));
+            const double angle = (pi/2)*i/8;
+            arc.push_back(sample(direction*std::sin(angle),direction*(1-std::cos(angle)),
+                                 angle,v,(i == 0 || i == 8) ? 0.0 : .4));
+        }
+        check(replay(straight,{0,0,0}),direction < 0 ? "reverse straight replay" : "forward straight replay");
+        check(replay(arc,{0,0,0}),direction < 0 ? "reverse arc replay" : "forward arc replay");
+    }
+    {
+        const std::vector<TrackingSample> compound{
+            sample(0,0,0), sample(.45,0,0,.5), sample(.9,0,0),
+            sample(.9,0,pi/4,0,.6), sample(.9,0,pi/2),
+            sample(.9,-.45,pi/2,-.5), sample(.9,-.9,pi/2),
+            sample(.9,-.45,pi/2,.5), sample(.9,0,pi/2,.5), sample(.9,.5,pi/2),
+            sample(.9,.5,pi/4,0,-.6), sample(.9,.5,0)};
+        check(replay(compound,{0,0,0},true), "combined rotation reverse forward terminal-rotation replay");
+    }
+    {
+        TrajectoryTracking tracker;
+        tracker.setTrajectory(cusp,changed);
+        check(tracker.step({NAN,0,0},p).status == TrackingStatus::Invalid, "reject nonfinite rover pose");
+        TrackingParams invalid = p; invalid.lookahead = NAN;
+        check(tracker.step({1,0,0},invalid).status == TrackingStatus::Invalid, "reject nonfinite control parameter");
+        auto bad = cusp; bad[1].v = NAN;
+        check(!tracker.setTrajectory(bad,changed) && tracker.samples().empty(), "invalid atomic replacement clears old trajectory");
+        check(!tracker.setTrajectory({},changed), "empty trajectory rejected");
+        tracker.setTrajectory(cusp,changed);
+        auto speed_change = cusp; speed_change[1].v = -.4;
+        check(tracker.setTrajectory(speed_change,changed) && !changed, "speed-only update preserves phase identity");
+    }
+    std::printf("trajectory_tracking_selfcheck: %d failure(s)\n",failures);
+    return failures ? 1 : 0;
+}

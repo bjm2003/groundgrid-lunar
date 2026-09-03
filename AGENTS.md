@@ -51,6 +51,8 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
 - Compile all Python sources without importing ROS modules.
 - Parse package, launch, and rostest XML.
 - Build and run `skidsteer_selfcheck` for pure dynamics changes.
+- Build and run `trajectory_tracking_selfcheck` for follower targeting/phase changes; it
+  exercises the same ROS-free stateful core used by the live follower.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.

@@ -569,6 +569,8 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  final goal error = %.3f m", trial["final_err"])
         rospy.loginfo("  final pose       = (%.3f, %.3f, %.3f)", *trial["final"])
         rospy.loginfo("  planner statuses = %s", ",".join(sorted(trial["statuses"])))
+        rospy.loginfo("  mission complete = planner:%s follower:%s",
+                      trial["planner_goal_reached"], trial["follower_goal_reached"])
         rospy.loginfo("  planner diag     = %s", trial["diagnostics"])
         rospy.loginfo("  tracking RMSE    = %.3f m", trial["rmse"])
         rospy.loginfo("  clearance min   = %.3f m", trial["clearance_min"])
@@ -588,14 +590,17 @@ class LunarPipelineTest(unittest.TestCase):
             self.assertTrue(trial["planned"], "hard-goal diagnostic produced no nominal plan")
             self.assertNotIn("aborted", trial["statuses"],
                              "first hard goal should be solved by snapping, not aborted")
-            self.assertTrue(trial["follower_goal_reached"],
-                            "snapped trajectory never reached its actual endpoint")
-            self.assertTrue(trial["planner_goal_reached"],
-                            "planner never confirmed snapped mission completion")
             self.assertLess(trial["final_err"], 1.5,
                             "snapped endpoint exceeded max_snap_distance")
         else:
             self.assertLess(trial["final_err"], 0.5)
+        # Being inside the distance threshold when the observation window expires is not
+        # a completed mission. Require the same two completion signals for ordinary and
+        # snapped routes, while retaining their different requested-position thresholds.
+        self.assertTrue(trial["follower_goal_reached"],
+                        "trajectory never reached its actual endpoint")
+        self.assertTrue(trial["planner_goal_reached"],
+                        "planner never confirmed mission completion")
         # Required in both modes: 3.2 lists the desired linear and angular velocity as a
         # planner output, and the arc mode is the shipping default.
         self.assertGreater(n_poses, 0, "planner published no path")

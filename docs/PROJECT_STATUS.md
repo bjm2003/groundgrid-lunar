@@ -1,8 +1,8 @@
 # GroundGrid 月球车项目状态
 
-最后核对日期：2026-08-28
+最后核对日期：2026-09-03
 
-核对基线：`main` / `14e0fde`；P0 实现分支：`codex/p0-trajectory-fixes`
+接手基线：`main` / `14e0fde`；当前工作分支：`codex/p0-trajectory-fixes`（尚未合并）。最近收到的 Ubuntu 短诊断来自 `80e5d56`；下面明确区分已收到的测试证据与尚待 Ubuntu 验证的修复。
 
 状态：可进行 ROS 仿真闭环的月球车感知与局部规划原型，尚未达到任务书整体验收或真实车辆交付状态。
 
@@ -72,6 +72,20 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 
 理想弧线和动力学基元现在都输出滑移补偿前的期望有效车体速度。动力学基元原始轮端命令先通过 `effectiveTwist()` 转换；地形缩放和速度/加速度包络统一在规划器端执行。跟踪器直接采用规划线速度，以固定 0.5 权重混合规划角速度和几何反馈，再调用一次 `inverseCommand()`。纯 C++ 核心已覆盖正向、倒车、原地旋转、角速度前馈、限幅和非有限输入；ROS 闭环仍需验证。
 
+### 当前 P0 阻塞：末端复合轨迹的执行顺序与稳定收敛
+
+`80e5d56` 的 `mixed / diagnostic_straight=true` 在 Ubuntu 返回 `DIAG_RC=0`，但同一输出中，车到执行终点的距离曾从 0.282 m 增至 0.835 m，之后倒车返回并由规划器确认完成。因此这只能证明该次最终到达，不能证明末端跟踪已稳定；短诊断还会跳过多轮统计测试，不能把 rostest 摘要中的两项 passed 当作完整巡回通过。
+
+代码审查和合成复现已确认旧选择逻辑存在两个结构性缺口：全路径最近点搜索可能跳过未完成旋转，前视/零速度回查可能越过前进—倒车切换边界。当前修复把目标选择及速度混合提取到 `TrajectoryTracking.h`：
+
+- 最近点、前视和命令回查只在当前运动段内进行；段末位置与航向都取得后才允许进入下一段。
+- 同几何轨迹重发保留已完成进度，真正重规划才重置；原地旋转按逐个航向样本执行，避免把长角度扫掠折成反向短转。
+- 进入位置保持后的航向纠偏不再重放已结束平移弧线的角速度；已越过的旋转前馈不得反向抵消纠偏。混合权重仍为 0.5，速度上限、超时和验收距离未改变。
+- `trajectory_tracking_selfcheck` 用生产跟踪核心进行连续多步回放；调试输出增加轨迹编号、全部位姿/速度及当前运动段和命令索引，供 Ubuntu 对照实际执行顺序。
+- `test_closed_loop` 对普通目标也要求规划器与跟踪器双方完成，防止超时时碰巧位于 0.5 m 范围内被误报为任务完成。
+
+这些改变已通过下述 Windows 离线检查，但尚无该修复的 Ubuntu 构建/闭环结果。合成复现证明了旧代码缺口，不足以独自确认用户这次实测轨迹的全部失效原因。感知、规划搜索、矩形/扫掠安全检查和阈值均未修改。
+
 ### P0 实现完成、待 Ubuntu 验证：滑移辨识
 
 月面解析地形已提取为仿真器和辨识器共用的无 ROS 模块，最小二乘核心也已拆为纯 NumPy。辨识器使用场景实例、时间戳和锁丢弃命令切换后的 settle-window 样本；NaN、无效区间、激励不足和退化矩阵不会进入或伪装成成功求解，失败时不写参数文件。合成数据测试最大误差门槛为 0.02；仍需用 `IdentifySkidSteer.launch` 验证注入参数恢复。
@@ -114,14 +128,24 @@ lunar_surface_sim.py / 真实 PointCloud2、Odometry、TF
 
 Windows 环境没有 ROS1 Noetic，因此以上结果不是 ROS 闭环通过证明。
 
+2026-09-03 针对运动段跟踪修复的 Windows 检查：
+
+- GCC C++17、`-Wall -Wextra -Werror` 编译两个自检程序；原 `skidsteer_selfcheck` 33 项、新 `trajectory_tracking_selfcheck` 27 项全部通过。
+- 新自检包含旧跨倒车边界错误复现，正/倒车直线与弧线、旋转/倒车/前进复合轨迹、重复发布、跨角度环绕的长旋转、位置捕获、限幅和非有限输入。
+- 5 项纯 NumPy 辨识测试通过；所有受版本控制 Python 源码完成纯语法检查，package/launch/rostest XML 完成解析。
+- 此批没有调整 YAML 参数数值，仅改注释；Windows 当前 Python 未安装 PyYAML，未宣称完成 YAML 解析。
+
+用户回传 `80e5d56` 短直线诊断：`DIAG_RC=0`，最后规划器记录执行终点位置误差 0.190 m、航向误差 0.174 rad、请求目标误差 0.135 m。日志在 Ubuntu 的 `~/p0-results-80e5d56/straight.log`，原始 rostest 日志为 `~/.ros/log/rostest-bjm-1166846.log`；这里只收到摘录，未形成完整正式归档。
+
 ## 7. 推荐执行顺序
 
-1. 在 Ubuntu `~/lunar_ws/src/groundgrid` 清理 groundgrid 包缓存并执行 Release 构建、包测试和 `catkin_test_results`。
-2. 运行 `IdentifySkidSteer.launch`，确认五参数注入恢复最大绝对误差不超过 0.02。
-3. 先运行 `mixed, n_trials=3` 冒烟，再运行五场景、每场景 `n_trials=10`。
-4. 归档 JSON、rostest XML、完整日志、辨识参数、配置和 commit SHA；验证完成前不合并 `main`。
-5. 如出现回归，在同一 P0 分支修复并复跑；不得降低 99% 任务书门槛掩盖缺口。
-6. 基于新基线优化 GroundGrid 处理周期和全系统 CPU，然后进入公里级规划、历史地图、多传感器融合与 Atlas/NPU 工作。
+1. 先在 Ubuntu Release 构建当前分支，并运行 `rosrun groundgrid trajectory_tracking_selfcheck`；依次完成短直线、转弯和困难目标诊断，检查完整轨迹与运动段日志，不能只看 SUCCESS。
+2. 短诊断确认后执行包测试和 `catkin_test_results`；仅在需要排查缓存时清理 groundgrid 包缓存。
+3. 运行 `IdentifySkidSteer.launch`，确认五参数注入恢复最大绝对误差不超过 0.02。
+4. 先运行 `mixed, n_trials=3` 冒烟，再运行五场景、每场景 `n_trials=10`。
+5. 归档 JSON、rostest XML、完整日志、辨识参数、配置和 commit SHA；验证完成前不合并 `main`。
+6. 如出现回归，在同一 P0 分支修复并复跑；不得降低 99% 任务书门槛掩盖缺口。
+7. 基于新基线优化 GroundGrid 处理周期和全系统 CPU，然后进入公里级规划、历史地图、多传感器融合与 Atlas/NPU 工作。
 
 ## 8. 关键资料
 
