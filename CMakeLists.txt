@@ -46,6 +46,7 @@ if(CATKIN_ENABLE_TESTING)
     add_rostest(test/lunar_pipeline.test)
     catkin_add_nosetests(test/test_skidsteer_identification.py)
     catkin_add_nosetests(test/test_trial_metrics.py)
+    catkin_add_nosetests(test/test_trial_observation.py)
 endif()
 
 #######################################

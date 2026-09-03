@@ -256,6 +256,24 @@ rostopic echo -n 1 /lunar_planner/trajectory
 rostopic echo -n 1 /lunar_path_follower/status
 ```
 
+连续目标测试应读取带目标标识的诊断快照，不能仅凭无标识的旧 `status` 字符串
+判断新目标完成或中止：
+
+```bash
+rostopic echo -n 1 /lunar_planner/diagnostics
+rostopic echo -n 1 /lunar_path_follower/diagnostics
+```
+
+规划器诊断中的 `goal_stamp_ns` 对应请求目标的时间戳，`goal_id` 标识本次执行；
+原子轨迹的 `path.header.seq` 与跟踪器诊断携带相同 `goal_id`。轨迹时间戳仍用于
+新鲜度检查，旧独立 Path 话题的 Header 序号不作为目标标识。诊断 `status` 与
+`goal_recovery_events/successes/aborts` 在同一消息中发布；完成和中止立即发布，
+不会等待周期诊断。`snapshot_seq` 用于拒绝旧快照。原有状态、路径和速度话题保持兼容。
+
+`goal_received` 仅表示规划器已接收请求，`success_snapped` 仅表示产出吸附路径，
+都不代表车辆到达。当前完整 `mixed/flat` 测试还要求可解困难目标实际完成，
+不能用恢复率的条件分母排除中止目标来代替任务完成验证。
+
 正常状态应为：
 
 ```text

@@ -2,10 +2,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -153,7 +155,12 @@ private:
     }
 
     void publishStatus(const std::string& text) {
+        const bool changed = text != last_status_;
+        last_status_ = text;
         std_msgs::String msg; msg.data = text; status_pub_.publish(msg);
+        // Status, goal identity and counters travel in ONE snapshot. In particular Abort
+        // must not race an older throttled back-out diagnostic in an external test.
+        publishDiagnostics(changed);
     }
 
     // Publish one atomic trajectory for control, plus the two legacy topics retained for
@@ -169,6 +176,9 @@ private:
 
         groundgrid::LunarTrajectory trajectory;
         trajectory.path = path;
+        // Only this nested Header carries goal identity, not the legacy Path transport's
+        // sequence number. Its stamp remains the publication/freshness timestamp.
+        trajectory.path.header.seq = goal_id_;
         const bool matched = profile.data.size() == path.poses.size()*2;
         bool finite = matched;
         for(const auto& stamped_pose : path.poses) {
@@ -262,17 +272,20 @@ private:
 
     // Structured counterpart to /lunar_planner/status, which has to stay short single-word
     // tokens for `rostopic echo` diagnosis. recovery_events/successes/aborts are monotone
-    // counters rather than events, so the test harness can diff them without caring about
-    // drops. 避障恢复率 is successes / (events - aborts): an entry that ends in an abort was
-    // a goal with no solution, so it is neither a recovery nor a failed recovery. That split
-    // cannot be gamed by aborting freely, because every abort also costs a 规划成功率 trial.
-    void publishDiagnostics() {
+    // counters rather than events. Per-goal deltas are captured here, at the source, not
+    // by subtracting independently received snapshots in a test. Aborted does not prove
+    // unreachable; consumers must keep recovery counters and actual completion distinct.
+    void publishDiagnostics(bool force = false) {
         const ros::Time now = ros::Time::now();
         const bool chatty = (mode_ == PlannerMode::Recovery);
-        if(!chatty && !last_diag_time_.isZero() && (now - last_diag_time_).toSec() < 1.0) return;
+        if(!force && !last_diag_time_.isZero() &&
+           (now - last_diag_time_).toSec() < (chatty ? 0.5 : 1.0)) return;
         last_diag_time_ = now;
         double cpu_pct = -1.0, rss_mb = -1.0;
-        sampleResources(cpu_pct, rss_mb);
+        // Urgent terminal telemetry must not turn a millisecond CPU tick difference into
+        // a spurious resource-overrun sample. Keep resource intervals independent of it.
+        if(last_cpu_time_.isZero() || (now-last_cpu_time_).toSec() >= 0.5)
+            sampleResources(cpu_pct, rss_mb);
         char buf[448];
         std::snprintf(buf, sizeof(buf),
                       "mode=%s action=%s escalation=%d fails=%d recovery_events=%d "
@@ -283,7 +296,15 @@ private:
                       recovery_aborts_,
                       last_fail_reason_.empty() ? "none" : last_fail_reason_.c_str(),
                       last_plan_ms_, last_snap_dist_, cpu_pct, rss_mb);
-        std_msgs::String msg; msg.data = buf; diag_pub_.publish(msg);
+        std::ostringstream snapshot;
+        snapshot << buf << " goal_id=" << goal_id_
+                 << " goal_stamp_ns=" << goal_.header.stamp.toNSec()
+                 << " snapshot_seq=" << ++diagnostic_seq_
+                 << " status=" << last_status_
+                 << " goal_recovery_events=" << recovery_events_-goal_events_start_
+                 << " goal_recovery_successes=" << recovery_successes_-goal_successes_start_
+                 << " goal_recovery_aborts=" << recovery_aborts_-goal_aborts_start_;
+        std_msgs::String msg; msg.data = snapshot.str(); diag_pub_.publish(msg);
     }
 
     void resetRecoveryState() {
@@ -362,7 +383,17 @@ private:
         if(!segmentValid(from, path.poses[nearest].pose,
                          /*allow_start_unknown=*/true,
                          /*clearance0=*/0.0, /*clearance1=*/0.0)) {
-            ROS_WARN_THROTTLE(1.0, "retained trajectory invalid on current-pose connector");
+            float actual_cost;
+            const bool actual_valid = footprintValid(from.position.x, from.position.y,
+                tf2::getYaw(from.orientation), actual_cost, /*allow_unknown=*/true);
+            const auto& nearest_pose = path.poses[nearest].pose;
+            ROS_WARN_THROTTLE(1.0, "retained trajectory invalid on current-pose connector: "
+                              "goal_id=%u actual=(%.3f,%.3f,%.3f) actual_body_valid=%s "
+                              "nearest=%zu nearest_pose=(%.3f,%.3f,%.3f) map_stamp=%.6f",
+                              goal_id_, from.position.x, from.position.y,
+                              tf2::getYaw(from.orientation), actual_valid ? "true" : "false",
+                              nearest, nearest_pose.position.x, nearest_pose.position.y,
+                              tf2::getYaw(nearest_pose.orientation), map_stamp_.toSec());
             return false;
         }
         for(size_t i=nearest+1; i<path.poses.size(); ++i) {
@@ -401,7 +432,6 @@ private:
             last_fail_reason_.clear();
         }
         publishStatus(retained_route_.wasSnapped() ? "success_snapped" : "success");
-        publishDiagnostics();
     }
 
     void mapCallback(const grid_map_msgs::GridMapConstPtr& msg) {
@@ -445,9 +475,17 @@ private:
     void goalCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
         goal_ = *msg; have_goal_ = true; replan_requested_ = true;
+        ++goal_id_;
+        if(goal_id_ == 0) ++goal_id_;  // reserve zero for unscoped/startup telemetry
+        goal_events_start_ = recovery_events_;
+        goal_successes_start_ = recovery_successes_;
+        goal_aborts_start_ = recovery_aborts_;
         // A new goal must not inherit the previous goal's stuck state, or it would be
         // declared unreachable before it has been attempted even once.
         resetRecoveryState();
+        last_fail_reason_.clear(); last_plan_ms_ = 0.0; last_snap_dist_ = 0.0;
+        last_status_.clear();
+        publishStatus("goal_received");
     }
 
     bool robotPose(geometry_msgs::PoseStamped& pose) {
@@ -584,7 +622,7 @@ private:
         if(!have_map_) return;
         // Checked before have_goal_, which abort clears: the latched status has to keep
         // saying "aborted" so `rostopic echo /lunar_planner/status` explains the silence.
-        if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); publishDiagnostics(); return; }
+        if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); return; }
         if(!have_goal_) return;
         geometry_msgs::PoseStamped start;
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
@@ -791,7 +829,6 @@ private:
             publishStatus(mode_ == PlannerMode::Aborted ? "aborted"
                           : (in_recovery ? recoveryStatus() : "no_path"));
         }
-        publishDiagnostics();
     }
 
     std::string recoveryStatus() const { return std::string("recovery_") + actionName(action_); }
@@ -1309,10 +1346,17 @@ private:
         // out of the band, never continue through it.
         if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
                            /*allow_unknown=*/true)) {
+            float actual_cost;
+            const auto& actual = start_pose.pose;
+            const bool actual_valid = footprintValid(actual.position.x, actual.position.y,
+                tf2::getYaw(actual.orientation), actual_cost, /*allow_unknown=*/true);
             ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
                               "(a LETHAL cell or over-limit slope lies under the vehicle; "
-                              "unobserved cells are tolerated at the start)",
-                              sp.x(), sp.y(), yawForBin(start.t));
+                              "unobserved cells are tolerated at the start); goal_id=%u "
+                              "actual=(%.3f,%.3f,%.3f) actual_body_valid=%s map_stamp=%.6f",
+                              sp.x(), sp.y(), yawForBin(start.t), goal_id_,
+                              actual.position.x, actual.position.y, tf2::getYaw(actual.orientation),
+                              actual_valid ? "true" : "false", map_stamp_.toSec());
             last_fail_reason_ = "start_footprint";
             return false;
         }
@@ -1537,6 +1581,10 @@ private:
     bool active_trajectory_reaches_goal_=false, active_trajectory_was_snapped_=false;
     int consecutive_failures_=0, recovery_escalation_=0, confirm_count_=0;
     int recovery_events_=0, recovery_successes_=0, recovery_aborts_=0;
+    int goal_events_start_=0, goal_successes_start_=0, goal_aborts_start_=0;
+    uint32_t goal_id_=0;
+    uint64_t diagnostic_seq_=0;
+    std::string last_status_;
     double best_goal_dist_ = std::numeric_limits<double>::infinity();
     double last_plan_ms_ = 0.0;
     double last_cpu_ticks_ = -1.0;

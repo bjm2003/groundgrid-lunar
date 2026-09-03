@@ -43,6 +43,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   are compatibility and visualisation outputs, not control inputs.
 - A trajectory twist is desired effective body motion before slip compensation. Apply
   terrain scaling in the planner and `inverseCommand()` once in the follower.
+- Correlate test observations with the acknowledged goal: atomic trajectory
+  `path.header.seq` carries `goal_id`; planner/follower diagnostic snapshots carry the
+  same id. Legacy untagged status strings cannot end a trial or supply recovery counters.
 
 ## Validation expectations
 

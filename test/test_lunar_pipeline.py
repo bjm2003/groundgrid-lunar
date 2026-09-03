@@ -30,10 +30,11 @@ import unittest
 import rospy
 import rostest
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Odometry
 from std_msgs.msg import Float32MultiArray, String
 from groundgrid.msg import LunarTrajectory
 from groundgrid.trial_metrics import completion_summary, mission_completed
+from groundgrid.trial_observation import TrialObservation, fields_of
 
 # The body, from state_lattice_planner/footprint_{length,width}. Clearance is measured
 # against this rectangle rather than its circumscribed circle: the circle sits 0.42 m
@@ -118,7 +119,7 @@ SCENARIOS = {
 STRICT_SCENARIOS = ("mixed", "flat")
 
 REACH_TOLERANCE = 0.5
-NOMINAL_STATUSES = ("success", "success_snapped", "goal_reached")
+NOMINAL_STATUSES = ("goal_received", "success", "success_snapped", "goal_reached")
 
 # A published path counts as "the route for this trial" only if it starts where the trial
 # started and ends at the trial's goal. Without this, 路径长度偏差 measured whatever path
@@ -170,7 +171,9 @@ class LunarPipelineTest(unittest.TestCase):
             self.scenario = "mixed"
         self.cpu_budget = float(rospy.get_param("~cpu_budget_pct", 40.0))
         self.last_path = None
-        self.last_vel = None
+        self.last_profile_size = 0
+        self.observation = TrialObservation()
+        self.pending_trajectories = {}
         self.status = None
         self.statuses = set()
         self.first_success_time = None
@@ -192,15 +195,13 @@ class LunarPipelineTest(unittest.TestCase):
         self.rss_mb = []
         self.diag = {}
         self.obstacles = []
-        rospy.Subscriber("/lunar_planner/path", Path, self._on_path, queue_size=1)
-        rospy.Subscriber("/lunar_planner/velocity_profile", Float32MultiArray,
-                         self._on_vel, queue_size=1)
         rospy.Subscriber("/lunar_planner/trajectory", LunarTrajectory,
                          self._on_trajectory, queue_size=1)
-        rospy.Subscriber("/lunar_planner/status", String, self._on_status, queue_size=1)
-        rospy.Subscriber("/lunar_path_follower/status", String,
+        rospy.Subscriber("/lunar_path_follower/diagnostics", String,
                          self._on_follower_status, queue_size=10)
         rospy.Subscriber("/lunar_planner/diagnostics", String, self._on_diag, queue_size=10)
+        self.goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped,
+                                        queue_size=1, latch=True)
         try:
             self._on_obstacles(rospy.wait_for_message("/lunar_sim/obstacles",
                                                       Float32MultiArray, timeout=10))
@@ -214,52 +215,41 @@ class LunarPipelineTest(unittest.TestCase):
         with self.lock:
             self.obstacles = [tuple(data[i:i + 4]) for i in range(0, len(data) - 3, 4)]
 
-    def _on_path(self, msg):
-        with self.lock:
-            self.last_path = msg
-            if len(msg.poses) > 0:
-                self.path_seen = True
-            # The first plan after a goal is the whole route; later ones are the shrinking
-            # remainder, so only the first is comparable against the straight-line distance.
-            # It has to be a plan *for this trial* -- see ROUTE_START_TOLERANCE.
-            if self.plan_path_len is None and len(msg.poses) > 1 and self.route_to:
-                first = msg.poses[0].pose.position
-                last = msg.poses[-1].pose.position
-                gx, gy = self.route_to
-                x0, y0 = self.route_from
-                if (math.hypot(first.x - x0, first.y - y0) <= ROUTE_START_TOLERANCE and
-                        math.hypot(last.x - gx, last.y - gy) <= ROUTE_END_TOLERANCE and
-                        math.hypot(last.x - gx, last.y - gy) <
-                        math.hypot(first.x - gx, first.y - gy)):
-                    self.plan_path_len = sum(
-                        math.hypot(b.pose.position.x - a.pose.position.x,
-                                   b.pose.position.y - a.pose.position.y)
-                        for a, b in zip(msg.poses, msg.poses[1:]))
-                    # The chord of this path, not the trial's start-to-goal line. Those
-                    # differ by the metre or so the rover covers while the goal is in
-                    # flight and by however far the goal had to be snapped, and both
-                    # differences are subtracted from the route without being subtracted
-                    # from the line, which is what drove the ratio negative. Against its
-                    # own chord the quantity is a detour by construction: >= 0, zero for a
-                    # straight run, and positive only where the planner routed around
-                    # something.
-                    self.plan_chord = math.hypot(last.x - first.x, last.y - first.y)
-
-    def _on_vel(self, msg):
-        with self.lock:
-            self.last_vel = msg
-            # Checked here rather than by polling both topics: the profile is published
-            # after the path it belongs to, so at this instant last_path is its match.
-            n_poses = len(self.last_path.poses) if self.last_path else 0
-            if n_poses > 0 and len(msg.data) == 2 * n_poses:
-                self.profile_ok = True
+    def _observe_path_locked(self, msg):
+        self.last_path = msg
+        if msg.poses:
+            self.path_seen = True
+        # Only the first whole route for this goal is comparable to its own chord.
+        if self.plan_path_len is None and len(msg.poses) > 1 and self.route_to:
+            first, last = msg.poses[0].pose.position, msg.poses[-1].pose.position
+            gx, gy = self.route_to
+            x0, y0 = self.route_from
+            if (math.hypot(first.x-x0, first.y-y0) <= ROUTE_START_TOLERANCE and
+                    math.hypot(last.x-gx, last.y-gy) <= ROUTE_END_TOLERANCE and
+                    math.hypot(last.x-gx, last.y-gy) < math.hypot(first.x-gx, first.y-gy)):
+                self.plan_path_len = sum(
+                    math.hypot(b.pose.position.x-a.pose.position.x,
+                               b.pose.position.y-a.pose.position.y)
+                    for a, b in zip(msg.poses, msg.poses[1:]))
+                self.plan_chord = math.hypot(last.x-first.x, last.y-first.y)
 
     def _on_trajectory(self, msg):
         with self.lock:
-            n_poses = len(msg.path.poses)
-            valid = len(msg.twists) == n_poses
-            if valid:
-                valid = all(math.isfinite(pose.pose.position.x) and
+            if not self.observation.owns(msg.path.header.seq):
+                if self.observation.goal_stamp_ns and self.observation.goal_id is None:
+                    self.pending_trajectories[msg.path.header.seq] = msg
+                    while len(self.pending_trajectories) > 4:
+                        del self.pending_trajectories[next(iter(self.pending_trajectories))]
+                return
+            self._observe_trajectory_locked(msg)
+
+    def _observe_trajectory_locked(self, msg):
+        self._observe_path_locked(msg.path)
+        self.last_profile_size = 2 * len(msg.twists)
+        n_poses = len(msg.path.poses)
+        valid = len(msg.twists) == n_poses
+        if valid:
+            valid = all(math.isfinite(pose.pose.position.x) and
                             math.isfinite(pose.pose.position.y) and
                             math.isfinite(pose.pose.position.z) and
                             math.isfinite(pose.pose.orientation.x) and
@@ -270,41 +260,40 @@ class LunarPipelineTest(unittest.TestCase):
                             math.isfinite(twist.angular.z) and
                             abs(twist.linear.x) <= 1.39 + 1e-4 and
                             abs(twist.angular.z) <= 0.8 + 1e-4
-                            for pose, twist in zip(msg.path.poses, msg.twists))
-            if not valid:
-                self.atomic_profile_invalid = True
-            elif n_poses > 0:
-                self.atomic_profile_ok = True
-                if any(abs(twist.angular.z) > 1e-3 for twist in msg.twists):
-                    self.angular_profile_seen = True
+                        for pose, twist in zip(msg.path.poses, msg.twists))
+        if not valid:
+            self.atomic_profile_invalid = True
+        elif n_poses > 0:
+            self.profile_ok = self.atomic_profile_ok = True
+            if any(abs(twist.angular.z) > 1e-3 for twist in msg.twists):
+                self.angular_profile_seen = True
 
     def _on_follower_status(self, msg):
         with self.lock:
-            if msg.data == "tracking":
-                self.follower_tracking_seen = True
-            elif msg.data == "goal_reached" and self.follower_tracking_seen:
-                self.follower_goal_reached = True
-            elif (self.follower_tracking_seen and
-                  msg.data in ("stale_trajectory", "stale_terrain")):
-                self.follower_stale = True
+            self.observation.follower(fields_of(msg.data))
+            self._sync_observation_locked()
 
-    def _on_status(self, msg):
-        with self.lock:
-            self.status = msg.data
-            self.statuses.add(msg.data)
-            if msg.data == "goal_reached" and self.path_seen:
-                self.planner_goal_reached = True
-            if msg.data.startswith("success") and self.first_success_time is None:
-                self.first_success_time = rospy.Time.now()
+    def _sync_observation_locked(self):
+        self.status = self.observation.status
+        self.statuses = set(self.observation.statuses)
+        self.planner_goal_reached = self.observation.planner_done
+        self.follower_tracking_seen = self.observation.follower_tracking
+        self.follower_goal_reached = self.observation.follower_done
+        self.follower_stale = self.observation.follower_stale
 
     def _on_diag(self, msg):
-        fields = {}
-        for token in msg.data.split():
-            if "=" in token:
-                key, value = token.split("=", 1)
-                fields[key] = value
+        fields = fields_of(msg.data)
         with self.lock:
-            self.diag = fields
+            if not self.observation.planner(fields):
+                return
+            self._sync_observation_locked()
+            self.diag = dict(self.observation.diagnostics)
+            pending = self.pending_trajectories.pop(self.observation.goal_id, None)
+            self.pending_trajectories.clear()
+            if pending is not None:
+                self._observe_trajectory_locked(pending)
+            if self.status.startswith("success") and self.first_success_time is None:
+                self.first_success_time = rospy.Time.now()
             try:
                 ms = float(fields.get("plan_ms", "0"))
             except ValueError:
@@ -321,13 +310,6 @@ class LunarPipelineTest(unittest.TestCase):
                     continue
                 if value >= 0.0:
                     sink.append(value)
-
-    def _counter(self, name):
-        with self.lock:
-            try:
-                return int(self.diag.get(name, "0"))
-            except ValueError:
-                return 0
 
     def _cross_track(self, x, y):
         with self.lock:
@@ -365,6 +347,11 @@ class LunarPipelineTest(unittest.TestCase):
 
     def _reset_trial_state(self):
         with self.lock:
+            self.observation = TrialObservation()
+            self.pending_trajectories.clear()
+            self.diag = {}
+            self.last_path = None
+            self.last_profile_size = 0
             self.status = None
             self.statuses = set()
             self.first_success_time = None
@@ -386,30 +373,26 @@ class LunarPipelineTest(unittest.TestCase):
     def _run_trial(self, gx, gy, gyaw, timeout):
         """Send one goal, follow it to completion or failure, return its metrics."""
         self._reset_trial_state()
-        events0 = self._counter("recovery_events")
-        successes0 = self._counter("recovery_successes")
-        aborts0 = self._counter("recovery_aborts")
 
         initial = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=5)
         x0, y0 = initial.pose.pose.position.x, initial.pose.pose.position.y
         goal = PoseStamped()
         goal.header.frame_id = "map"
-        goal.header.stamp = rospy.Time.now()
         goal.pose.position.x = gx
         goal.pose.position.y = gy
         goal.pose.orientation.z = math.sin(gyaw / 2.0)
         goal.pose.orientation.w = math.cos(gyaw / 2.0)
-        with self.lock:
-            self.route_from = (x0, y0)
-            self.route_to = (gx, gy)
-        pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1, latch=True)
         # Published exactly once. Re-sending would reset the planner's stuck-detection
         # state on every tick, so recovery could never trigger and the recovery-rate
         # metric would always read zero.
         rospy.sleep(0.5)
-        pub.publish(goal)
-
         goal_time = rospy.Time.now()
+        goal.header.stamp = goal_time
+        with self.lock:
+            self.observation = TrialObservation(goal_time.to_nsec())
+            self.route_from = (x0, y0)
+            self.route_to = (gx, gy)
+        self.goal_pub.publish(goal)
         end = goal_time + rospy.Duration(timeout)
         rate = rospy.Rate(5)
         final = initial
@@ -480,6 +463,8 @@ class LunarPipelineTest(unittest.TestCase):
             follower_goal_reached = self.follower_goal_reached
             planner_goal_reached = self.planner_goal_reached
             diagnostics = dict(self.diag)
+            counters = dict(self.observation.counters)
+            goal_id = self.observation.goal_id
         rospy.loginfo("trial end goal=(%.3f, %.3f) reason=%s reached=%s "
                       "planner_done=%s follower_done=%s duration=%.3fs",
                       gx, gy, end_reason, reached, planner_goal_reached,
@@ -490,6 +475,8 @@ class LunarPipelineTest(unittest.TestCase):
                   if path_len is not None and chord > 1e-3 else float("nan"))
         return {
             "goal": (gx, gy),
+            "goal_id": goal_id,
+            "goal_stamp_ns": goal_time.to_nsec(),
             "start": (x0, y0),
             "start_yaw_rad": _yaw_of(initial.pose.pose.orientation),
             "goal_yaw_rad": gyaw,
@@ -518,9 +505,9 @@ class LunarPipelineTest(unittest.TestCase):
             "chord": chord if chord is not None else float("nan"),
             "detour": detour,
             "driven": driven,
-            "recovery_events": self._counter("recovery_events") - events0,
-            "recovery_successes": self._counter("recovery_successes") - successes0,
-            "recovery_aborts": self._counter("recovery_aborts") - aborts0,
+            "recovery_events": counters["recovery_events"],
+            "recovery_successes": counters["recovery_successes"],
+            "recovery_aborts": counters["recovery_aborts"],
             "rmse": math.sqrt(sq_err / n_err) if n_err else float("nan"),
             "clearance_mean": statistics.mean(clearances) if clearances else float("nan"),
             "clearance_min": min(clearances) if clearances else float("nan"),
@@ -537,20 +524,13 @@ class LunarPipelineTest(unittest.TestCase):
         }
 
     def _await_consistent_profile(self, timeout=10.0):
-        """Wait for a path and profile snapshot that satisfy the follower's invariant.
-
-        LunarPathFollowerNode::plannedSpeedAt silently ignores the profile unless it holds
-        exactly two floats per pose, so this relation -- not merely a non-empty profile --
-        is what decides whether the planned speeds reach the wheels. The retry loop exists
-        because path and profile are separate publications and a snapshot taken between
-        the two is legitimately mismatched.
-        """
+        """Inspect the current goal's atomic path/twist pair, never cross-topic ordering."""
         end = rospy.Time.now() + rospy.Duration(timeout)
         seen = (0, 0)
         while not rospy.is_shutdown() and rospy.Time.now() < end:
             with self.lock:
                 n_poses = len(self.last_path.poses) if self.last_path else 0
-                n_vel = len(self.last_vel.data) if self.last_vel else 0
+                n_vel = self.last_profile_size
             seen = (n_poses, n_vel)
             if n_poses > 0 and n_vel == 2 * n_poses:
                 return seen
@@ -666,10 +646,9 @@ class LunarPipelineTest(unittest.TestCase):
         events = sum(t["recovery_events"] for t in every)
         successes = sum(t["recovery_successes"] for t in every)
         aborts = sum(t["recovery_aborts"] for t in every)
-        # An entry that ends in an abort was a goal with no solution, so it is neither a
-        # recovery nor a failed recovery and does not belong in the denominator. Aborting
-        # freely cannot game this: every abort also costs a 规划成功率 trial, and both
-        # numbers are reported side by side.
+        # Preserve the historical recovery-counter metric and threshold for comparability.
+        # An abort does NOT prove an unreachable goal; completion and abort counts remain
+        # separate, and this conditional rate is not evidence that hard goals completed.
         recoverable = events - aborts
         recovery_rate = successes / recoverable if recoverable else float("nan")
         # 避障成功率 is deliberately not the same question as 近障恢复率: it asks whether
@@ -677,12 +656,9 @@ class LunarPipelineTest(unittest.TestCase):
         # and it is only meaningful where clearance was actually measurable.
         measured = [t for t in every if t["measured_clearance"]]
         collisions = [t for t in measured if t["collided"]]
-        # A goal the planner correctly declared unreachable never became an avoidance
-        # attempt, so it does not belong in the denominator -- same argument as
-        # `recoverable` above. Without this the metric read exactly `reach_rate` (0.75 for
-        # both, with zero collisions), i.e. it was measuring how hard the hard goals are.
-        # A trial that collided stays in regardless of how it ended: aborting after driving
-        # through a rock must not erase the collision.
+        # Preserve this historical conditional collision metric, but an aborted trial is
+        # not thereby proved unreachable. Strict scenarios separately require completion
+        # of every declared-solvable hard goal below. A collision is never excluded.
         attempted = [t for t in measured
                      if t["collided"] or t["reached"] or "aborted" not in t["statuses"]]
         avoid_rate = (sum(1 for t in attempted if not t["collided"]) / len(attempted)
@@ -728,6 +704,7 @@ class LunarPipelineTest(unittest.TestCase):
             "angular_profile_coverage": angular_coverage,
         }
         counts = {"trials": len(every), "tour": len(tour), "hard": len(hard),
+                  "unacknowledged_goals": sum(t["goal_id"] is None for t in every),
                   "solvable": len(solvable),
                   "recovery_events": events, "recovery_successes": successes,
                   "recovery_aborts": aborts, "collisions": len(collisions),
@@ -757,11 +734,11 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.loginfo("  completed all     = %.3f (%d/%d; snapped missions included)",
                       rates["completion_rate"], counts["missions_completed"], len(every))
         rospy.loginfo("  避障成功率        = %.3f (%d collision-free / %d attempts; "
-                      "%d measured, %d correctly aborted)", avoid_rate,
+                      "%d measured, %d aborted/excluded)", avoid_rate,
                       sum(1 for t in attempted if not t["collided"]), len(attempted),
                       len(measured), len(measured) - len(attempted))
         rospy.loginfo("  近障恢复率        = %.3f (%d recovered / %d recoverable; "
-                      "%d entered, %d aborted as unreachable)",
+                      "%d entered, %d aborted)",
                       recovery_rate, successes, recoverable, events, aborts)
         rospy.loginfo("  资源占用超标率    = %.3f (cpu_pct > %.0f%%, %d samples)",
                       cpu_over, self.cpu_budget, len(cpu))
@@ -806,6 +783,10 @@ class LunarPipelineTest(unittest.TestCase):
         report = dict(report)
         report["trials"] = [
             {"goal": list(t["goal"]), "start": list(t["start"]),
+             "goal_id": t["goal_id"], "goal_stamp_ns": t["goal_stamp_ns"],
+             "recovery_events": t["recovery_events"],
+             "recovery_successes": t["recovery_successes"],
+             "recovery_aborts": t["recovery_aborts"],
              "start_yaw_rad": t["start_yaw_rad"], "goal_yaw_rad": t["goal_yaw_rad"],
              "final": list(t["final"]), "reached": t["reached"],
              "mission_completed": mission_completed(t), "end_reason": t["end_reason"],
@@ -839,6 +820,8 @@ class LunarPipelineTest(unittest.TestCase):
 
     def _assert(self, report, tour, every):
         rates, metrics = report["rates"], report["metrics"]
+        self.assertEqual(report["counts"]["unacknowledged_goals"], 0,
+                         "missing goal-scoped planner telemetry; no legacy-status fallback")
         # Never allowed anywhere: driving the body through a ground-truth hazard.
         # rostest only echoes the assertion message, so the offenders go in it.
         self.assertEqual(report["counts"]["collisions"], 0,
@@ -864,6 +847,13 @@ class LunarPipelineTest(unittest.TestCase):
             # declares reachable goals unreachable. Open terrain must never abort.
             self.assertFalse([t for t in tour if "aborted" in t["statuses"]],
                              "an open-terrain goal was aborted")
+            # Correcting a missed Abort counter can raise the historical recovery rate
+            # without delivering a single additional goal. Do not let that turn the same
+            # incomplete hard-goal run green. Only deliberately impossible goals are exempt.
+            self.assertFalse(
+                [(t["goal"], t["end_reason"]) for t in every[len(tour):]
+                 if tuple(t["goal"]) not in UNREACHABLE_GOALS and not mission_completed(t)],
+                "solvable hard goals must complete; a success_snapped path is not arrival")
             # And the converse, now that these goals no longer sit in the rate: a goal
             # inside a 40 deg crater wall must be refused, not driven to. Reaching one
             # would mean the slope limit is not being enforced.
@@ -902,7 +892,7 @@ class LunarPipelineTest(unittest.TestCase):
                            "planner never published a path in any trial")
         self.assertEqual(rates["output_conformance"], 1.0,
                          "输出达标率: every emitted path must have an equal-length, finite "
-                         "legacy profile and atomic trajectory")
+                         "atomic path and twist array for its acknowledged goal")
         self.assertEqual(rates["follower_stale"], 0.0,
                          "follower stopped because a nominal trajectory or terrain map was stale")
         self.assertGreater(rates["angular_profile_coverage"], 0.0,

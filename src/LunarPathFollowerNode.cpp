@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -58,6 +60,7 @@ public:
                                      &LunarPathFollowerNode::terrainCallback, this);
         cmd_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
         status_pub_ = nh_.advertise<std_msgs::String>("/lunar_path_follower/status", 1, true);
+        diag_pub_ = nh_.advertise<std_msgs::String>("/lunar_path_follower/diagnostics", 1, true);
         timer_ = nh_.createTimer(ros::Duration(0.05), &LunarPathFollowerNode::control, this);
     }
 
@@ -70,6 +73,11 @@ private:
         std_msgs::String msg;
         msg.data = status;
         status_pub_.publish(msg);
+        std::ostringstream snapshot;
+        snapshot << "goal_id=" << goal_id_ << " snapshot_seq=" << ++diagnostic_seq_
+                 << " status=" << status;
+        msg.data = snapshot.str();
+        diag_pub_.publish(msg);
     }
 
     void stop(const std::string& status) {
@@ -79,6 +87,11 @@ private:
 
     void trajectoryCallback(const groundgrid::LunarTrajectoryConstPtr& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if(goal_id_ != msg->path.header.seq) {
+            goal_id_ = msg->path.header.seq;
+            tracker_.clear();
+            last_status_.clear();
+        }
         received_ = msg->path.header.stamp.isZero() ? ros::Time::now()
                                                     : msg->path.header.stamp;
         if(msg->path.poses.empty()) {
@@ -251,7 +264,7 @@ private:
 
     ros::NodeHandle nh_,pnh_;
     ros::Subscriber trajectory_sub_,terrain_sub_;
-    ros::Publisher cmd_pub_,status_pub_;
+    ros::Publisher cmd_pub_,status_pub_,diag_pub_;
     ros::Timer timer_;
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
@@ -266,6 +279,8 @@ private:
     double path_timeout_,terrain_timeout_,angular_feedforward_weight_;
     bool debug_control_;
     size_t trajectory_id_=0;
+    uint32_t goal_id_=0;
+    uint64_t diagnostic_seq_=0;
 };
 
 } // namespace groundgrid
