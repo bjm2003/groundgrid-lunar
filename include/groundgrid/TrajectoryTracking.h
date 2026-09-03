@@ -37,11 +37,27 @@ struct TrackingParams {
 
 enum class TrackingStatus { Invalid, Tracking, GoalReached };
 
+enum class TrackingFailure { None, InvalidInput, RotationAnchor, MissingCommand, InvalidFeedback, InvalidBlend };
+
+inline const char* trackingFailureName(TrackingFailure reason) {
+    switch(reason) {
+        case TrackingFailure::None: return "none";
+        case TrackingFailure::RotationAnchor: return "rotation_anchor_not_acquired";
+        case TrackingFailure::MissingCommand: return "missing_phase_command";
+        case TrackingFailure::InvalidFeedback: return "invalid_feedback";
+        case TrackingFailure::InvalidBlend: return "invalid_blend";
+        default: return "invalid_input";
+    }
+}
+
 struct TrackingStep {
     TrackingStatus status = TrackingStatus::Invalid;
+    TrackingFailure failure = TrackingFailure::InvalidInput;
     std::size_t phase_begin = 0, phase_end = 0;
     std::size_t nearest = 0, target = 0, command = 0;
     MotionPhase phase = MotionPhase::Hold;
+    Pose2D phase_endpoint;
+    double endpoint_distance = 0.0, arrival_distance = 0.0;
     double nearest_distance = 0.0, target_distance = 0.0;
     bool pose_capture = false;
     double planned_v = 0.0, planned_w = 0.0, feedback_w = 0.0;
@@ -112,6 +128,7 @@ public:
         TrackingStep result;
         if(samples_.empty() || phases_.empty() || !finitePose(rover) || !validParams(p))
             return result;
+        result.failure = TrackingFailure::None;
 
         const auto& goal = samples_.back().pose;
         if(trajectoryEndpointReached(distance(rover, goal),
@@ -154,10 +171,14 @@ public:
         }
 
         const double endpoint_distance = distance(rover, samples_[phase.end].pose);
+        result.phase_endpoint = samples_[phase.end].pose;
+        result.endpoint_distance = endpoint_distance;
+        result.arrival_distance = arrival;
         result.pose_capture = endpoint_distance < arrival;
         if(!translating && !result.pose_capture) {
             // No translation exists in a rotation-only phase. Do not borrow a command from
             // an already completed or future phase to make an unvalidated reconnection.
+            result.failure = TrackingFailure::RotationAnchor;
             return result;
         }
 
@@ -185,7 +206,10 @@ public:
             if(!translating && phase.kind != MotionPhase::Hold) {
                 // A rotation endpoint may carry w=0 after the planner's deceleration pass.
                 // Only an incoming rotation command in THIS phase can provide feed-forward.
-                if(!commandInPhase(phase, result.target, false, result.command)) return result;
+                if(!commandInPhase(phase, result.target, false, result.command)) {
+                    result.failure = TrackingFailure::MissingCommand;
+                    return result;
+                }
                 result.planned_w = samples_[result.command].w;
                 // Once this angular sample has been passed, its old feed-forward must not
                 // oppose closed-loop correction and create a non-zero steady-state error.
@@ -194,7 +218,10 @@ public:
             // Translation is finished here. Its curved-motion feed-forward no longer
             // applies while holding position for yaw capture; the blend weight stays 0.5.
         } else {
-            if(!commandInPhase(phase, result.target, true, result.command)) return result;
+            if(!commandInPhase(phase, result.target, true, result.command)) {
+                result.failure = TrackingFailure::MissingCommand;
+                return result;
+            }
             result.planned_v = samples_[result.command].v;
             result.planned_w = samples_[result.command].w;
             const double bearing = std::atan2(target.y-rover.y, target.x-rover.x);
@@ -202,10 +229,16 @@ public:
             if(!geometricAngularFeedback(result.planned_v,
                                          SkidSteerModel::wrap(bearing-reference_yaw),
                                          result.target_distance, p.control.max_angular_speed,
-                                         result.feedback_w)) return result;
+                                         result.feedback_w)) {
+                result.failure = TrackingFailure::InvalidFeedback;
+                return result;
+            }
         }
         if(!blendTrajectoryCommand(result.planned_v, result.planned_w, result.feedback_w,
-                                   p.control, result.desired_v, result.desired_w)) return result;
+                                   p.control, result.desired_v, result.desired_w)) {
+            result.failure = TrackingFailure::InvalidBlend;
+            return result;
+        }
         result.status = TrackingStatus::Tracking;
         return result;
     }

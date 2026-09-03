@@ -1,6 +1,7 @@
 // Stateful, multi-step controller regression tests. All fixtures below are synthetic;
 // they verify index/phase semantics, not ROS timing, perception, or collision clearance.
 #include "groundgrid/TrajectoryTracking.h"
+#include "groundgrid/RetainedTrajectoryCache.h"
 
 #include <cstdio>
 #include <vector>
@@ -192,6 +193,67 @@ int main() {
             sample(.9,-.45,pi/2,.5), sample(.9,0,pi/2,.5), sample(.9,.5,pi/2),
             sample(.9,.5,pi/4,0,-.6), sample(.9,.5,0)};
         check(replay(compound,{0,0,0},true), "combined rotation reverse forward terminal-rotation replay");
+    }
+    {
+        // Synthetic planner/follower handoff: A's first rotation has been completed;
+        // recovery publishes B farther along the route. The former planner kept A cached
+        // on recovery confirmation and then sent A again, resetting tracking to its start.
+        using Path = std::vector<TrackingSample>;
+        using Profile = std::vector<double>;
+        const Path old_route{sample(0,0,0), sample(0,0,-.4,0,-.6),
+                             sample(.3,-.15,-.4,.5), sample(.95,-.45,-.4)};
+        const Path recovered_route{sample(.3,-.15,-.4), sample(.6,-.3,-.4,.5),
+                                   sample(1,-.45,-.4)};
+        const Profile old_profile{0,0,0,-.6,.5,0,0,0};
+        const Profile recovered_profile{0,0,.5,0,0,0};
+        const Pose2D rover{.6,-.3,-.4};
+        TrajectoryTracking tracker;
+        RetainedTrajectoryCache<Path,Profile> cache;
+        check(!cache.reusable(), "empty retained cache cannot be reused");
+        cache.published(old_route,old_profile,false,true);
+        tracker.setTrajectory(cache.path(),changed);
+        check(cache.reusable() && tracker.step({0,0,-.4},p).phase == MotionPhase::Forward,
+              "nominal cache and follower acquire old route rotation");
+
+        cache.published(recovered_route,recovered_profile,true,false);
+        tracker.setTrajectory(recovered_route,changed);
+        check(!cache.reusable() && cache.path().size() == old_route.size() &&
+              cache.profile() == old_profile && !cache.wasSnapped(),
+              "unconfirmed recovery revokes reuse but preserves checked back-out history");
+        tracker.setTrajectory(old_route,changed);  // former confirmed-recovery bug
+        const auto rejected = tracker.step(rover,p);
+        check(changed && rejected.status == TrackingStatus::Invalid &&
+              rejected.failure == TrackingFailure::RotationAnchor &&
+              rejected.phase_begin == 0 && rejected.phase_end == 1 &&
+              rejected.endpoint_distance > rejected.arrival_distance &&
+              rejected.desired_v == 0 && rejected.desired_w == 0,
+              "old cache resurrection reproduces distant phase-zero rotation rejection");
+
+        tracker.setTrajectory(recovered_route,changed);
+        cache.published(recovered_route,recovered_profile,true,true);  // confirmed recovery
+        tracker.setTrajectory(cache.path(),changed);
+        const auto continued = tracker.step(rover,p);
+        check(cache.reusable() && cache.profile() == recovered_profile && cache.wasSnapped() &&
+              !changed && continued.status == TrackingStatus::Tracking && continued.desired_v > 0,
+              "confirmed recovery promotes complete new route and preserves follower continuity");
+        cache.published(cache.path(),cache.profile(),cache.wasSnapped(),true);
+        check(cache.reusable() && cache.profile() == recovered_profile,
+              "validated same-route republication safely preserves cache payload");
+
+        cache.published(Path{},Profile{},false,false);  // stop/invalid atomic output
+        tracker.clear();
+        check(!cache.reusable() && cache.path().size() == recovered_route.size(),
+              "empty publication revokes cache replay after follower progress is cleared");
+        const Path manoeuvre{sample(.6,-.3,-.4),sample(.6,-.3,0,0,.6)};
+        cache.published(manoeuvre,Profile{},false,false);
+        check(!cache.reusable() && cache.profile() == recovered_profile && cache.wasSnapped(),
+              "recovery manoeuvre neither reactivates nor overwrites nominal back-out history");
+        cache.published(old_route,old_profile,false,true);
+        check(cache.reusable() && !cache.wasSnapped() && cache.profile() == old_profile,
+              "fresh validated nominal plan replaces interrupted cache and snap metadata");
+        cache.clear();
+        check(!cache.reusable() && cache.path().empty() && cache.profile().empty() &&
+              !cache.wasSnapped(), "new goal clears all retained route state");
     }
     {
         TrajectoryTracking tracker;

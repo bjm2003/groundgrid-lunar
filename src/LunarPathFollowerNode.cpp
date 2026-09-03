@@ -201,9 +201,14 @@ private:
             return;
         }
         if(step.status != TrackingStatus::Tracking) {
-            ROS_WARN("follow_phase_invalid id=%zu phase=%s begin=%zu end=%zu x=%.3f y=%.3f yaw=%.3f",
+            ROS_WARN("follow_phase_invalid id=%zu phase=%s begin=%zu end=%zu "
+                     "reason=%s x=%.3f y=%.3f yaw=%.3f "
+                     "anchor_x=%.3f anchor_y=%.3f anchor_yaw=%.3f "
+                     "anchor_d=%.3f arrival=%.3f nearest_d=%.3f",
                      trajectory_id_, motionPhaseName(step.phase), step.phase_begin, step.phase_end,
-                     x,y,yaw);
+                     trackingFailureName(step.failure), x,y,yaw,
+                     step.phase_endpoint.x, step.phase_endpoint.y, step.phase_endpoint.yaw,
+                     step.endpoint_distance, step.arrival_distance, step.nearest_distance);
             path_.poses.clear();
             tracker_.clear();
             stop("invalid_trajectory");

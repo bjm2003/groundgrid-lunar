@@ -28,6 +28,7 @@
 #include "groundgrid/MotionPrimitiveLibrary.h"
 #include "groundgrid/LunarTrajectory.h"
 #include "groundgrid/TrajectoryControl.h"
+#include "groundgrid/RetainedTrajectoryCache.h"
 
 namespace groundgrid {
 
@@ -161,7 +162,8 @@ private:
     void publishPlanOutputs(const nav_msgs::Path& path,
                             const std_msgs::Float32MultiArray& profile,
                             bool reaches_goal,
-                            bool was_snapped) {
+                            bool was_snapped,
+                            bool retain_route = false) {
         path_pub_.publish(path);
         vel_pub_.publish(profile);
 
@@ -201,6 +203,11 @@ private:
         }
         active_trajectory_reaches_goal_ = finite && !path.poses.empty() && reaches_goal;
         active_trajectory_was_snapped_ = active_trajectory_reaches_goal_ && was_snapped;
+        // All publications pass through this handoff. Even a transient empty trajectory
+        // clears follower phase progress, so an interrupted cache cannot later be replayed
+        // from an arbitrary nearest point. Its history remains available to back-out only.
+        retained_route_.published(trajectory.path, profile, was_snapped,
+                                  active_trajectory_reaches_goal_ && retain_route);
         trajectory_pub_.publish(trajectory);
     }
 
@@ -284,23 +291,23 @@ private:
         recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
         best_goal_dist_ = std::numeric_limits<double>::infinity();
         last_progress_time_ = ros::Time::now();
-        last_valid_path_.poses.clear();
-        last_valid_profile_.data.clear();
-        last_valid_was_snapped_ = false;
+        retained_route_.clear();
         active_trajectory_reaches_goal_ = false;
         active_trajectory_was_snapped_ = false;
         last_path_.poses.clear();
     }
 
     bool retainedTrajectoryStillValid(const geometry_msgs::PoseStamped& start) const {
-        if(last_valid_path_.poses.empty() ||
-           last_valid_profile_.data.size() != last_valid_path_.poses.size()*2) {
+        if(!retained_route_.reusable()) return false;
+        const auto& path = retained_route_.path();
+        if(path.poses.empty() ||
+           retained_route_.profile().data.size() != path.poses.size()*2) {
             return false;
         }
         size_t nearest = 0;
         double nearest_distance = std::numeric_limits<double>::infinity();
-        for(size_t i=0; i<last_valid_path_.poses.size(); ++i) {
-            const auto& p = last_valid_path_.poses[i].pose.position;
+        for(size_t i=0; i<path.poses.size(); ++i) {
+            const auto& p = path.poses[i].pose.position;
             const double distance = std::hypot(p.x-start.pose.position.x,
                                                p.y-start.pose.position.y);
             if(distance < nearest_distance) {
@@ -349,24 +356,24 @@ private:
         };
 
         // The current body may occlude its own cells; every point after it is strict. Check
-        // the connector to the nearest retained pose because the follower will immediately
-        // look ahead from there rather than replaying the path prefix.
+        // the connector to the nearest retained pose. Reuse is limited to an uninterrupted
+        // route above; the follower therefore retains its completed rotation/cusp progress.
         geometry_msgs::Pose from = start.pose;
-        if(!segmentValid(from, last_valid_path_.poses[nearest].pose,
+        if(!segmentValid(from, path.poses[nearest].pose,
                          /*allow_start_unknown=*/true,
                          /*clearance0=*/0.0, /*clearance1=*/0.0)) {
             ROS_WARN_THROTTLE(1.0, "retained trajectory invalid on current-pose connector");
             return false;
         }
-        for(size_t i=nearest+1; i<last_valid_path_.poses.size(); ++i) {
+        for(size_t i=nearest+1; i<path.poses.size(); ++i) {
             // The current/nearest pose may already sit inside the desired buffer because
             // of tracking error or a newly refined obstacle boundary. It is not legal to
             // ignore a lethal cell under the physical body, but it must be legal to follow
             // a collision-free route *out* of the buffer. Restore the full margin over the
             // first outgoing segment; all later segments remain fully inflated.
             const double clearance0 = (i == nearest+1) ? 0.0 : trajectory_clearance_;
-            if(!segmentValid(last_valid_path_.poses[i-1].pose,
-                             last_valid_path_.poses[i].pose,
+            if(!segmentValid(path.poses[i-1].pose,
+                             path.poses[i].pose,
                              /*allow_start_unknown=*/false,
                              clearance0, trajectory_clearance_)) {
                 ROS_WARN_THROTTLE(1.0,
@@ -379,12 +386,13 @@ private:
     }
 
     void republishRetainedTrajectory(bool after_failed_replan = false) {
-        nav_msgs::Path path = last_valid_path_;
+        nav_msgs::Path path = retained_route_.path();
         path.header.stamp = ros::Time::now();
         for(auto& pose : path.poses) pose.header = path.header;
         last_path_ = path;
-        publishPlanOutputs(path, last_valid_profile_,
-                           /*reaches_goal=*/true, last_valid_was_snapped_);
+        publishPlanOutputs(path, retained_route_.profile(),
+                           /*reaches_goal=*/true, retained_route_.wasSnapped(),
+                           /*retain_route=*/true);
         if(after_failed_replan) {
             if(last_fail_reason_.empty()) last_fail_reason_ = "replan_failed_reused";
             else last_fail_reason_ += "_reused";
@@ -392,7 +400,7 @@ private:
             last_plan_ms_ = 0.0;
             last_fail_reason_.clear();
         }
-        publishStatus(last_valid_was_snapped_ ? "success_snapped" : "success");
+        publishStatus(retained_route_.wasSnapped() ? "success_snapped" : "success");
         publishDiagnostics();
     }
 
@@ -504,11 +512,12 @@ private:
     // own reverse detection makes the rover back up rather than turn around in place.
     bool recoveryBackOut(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
                          std_msgs::Float32MultiArray& vel) {
-        if(last_valid_path_.poses.size() < 2) return false;
+        const auto& history = retained_route_.path();
+        if(history.poses.size() < 2) return false;
         const double x = start.pose.position.x, y = start.pose.position.y;
         size_t nearest = 0; double nearest_d = std::numeric_limits<double>::infinity();
-        for(size_t i = 0; i < last_valid_path_.poses.size(); ++i) {
-            const auto& p = last_valid_path_.poses[i].pose.position;
+        for(size_t i = 0; i < history.poses.size(); ++i) {
+            const auto& p = history.poses[i].pose.position;
             const double d = std::hypot(p.x - x, p.y - y);
             if(d < nearest_d) { nearest_d = d; nearest = i; }
         }
@@ -518,7 +527,7 @@ private:
         path.poses.push_back(first);
         double travelled = 0.0;
         for(size_t i = nearest; i-- > 0;) {
-            const auto& src = last_valid_path_.poses[i];
+            const auto& src = history.poses[i];
             // The map has moved on since this path was planned, and this is the only recovery
             // that puts the vehicle into space it cannot currently see -- so re-check every
             // pose strictly (no allow_unknown) and abandon the rung on the first rejection.
@@ -581,7 +590,7 @@ private:
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
 
         // The follower stops against the *active* trajectory endpoint. That can differ from
-        // last_valid_path_ while recovery owns a rotate/back-out or a relaxed goal plan, so
+        // retained_route_ while recovery owns a rotate/back-out or a relaxed goal plan, so
         // completion must be classified with the exact trajectory currently at the follower.
         // A recovery manoeuvre ending is not mission success. An ordinary tolerance endpoint
         // outside the requested-goal radius is an intermediate waypoint and triggers a fresh
@@ -612,9 +621,7 @@ private:
                 publishStatus("goal_reached");
                 have_goal_ = false;
                 replan_requested_ = false;
-                last_valid_path_.poses.clear();
-                last_valid_profile_.data.clear();
-                last_valid_was_snapped_ = false;
+                retained_route_.clear();
                 active_trajectory_reaches_goal_ = false;
                 active_trajectory_was_snapped_ = false;
                 return;
@@ -629,9 +636,7 @@ private:
                 confirm_count_ = 0;
                 best_goal_dist_ = requested_goal_dist;
                 last_progress_time_ = ros::Time::now();
-                last_valid_path_.poses.clear();
-                last_valid_profile_.data.clear();
-                last_valid_was_snapped_ = false;
+                retained_route_.clear();
                 active_trajectory_reaches_goal_ = false;
                 active_trajectory_was_snapped_ = false;
                 last_path_.poses.clear();
@@ -656,8 +661,8 @@ private:
         // operator click; measuring the click made a completed safe snap look permanently
         // stuck and forced it through the recovery ladder into Abort.
         double execution_goal_dist = requested_goal_dist;
-        if(!last_valid_path_.poses.empty()) {
-            const auto& endpoint = last_valid_path_.poses.back().pose.position;
+        if(active_trajectory_reaches_goal_ && !last_path_.poses.empty()) {
+            const auto& endpoint = last_path_.poses.back().pose.position;
             execution_goal_dist = std::hypot(endpoint.x-start.pose.position.x,
                                              endpoint.y-start.pose.position.y);
         }
@@ -680,18 +685,18 @@ private:
             execution_goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
             /*retained_path_valid=*/true);
         const bool stable_route_candidate = stableTrajectoryReuseAllowed(
-            last_valid_was_snapped_, terminal_region, no_progress,
+            retained_route_.wasSnapped(), terminal_region, no_progress,
             mode_ == PlannerMode::Nominal, /*retained_path_valid=*/true);
         if(stable_route_candidate) {
             const bool retained_path_valid = retainedTrajectoryStillValid(start);
-            if(stableTrajectoryReuseAllowed(last_valid_was_snapped_, terminal_region,
+            if(stableTrajectoryReuseAllowed(retained_route_.wasSnapped(), terminal_region,
                                             no_progress,
                                             mode_ == PlannerMode::Nominal,
                                             retained_path_valid)) {
                 ROS_INFO_THROTTLE(1.0,
                                   "plan: reusing stable %s trajectory (%zu poses, goal_dist=%.3fm)",
-                                  last_valid_was_snapped_ ? "snapped" : "terminal",
-                                  last_valid_path_.poses.size(), execution_goal_dist);
+                                  retained_route_.wasSnapped() ? "snapped" : "terminal",
+                                  retained_route_.path().poses.size(), execution_goal_dist);
                 republishRetainedTrajectory();
                 return;
             }
@@ -730,24 +735,27 @@ private:
         } else if(ok) {
             consecutive_failures_ = 0;
             last_path_ = path;
-            // Only genuine plans seed the back-out buffer: retreating along a previous
-            // recovery manoeuvre would just replay the manoeuvre that already failed.
-            if(!in_recovery) {
-                last_valid_path_ = path;
-                last_valid_profile_ = vel;
-                last_valid_was_snapped_ = snapped_goal_used_;
-            }
+            const bool recovery_confirmed = in_recovery &&
+                ++confirm_count_ >= recovery_confirm_count_;
+            // A confirmed relaxed plan is the NEW nominal route. Keeping the pre-recovery
+            // cache here resurrected its completed first rotation at the next reuse tick.
+            // Unconfirmed plans and manoeuvres must not become reusable history.
             publishPlanOutputs(path, vel,
-                               /*reaches_goal=*/true, snapped_goal_used_);
+                               /*reaches_goal=*/true, snapped_goal_used_,
+                               /*retain_route=*/!in_recovery || recovery_confirmed);
             if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
                 // marginal situation chatters between recovery and nominal every cycle.
-                if(++confirm_count_ >= recovery_confirm_count_) {
+                if(recovery_confirmed) {
                     mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
                     recovery_escalation_ = 0; confirm_count_ = 0;
                     last_recovery_end_ = ros::Time::now();
-                    best_goal_dist_ = execution_goal_dist;
+                    const auto& endpoint = path.poses.back().pose.position;
+                    best_goal_dist_ = std::hypot(endpoint.x-start.pose.position.x,
+                                                  endpoint.y-start.pose.position.y);
                     last_progress_time_ = ros::Time::now();
+                    ROS_INFO("plan: recovery confirmed; retained route replaced (%zu poses)",
+                             path.poses.size());
                     ++recovery_successes_;
                     publishStatus(snapped_goal_used_ ? "success_snapped" : "success");
                 } else {
@@ -770,7 +778,7 @@ private:
                                   "plan: fresh search failed (%s); continuing revalidated "
                                   "trajectory (%zu poses)",
                                   last_fail_reason_.empty() ? "unknown" : last_fail_reason_.c_str(),
-                                  last_valid_path_.poses.size());
+                                  retained_route_.path().poses.size());
                 consecutive_failures_ = 0;
                 confirm_count_ = 0;
                 republishRetainedTrajectory(/*after_failed_replan=*/true);
@@ -1517,7 +1525,6 @@ private:
     double trajectory_clearance_, goal_snap_clearance_;
     int goal_snap_heading_span_;
     bool snapped_goal_used_=false; double last_snap_dist_=0.0;
-    bool last_valid_was_snapped_=false;
 
     PlannerMode mode_ = PlannerMode::Nominal;
     RecoveryAction action_ = RecoveryAction::None;
@@ -1535,8 +1542,7 @@ private:
     double last_cpu_ticks_ = -1.0;
     ros::Time last_cpu_time_;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
-    nav_msgs::Path last_valid_path_;
-    std_msgs::Float32MultiArray last_valid_profile_;
+    RetainedTrajectoryCache<nav_msgs::Path, std_msgs::Float32MultiArray> retained_route_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;
