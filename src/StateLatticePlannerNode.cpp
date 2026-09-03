@@ -33,6 +33,7 @@
 #include "groundgrid/RetainedTrajectoryCache.h"
 #include "groundgrid/SweptFootprint.h"
 #include "groundgrid/ReplanStopBarrier.h"
+#include "groundgrid/FootprintRaster.h"
 
 namespace groundgrid {
 
@@ -222,6 +223,7 @@ private:
         }
         active_trajectory_reaches_goal_ = finite && !path.poses.empty() && reaches_goal;
         active_trajectory_was_snapped_ = active_trajectory_reaches_goal_ && was_snapped;
+        active_trajectory_map_stamp_ = finite && !path.poses.empty() ? map_stamp_ : ros::Time();
         // All publications pass through this handoff. Even a transient empty trajectory
         // clears follower phase progress, so an interrupted cache cannot later be replayed
         // from an arbitrary nearest point. Its history remains available to back-out only.
@@ -374,7 +376,7 @@ private:
             return sweptSegmentValid(
                 {from.position.x, from.position.y, tf2::getYaw(from.orientation)},
                 {to.position.x, to.position.y, tf2::getYaw(to.orientation)},
-                clearance0, clearance1, allow_start_unknown, cost);
+                clearance0, clearance1, allow_start_unknown, cost,"active_sweep");
         };
 
         // The current body may occlude its own cells; every point after it is strict. Check
@@ -395,7 +397,8 @@ private:
                               tf2::getYaw(from.orientation), actual_valid ? "true" : "false",
                               nearest, nearest_pose.position.x, nearest_pose.position.y,
                               tf2::getYaw(nearest_pose.orientation), map_stamp_.toSec());
-            if(!actual_valid) logFootprintRejection(from,"current_pose");
+            if(!actual_valid) logFootprintRejection(
+                {from.position.x,from.position.y,tf2::getYaw(from.orientation)},"current_pose");
             return false;
         }
         for(size_t i=nearest+1; i<path.poses.size(); ++i) {
@@ -410,8 +413,9 @@ private:
                              /*allow_start_unknown=*/false,
                              clearance0, trajectory_clearance_)) {
                 ROS_WARN_THROTTLE(1.0,
-                                  "retained trajectory invalid on swept segment %zu -> %zu",
-                                  i-1, i);
+                                  "retained trajectory invalid on swept segment %zu -> %zu "
+                                  "goal_id=%u validated_map=%.6f current_map=%.6f",
+                                  i-1,i,goal_id_,active_trajectory_map_stamp_.toSec(),map_stamp_.toSec());
                 return false;
             }
         }
@@ -900,9 +904,9 @@ private:
     // vehicle is physically sitting on its current pose and its body occludes the ground
     // directly beneath it, so those cells are never observed. Genuinely lethal cells
     // (terrain_cost >= 100) and cells whose measured slope exceeds the limit are still rejected.
-    // Reads the flattened traversability cache; behaviour is identical to a direct grid_map
-    // scan, but cells whose slope magnitude is already within the (stricter) lateral limit
-    // skip the direction-dependent slope trig entirely.
+    // Rasterise ALL intersected grid cells rather than a rotated body-coordinate point
+    // lattice. A larger clearance rectangle must include every smaller one's cells.
+    // Gentle cells still skip the direction-dependent slope trigonometry.
     bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false,
                         double margin = 0.0, FootprintRejection* rejection = nullptr) const {
         if(rejection) *rejection=FootprintRejection{};
@@ -912,27 +916,26 @@ private:
         };
         cost = 0.0f; int samples = 0;
         const double r = map_.getResolution();
-        const double half_l = footprint_length_/2 + margin, half_w = footprint_width_/2 + margin;
         const double cyaw = std::cos(yaw), syaw = std::sin(yaw);
-        for(double lx = -half_l; lx <= half_l + 1e-6; lx += r) {
-            for(double ly = -half_w; ly <= half_w + 1e-6; ly += r) {
-                const double wx = x + cyaw*lx - syaw*ly;
-                const double wy = y + syaw*lx + cyaw*ly;
+        const double origin_x=map_.getPosition().x()-0.5*map_.getLength().x();
+        const double origin_y=map_.getPosition().y()-0.5*map_.getLength().y();
+        const bool valid=visitFootprintCells({x,y,yaw},footprint_length_,footprint_width_,margin,
+            r,origin_x,origin_y,[&](double wx,double wy) {
                 grid_map::Index idx;
                 if(!map_.getIndex(grid_map::Position(wx, wy), idx)) {
-                    if(allow_unknown) continue;
+                    if(allow_unknown) return true;
                     return reject("off_map",wx,wy,-1,-1);
                 }
                 const size_t lin = static_cast<size_t>(idx(0)) * cell_cols_ + idx(1);
                 const float c = cell_cost_[lin];
                 if(!std::isfinite(c)) {
-                    if(allow_unknown) continue;
+                    if(allow_unknown) return true;
                     return reject("unknown_cost",wx,wy,idx(0),idx(1));
                 }
                 if(c >= 100.0f) return reject("lethal_cost",wx,wy,idx(0),idx(1));
                 const float sm = cell_slopemag_[lin];
                 if(!std::isfinite(sm)) {
-                    if(allow_unknown) continue;
+                    if(allow_unknown) return true;
                     return reject("unknown_slope",wx,wy,idx(0),idx(1));
                 }
                 if(sm > max_lat_slope_) {  // steep cell: fall back to the directional check
@@ -945,21 +948,26 @@ private:
                                       wx,wy,idx(0),idx(1));
                 }
                 cost += c; ++samples;
-            }
-        }
+                return true;
+            });
         if(samples) cost /= samples;
-        return true;
+        return valid;
     }
 
     // Observability only: report the exact rejected cell and original terrain layers.
     // Ground-truth clearance does not justify overriding a perceived lethal cell. These
     // fields distinguish obstacle/step/slope rejection before considering a map change.
-    void logFootprintRejection(const geometry_msgs::Pose& pose,const char* context,
-                               double margin=0.0) const {
+    void logFootprintRejection(const Pose2D& pose,const char* context,
+                               double margin=0.0,bool allow_body_unknown=true) const {
         FootprintRejection rejection;
         float cost;
-        if(footprintValid(pose.position.x,pose.position.y,tf2::getYaw(pose.orientation),
-                          cost,true,margin,&rejection)) return;
+        double rejected_margin=0.0;
+        // Mirror the actual body/band policy, including their different unknown rules.
+        if(footprintValid(pose.x,pose.y,pose.yaw,cost,allow_body_unknown,0.0,&rejection)) {
+            if(margin<=0.0 || footprintValid(pose.x,pose.y,pose.yaw,
+                                             cost,true,margin,&rejection)) return;
+            rejected_margin=margin;
+        }
         const bool indexed=rejection.row>=0 && rejection.col>=0;
         const grid_map::Index index(rejection.row,rejection.col);
         const double nan=std::numeric_limits<double>::quiet_NaN();
@@ -973,8 +981,8 @@ private:
                           "terrain_cost=%.3f slope_x=%.4f slope_y=%.4f slope=%.3f "
                           "step_height=%.3f obstacle_height=%.3f obstacle_confidence=%.3f "
                           "roughness=%.3f map_stamp=%.6f",
-                          goal_id_,context,rejection.reason,margin,
-                          pose.position.x,pose.position.y,tf2::getYaw(pose.orientation),
+                          goal_id_,context,rejection.reason,rejected_margin,
+                          pose.x,pose.y,pose.yaw,
                           rejection.sample_x,rejection.sample_y,cell.x(),cell.y(),
                           layer("terrain_cost"),layer("slope_x"),layer("slope_y"),layer("slope"),
                           layer("step_height"),layer("obstacle_height"),layer("obstacle_confidence"),
@@ -1013,15 +1021,20 @@ private:
 
     bool sweptSegmentValid(const Pose2D& from, const Pose2D& to,
                             double clearance0, double clearance1,
-                            bool allow_start_unknown, float& cost) const {
+                            bool allow_start_unknown, float& cost,
+                            const char* rejection_context=nullptr) const {
         if(allow_start_unknown && clearance0==0.0 && clearance1>0.0 &&
            footprintWithClearanceValid(from.x,from.y,from.yaw,cost,true,clearance1))
             clearance0=clearance1;
         return sweptFootprintValid(from, to, cornerRadius(), map_.getResolution(),
             clearance0, clearance1, allow_start_unknown,
-            [this](const Pose2D& pose, double clearance, bool allow_unknown, float& terrain) {
-                return footprintWithClearanceValid(pose.x, pose.y, pose.yaw,
-                                                    terrain, allow_unknown, clearance);
+            [this,rejection_context](const Pose2D& pose, double clearance,
+                                     bool allow_unknown, float& terrain) {
+                const bool valid=footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
+                                                              terrain,allow_unknown,clearance);
+                if(!valid && rejection_context)
+                    logFootprintRejection(pose,rejection_context,clearance,allow_unknown);
+                return valid;
             }, cost);
     }
 
@@ -1436,7 +1449,8 @@ private:
                               sp.x(), sp.y(), yawForBin(start.t), goal_id_,
                               actual.position.x, actual.position.y, tf2::getYaw(actual.orientation),
                               actual_valid ? "true" : "false", map_stamp_.toSec());
-            logFootprintRejection(actual,"start_body");
+            logFootprintRejection({actual.position.x,actual.position.y,
+                                   tf2::getYaw(actual.orientation)},"start_body");
             last_fail_reason_ = "start_footprint";
             return false;
         }
@@ -1586,11 +1600,8 @@ private:
             last_fail_reason_ = expanded==1 && root_successors==0 ? "start_no_successor"
                                  : (elapsed >= max_planning_time_ ? "search_timeout" : "search_exhausted");
             if(expanded==1 && root_successors==0) {
-                geometry_msgs::Pose lattice=start_pose.pose;
-                lattice.position.x=sp.x(); lattice.position.y=sp.y();
-                tf2::Quaternion q; q.setRPY(0,0,yawForBin(start.t));
-                lattice.orientation=tf2::toMsg(q);
-                logFootprintRejection(lattice,"start_clearance",trajectoryClearance());
+                logFootprintRejection({sp.x(),sp.y(),yawForBin(start.t)},
+                                       "start_clearance",trajectoryClearance());
             }
             return false;
         }
@@ -1711,6 +1722,7 @@ private:
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
     RetainedTrajectoryCache<nav_msgs::Path, std_msgs::Float32MultiArray> retained_route_;
     ReplanStopBarrier stop_barrier_;
+    ros::Time active_trajectory_map_stamp_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;

@@ -1,9 +1,12 @@
 // Synthetic geometry tests of the production swept checker. These are not a replay of
-// the rolling perception map; the logged pose only anchors the no-successor fixture.
+// the rolling perception map; logged poses only anchor the synthetic fixtures.
 #include "groundgrid/SweptFootprint.h"
+#include "groundgrid/FootprintRaster.h"
 
 #include <cstdio>
 #include <limits>
+#include <set>
+#include <utility>
 #include <vector>
 
 using namespace groundgrid;
@@ -18,6 +21,62 @@ void check(bool ok, const char* label) {
     if(!ok) ++failures;
 }
 struct Hazard { double x,y,r; };
+using Cell=std::pair<int,int>;
+using Cells=std::set<Cell>;
+Cell cellAt(double x,double y,double ox=0,double oy=0) {
+    return {int(std::floor((x-ox)/.15)),int(std::floor((y-oy)/.15))};
+}
+Cells rasterCells(const Pose2D& p,double margin,double ox=0,double oy=0) {
+    Cells cells;
+    visitFootprintCells(p,1.8,1.5,margin,.15,ox,oy,[&](double x,double y) {
+        cells.insert(cellAt(x,y,ox,oy)); return true;
+    });
+    return cells;
+}
+// Exact pre-fix point-lattice policy: retain only in this regression test.
+Cells legacyPointCells(const Pose2D& p,double margin) {
+    Cells cells;
+    for(double u=-.9-margin;u<=.9+margin+1e-6;u+=.15)
+        for(double v=-.75-margin;v<=.75+margin+1e-6;v+=.15)
+            cells.insert(cellAt(p.x+std::cos(p.yaw)*u-std::sin(p.yaw)*v,
+                                p.y+std::sin(p.yaw)*u+std::cos(p.yaw)*v));
+    return cells;
+}
+
+// Independent oracle: clip the oriented rectangle polygon against a grid square.
+// Production uses separating axes instead, so a repeated implementation bug is less
+// likely to pass both sides of the comparison. Test only, not on the runtime path.
+bool clippedOverlap(const Pose2D& p,double margin,double cx,double cy) {
+    using Point=std::pair<double,double>;
+    std::vector<Point> poly;
+    for(const auto& corner : std::vector<Point>{{-.9-margin,-.75-margin},
+             {.9+margin,-.75-margin},{.9+margin,.75+margin},{-.9-margin,.75+margin}})
+        poly.emplace_back(p.x+std::cos(p.yaw)*corner.first-std::sin(p.yaw)*corner.second,
+                          p.y+std::sin(p.yaw)*corner.first+std::cos(p.yaw)*corner.second);
+    for(int axis=0;axis<2;++axis) for(int sign : {-1,1}) {
+        const double centre=axis==0 ? cx : cy;
+        const double edge=centre+sign*.075;
+        const auto distance=[&](const Point& a) {
+            return sign*((axis==0 ? a.first : a.second)-edge);
+        };
+        std::vector<Point> clipped;
+        if(poly.empty()) return false;
+        Point a=poly.back();
+        double da=distance(a);
+        for(const auto& b : poly) {
+            const double db=distance(b);
+            const bool ai=da<=1e-12, bi=db<=1e-12;
+            if(ai!=bi) {
+                const double t=da/(da-db);
+                clipped.emplace_back(a.first+t*(b.first-a.first),a.second+t*(b.second-a.second));
+            }
+            if(bi) clipped.push_back(b);
+            a=b; da=db;
+        }
+        poly.swap(clipped);
+    }
+    return !poly.empty();
+}
 struct RectangleMap {
     std::vector<Hazard> hazards;
     bool operator()(const Pose2D& p, double margin, bool, float& cost) const {
@@ -53,6 +112,72 @@ bool legacyEdge(const Pose2D& p,int direction,int turn,const RectangleMap& map) 
 
 int main() {
     float cost;
+    {
+        const Pose2D p{6.425,-6.525,-pi/4};
+        const Cell lethal=cellAt(5.175,-6.075);
+        const auto body=legacyPointCells(p,0), ordinary=legacyPointCells(p,.25);
+        const auto full=legacyPointCells(p,.5);
+        check(!body.count(lethal) && !full.count(lethal) && ordinary.count(lethal),
+              "reproduce same-map 0.50 m pass but 0.25 m rejection from rotated point holes");
+        const auto new_body=rasterCells(p,0), new_ordinary=rasterCells(p,.25), new_full=rasterCells(p,.5);
+        check(!new_body.count(lethal) && new_ordinary.count(lethal) && new_full.count(lethal),
+              "both rasterised clearance bands reject the known hazard outside the physical body");
+        check(std::includes(new_full.begin(),new_full.end(),new_ordinary.begin(),new_ordinary.end()) &&
+              std::includes(new_ordinary.begin(),new_ordinary.end(),new_body.begin(),new_body.end()),
+              "grid coverage is nested between body, ordinary and snap clearance");
+        const auto axis=rasterCells({0,0,0},0);
+        check(axis.count(cellAt(.975,.075)) && axis.count(cellAt(-.975,-.075)),
+              "raster includes cells touching both positive and negative rectangle edges");
+        check(!axis.count(cellAt(1.125,.075)),
+              "rectangle raster does not substitute the rover circumscribed circle");
+        const auto shifted=rasterCells({p.x+1.05,p.y-.6,p.yaw},.5,1.05,-.6);
+        check(shifted==new_full,"rolling grid origin and rover translation preserve cell coverage");
+        bool monotone=true, oracle=true;
+        std::size_t oracle_cells=0;
+        for(int heading=-32;heading<=32;++heading) for(double offset : {0.0,.037,.149}) {
+            const Pose2D pose{-.32+offset,.27-offset,heading*.1};
+            const double ox=.031,oy=-.021;
+            Cells previous;
+            for(double margin : {0.0,.25,.5}) {
+                const auto got=rasterCells(pose,margin,ox,oy);
+                monotone &= std::includes(got.begin(),got.end(),previous.begin(),previous.end());
+                Cells expected;
+                for(int i=-22;i<=22;++i) for(int j=-22;j<=22;++j) {
+                    const double cx=ox+(i+.5)*.15,cy=oy+(j+.5)*.15;
+                    if(clippedOverlap(pose,margin,cx,cy)) expected.insert({i,j});
+                    ++oracle_cells;
+                }
+                oracle &= got==expected;
+                previous=got;
+            }
+        }
+        check(monotone,"clearance nesting across 195 headings/subcell-offset fixtures");
+        check(oracle,"raster agrees with independent polygon clipping for every fixture cell");
+        std::printf("raster oracle: %zu rectangle/cell comparisons\n",oracle_cells);
+        int calls=0;
+        check(!visitFootprintCells(p,1.8,1.5,.5,.15,0,0,[&](double,double) {
+                  ++calls; return false;
+              }) && calls==1,"first rejected cell stops raster iteration immediately");
+        calls=0;
+        const auto count=[&](double,double) { ++calls; return true; };
+        const double nan=std::numeric_limits<double>::quiet_NaN();
+        check(!visitFootprintCells({nan,0,0},1.8,1.5,0,.15,0,0,count) &&
+              !visitFootprintCells(p,1.8,1.5,-.1,.15,0,0,count) &&
+              !visitFootprintCells(p,0,1.5,0,.15,0,0,count) &&
+              !visitFootprintCells(p,1.8,1.5,0,0,0,0,count) &&
+              !visitFootprintCells(p,1.8,1.5,0,.15,nan,0,count) &&
+              !visitFootprintCells({1e30,0,0},1.8,1.5,0,.15,0,0,count) &&
+              !visitFootprintCells(p,1e6,1e6,0,.15,0,0,count) && calls==0,
+              "invalid or oversized raster geometry fails closed without cell callbacks");
+        const auto grid_hazard=[&](const Pose2D& pose,double margin,bool,float& terrain) {
+            terrain=0;
+            return visitFootprintCells(pose,1.8,1.5,margin,.15,0,0,
+                [&](double x,double y) { return cellAt(x,y)!=lethal; });
+        };
+        check(!sweptFootprintValid(p,p,radius,.15,.5,.5,false,grid_hazard,cost) &&
+              !sweptFootprintValid(p,p,radius,.15,.25,.25,false,grid_hazard,cost),
+              "search and retained swept checks reject the same rasterised hazard");
+    }
     const RectangleMap rock{{{0,-2,.65}}};
     const Pose2D stuck{-1.991314028154504,-2.89871102168998,-pi/8};
     check(rock(stuck,0,true,cost) && !rock(stuck,.5,true,cost),

@@ -33,6 +33,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 
 - Keep `min_point_distance < sensor_blind_radius`. The current lunar values are 1.2 m and 2.5 m. Changing only one can mark an unseen near-field obstacle region as safe.
 - Treat the rover as its rectangular footprint for clearance and collision metrics; do not replace it with a circumscribed circle.
+- Enumerate every grid square touched by the oriented footprint; do not substitute a
+  rotated point lattice. On one map, increasing clearance must include all cells from
+  the smaller footprint. Search and execution revalidation share this rasterisation.
 - Collision checking must include the swept body during in-place rotations and transitions, not only endpoint poses.
 - A start-clearance ramp is limited to the occupied start's first edge, with full clearance
   restored at its endpoint. It never permits a known hazard under the physical body. Search

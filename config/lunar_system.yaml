@@ -78,9 +78,10 @@ state_lattice_planner:
   max_snap_distance: 1.5
   # Clearance every planned/reused trajectory pose must hold on top of the body rectangle.
   # Applying clearance only to a snapped endpoint allowed the final arc to clip a rock. The
-  # map is quantised to one 0.15 m cell (a corner can sit 0.106 m past the last sampled cell)
-  # and the follower's heading/tracking tolerance consumes another ~0.12 m. The physical body
-  # stays strict-known; only this extra band may contain unknown cells in an occlusion shadow.
+  # historical margin covers 0.15 m map discretisation plus heading/tracking error. The
+  # checker now covers every touched cell square, removing rotated point-sampling gaps;
+  # keep the existing margin rather than retuning it as part of that correctness fix. The
+  # physical body stays strict-known; only the extra band may contain unknown shadow cells.
   # The occupied start is a narrow exception: its first outgoing edge grows the band from
   # zero to full at the endpoint. All swept physical bodies remain checked; later edges
   # cannot restart this ramp. This lets a safe rover leave a newly refined obstacle band.
