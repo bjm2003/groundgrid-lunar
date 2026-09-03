@@ -49,6 +49,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   are compatibility and visualisation outputs, not control inputs.
 - A trajectory twist is desired effective body motion before slip compensation. Apply
   terrain scaling in the planner and `inverseCommand()` once in the follower.
+- Mix unsaturated angular feedback with planned feed-forward before the common angular
+  command limit. Pre-clipping feedback halves available correction at the 0.5 blend;
+  raw diagnostic `feedback_w` may exceed the command limit, but output commands may not.
 - The simulator must capture a cloud's pose and timestamp together under the dynamics
   lock. Ray-cast computation does not advance the measurement time; stamping old geometry
   with the latest TF time corrupts the perceived map while moving.

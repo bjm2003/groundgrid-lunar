@@ -1,6 +1,6 @@
-// Stateful, multi-step controller regression tests. All fixtures below are synthetic;
-// they verify index/phase and stop-barrier semantics, not ROS transport, physical braking,
-// perception, or collision clearance.
+// Stateful, multi-step controller regression tests. Fixtures are synthetic unless marked
+// as rounded log-derived samples. They verify index/phase, blending and stop-barrier
+// semantics, not ROS transport, physical braking, perception, or collision clearance.
 #include "groundgrid/TrajectoryTracking.h"
 #include "groundgrid/RetainedTrajectoryCache.h"
 #include "groundgrid/ReplanStopBarrier.h"
@@ -186,6 +186,51 @@ int main() {
         }
         check(replay(straight,{0,0,0}),direction < 0 ? "reverse straight replay" : "forward straight replay");
         check(replay(arc,{0,0,0}),direction < 0 ? "reverse arc replay" : "forward arc replay");
+    }
+    {
+        // Rounded log-derived fixture from 0b314f1, trajectory 186. The truncated point-5
+        // speed is reconstructed from command=5 in follow_debug. Test the first reverse
+        // then forward boundary, NOT completion of the whole recovery manoeuvre: later
+        // reverse tracking remains a known gap requiring ROS/map validation.
+        const std::vector<TrackingSample> logged{
+            sample(-2.275,-1.425,.392699),
+            sample(-2.500,-1.500,.196350,-.533484,-.441662),
+            sample(-2.725,-1.575,0),
+            sample(-2.500,-1.650,-.196350,.533484,-.441662),
+            sample(-2.275,-1.725,-.392699,.754460,-.624604),
+            sample(-2.050,-1.800,-.196350,.533484,0),
+            sample(-1.825,-1.875,0),
+            sample(-2.050,-1.950,.196350,-.533484,.441662),
+            sample(-2.275,-2.025,.392699)};
+        TrajectoryTracking tracker;
+        tracker.setTrajectory(logged,changed);
+        Pose2D rover{-2.365,-1.422,.356};
+        SkidSteerModel model;
+        bool acquired=false, bounded=true, full_correction=false;
+        for(int tick=0;tick<140;++tick) {
+            const auto out=tracker.step(rover,p);
+            if(out.status!=TrackingStatus::Tracking) break;
+            if(out.phase_begin==6) { acquired=true; break; }
+            bounded &= std::abs(out.desired_v)<=p.control.max_linear_speed &&
+                       std::abs(out.desired_w)<=p.control.max_angular_speed;
+            full_correction |= out.phase_begin==2 && out.planned_w==0 &&
+                               std::abs(out.desired_w)>.79;
+            rover=model.integrate(rover,out.desired_v,out.desired_w,.05);
+        }
+        check(acquired && bounded && full_correction,
+              "logged first reversing cusp acquires forward endpoint without half-limit spiral");
+        check(std::hypot(rover.x+1.825,rover.y+1.875)<p.waypoint_arrival_distance &&
+              std::abs(rover.yaw)<p.goal_yaw_tolerance,
+              "logged forward boundary meets unchanged position and yaw tolerances");
+    }
+    {
+        TrajectoryTracking tracker;
+        tracker.setTrajectory({sample(0,0,0),sample(0,0,2.0,0,.6)},changed);
+        const auto out=tracker.step({0,0,0},p);
+        check(out.status==TrackingStatus::Tracking && out.desired_v==0 &&
+              out.feedback_w>p.control.max_angular_speed &&
+              out.desired_w==p.control.max_angular_speed,
+              "rotation feedback is mixed before the common angular limit");
     }
     {
         const std::vector<TrackingSample> compound{

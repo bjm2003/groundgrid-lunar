@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using groundgrid::Pose2D;
@@ -101,6 +102,23 @@ int main() {
               "reverse geometric feedback preserves planner yaw-rate sign");
         check(!geometricAngularFeedback(-0.6, 0.2, -0.1, 0.8, reverse_w),
               "geometric feedback rejects invalid distance");
+        for(int direction : {-1,1}) {
+            double feedback = 0.0, v = 0.0, w = 0.0;
+            groundgrid::TrajectoryControlParams limits;
+            const bool ok = geometricAngularFeedback(direction*.533484,-1.2,.3,.8,feedback);
+            check(ok && feedback < -1.6 &&
+                  groundgrid::blendTrajectoryCommand(direction*.533484,0,feedback,limits,v,w) &&
+                  std::abs(v-direction*.533484)<1e-12 && std::abs(w+.8)<1e-12,
+                  direction < 0 ? "reverse correction saturates only after the 50/50 blend" :
+                                  "forward correction saturates only after the 50/50 blend");
+        }
+        double feedback = 0.0, v = 0.0, w = 0.0;
+        groundgrid::TrajectoryControlParams limits;
+        check(groundgrid::blendTrajectoryCommand(.5,.6,-1.4,limits,v,w) &&
+              std::abs(w+.4)<1e-12,
+              "opposing feedforward and feedback cancel before command saturation");
+        check(!geometricAngularFeedback(std::numeric_limits<double>::max(),1.0,.1,.8,feedback),
+              "overflowing geometric demand is rejected instead of disguised by clipping");
     }
 
     // 6) Lookahead stops at unfinished co-located rotations, then advances when aligned.

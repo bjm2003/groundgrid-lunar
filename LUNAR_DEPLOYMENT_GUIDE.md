@@ -314,6 +314,10 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 Rotate/BackOut 与保留路径共用扫掠检查。可用 `rosrun groundgrid planner_safety_selfcheck`
 运行离线几何回归，但它不代替完整 ROS 巡回验证。
 
+跟踪日志中的 `feedback_w` 是混合前的原始纠偏需求，可以超过 0.8 rad/s；控制器
+按 0.5 前馈/0.5 反馈混合后统一限幅，检查输出约束应看 `desired_w/cmd_w`。
+不要先把反馈限到 0.8 再乘 0.5，否则零规划角速度时实际纠偏被误限到 0.4。
+
 正常状态应为：
 
 ```text

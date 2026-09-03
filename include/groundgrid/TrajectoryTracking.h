@@ -200,9 +200,8 @@ public:
 
         if(result.pose_capture) {
             const double yaw_error = SkidSteerModel::wrap(target.yaw-rover.yaw);
-            result.feedback_w = std::clamp(1.5*yaw_error,
-                                          -p.control.max_angular_speed,
-                                          p.control.max_angular_speed);
+            // As with translating feedback, saturate only the final blended command.
+            result.feedback_w = 1.5*yaw_error;
             if(!translating && phase.kind != MotionPhase::Hold) {
                 // A rotation endpoint may carry w=0 after the planner's deceleration pass.
                 // Only an incoming rotation command in THIS phase can provide feed-forward.

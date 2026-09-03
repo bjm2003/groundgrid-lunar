@@ -158,6 +158,9 @@ inline bool requiresTerminalWaypointTracking(bool next_is_goal,
 // the yaw-rate sign is independent of the sign of v: a reverse arc with positive
 // direction-frame error still needs positive yaw rate. Multiplying by signed v here would
 // make reverse feedback oppose the planner feed-forward and cancel it at a 50/50 blend.
+// Return the unsaturated feedback demand. The angular envelope is validated here but
+// applied only AFTER feed-forward blending: clipping this term to w_max first would
+// silently cap correction at half w_max whenever planned_w is zero.
 inline bool geometricAngularFeedback(double planned_v, double direction_frame_error,
                                      double target_distance, double max_angular_speed,
                                      double& feedback_w) {
@@ -168,9 +171,8 @@ inline bool geometricAngularFeedback(double planned_v, double direction_frame_er
     }
     const double curvature = 2.0*std::sin(direction_frame_error) /
                              std::max(target_distance, 0.1);
-    feedback_w = std::clamp(std::abs(planned_v)*curvature,
-                            -max_angular_speed, max_angular_speed);
-    return true;
+    feedback_w = std::abs(planned_v)*curvature;
+    return std::isfinite(feedback_w);
 }
 
 // Blend the planner's angular feed-forward with geometric feedback while keeping the
