@@ -81,10 +81,14 @@ state_lattice_planner:
   # map is quantised to one 0.15 m cell (a corner can sit 0.106 m past the last sampled cell)
   # and the follower's heading/tracking tolerance consumes another ~0.12 m. The physical body
   # stays strict-known; only this extra band may contain unknown cells in an occlusion shadow.
+  # The occupied start is a narrow exception: its first outgoing edge grows the band from
+  # zero to full at the endpoint. All swept physical bodies remain checked; later edges
+  # cannot restart this ramp. This lets a safe rover leave a newly refined obstacle band.
+  # If the start already has the full band, the departure keeps that full band too.
   trajectory_clearance: 0.25
   # A snapped route lies beside an invalid/occluded requested goal. In the mixed hard-goal
   # diagnostic the perceived boulder boundary grew by about 0.25 m between far and near maps.
-  # Plan that entire route with 0.50 m, then revalidate retained poses against the ordinary
+  # After the first departure edge, plan with 0.50 m; revalidate retained poses against the ordinary
   # 0.25 m requirement: the difference is explicit map-refinement hysteresis. Ordinary goals
   # keep trajectory_clearance and therefore do not narrow every corridor in the system.
   goal_snap_clearance: 0.50

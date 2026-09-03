@@ -31,6 +31,7 @@
 #include "groundgrid/LunarTrajectory.h"
 #include "groundgrid/TrajectoryControl.h"
 #include "groundgrid/RetainedTrajectoryCache.h"
+#include "groundgrid/SweptFootprint.h"
 
 namespace groundgrid {
 
@@ -351,29 +352,11 @@ private:
                                    bool allow_start_unknown,
                                    double clearance0,
                                    double clearance1) {
-            const double dx = to.position.x-from.position.x;
-            const double dy = to.position.y-from.position.y;
-            const double yaw0 = tf2::getYaw(from.orientation);
-            const double dyaw = wrap(tf2::getYaw(to.orientation)-yaw0);
-            // Bound corner travel, not only centre travel. This makes retained-path
-            // validation obey the same swept-body invariant as newly expanded primitives,
-            // including co-located in-place rotations.
-            const double sweep = std::hypot(dx, dy) + std::abs(dyaw)*cornerRadius();
-            const int steps = std::max(1, static_cast<int>(std::ceil(
-                sweep/std::max(map_.getResolution(), 1e-3))));
-            for(int step=0; step<=steps; ++step) {
-                const double q = static_cast<double>(step)/steps;
-                float cost;
-                const double clearance = clearance0+q*(clearance1-clearance0);
-                if(!footprintWithClearanceValid(from.position.x+q*dx,
-                                                from.position.y+q*dy,
-                                                wrap(yaw0+q*dyaw), cost,
-                                                allow_start_unknown && step==0,
-                                                clearance)) {
-                    return false;
-                }
-            }
-            return true;
+            float cost;
+            return sweptSegmentValid(
+                {from.position.x, from.position.y, tf2::getYaw(from.orientation)},
+                {to.position.x, to.position.y, tf2::getYaw(to.orientation)},
+                clearance0, clearance1, allow_start_unknown, cost);
         };
 
         // The current body may occlude its own cells; every point after it is strict. Check
@@ -530,7 +513,7 @@ private:
         // over-slope cells are still rejected, and the whole sweep is checked, not just
         // the end yaw -- this probe is issued when the rover is already boxed in, which is
         // exactly where a corner has something to hit.
-        if(!rotationValid(x, y, yaw, target_yaw, cost, true)) return false;
+        if(!rotationValid(x, y, yaw, target_yaw, cost, /*departure=*/true)) return false;
 
         path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
         path.poses.clear();
@@ -566,14 +549,18 @@ private:
         double travelled = 0.0;
         for(size_t i = nearest; i-- > 0;) {
             const auto& src = history.poses[i];
-            // The map has moved on since this path was planned, and this is the only recovery
-            // that puts the vehicle into space it cannot currently see -- so re-check every
-            // pose strictly (no allow_unknown) and abandon the rung on the first rejection.
+            // Re-check the connector and every swept segment, not only the history poses.
+            // Only the occupied start may lack the band; restore it by the first endpoint.
             float cost;
-            if(!trajectoryFootprintValid(src.pose.position.x, src.pose.position.y,
-                                         tf2::getYaw(src.pose.orientation), cost)) return false;
-            const auto& prev = path.poses.back().pose.position;
-            travelled += std::hypot(src.pose.position.x - prev.x, src.pose.position.y - prev.y);
+            const auto& prev = path.poses.back().pose;
+            const bool departure = path.poses.size() == 1;
+            if(!sweptSegmentValid(
+                    {prev.position.x, prev.position.y, tf2::getYaw(prev.orientation)},
+                    {src.pose.position.x, src.pose.position.y, tf2::getYaw(src.pose.orientation)},
+                    departure ? 0.0 : trajectoryClearance(), trajectoryClearance(),
+                    departure, cost)) return false;
+            travelled += std::hypot(src.pose.position.x - prev.position.x,
+                                     src.pose.position.y - prev.position.y);
             geometry_msgs::PoseStamped pose = src; pose.header = path.header;
             path.poses.push_back(pose);
             if(travelled >= recovery_backout_distance_) break;
@@ -906,16 +893,32 @@ private:
                               /*allow_unknown=*/true, clearance);
     }
 
-    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
-                                  bool allow_body_unknown = false) const {
+    double trajectoryClearance() const {
         // A route to a snapped goal is planned with an uncertainty reserve along its whole
         // length, not only at the endpoint. Retained-path validation deliberately uses the
         // ordinary trajectory_clearance_ explicitly: the difference is hysteresis that the
         // far-to-near rolling-map refinement may consume without causing path churn.
-        const double clearance = snapped_goal_used_ ? goal_snap_clearance_
-                                                     : trajectory_clearance_;
+        return snapped_goal_used_ ? goal_snap_clearance_ : trajectory_clearance_;
+    }
+
+    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
+                                  bool allow_body_unknown = false) const {
         return footprintWithClearanceValid(x, y, yaw, cost, allow_body_unknown,
-                                           clearance);
+                                           trajectoryClearance());
+    }
+
+    bool sweptSegmentValid(const Pose2D& from, const Pose2D& to,
+                            double clearance0, double clearance1,
+                            bool allow_start_unknown, float& cost) const {
+        if(allow_start_unknown && clearance0==0.0 && clearance1>0.0 &&
+           footprintWithClearanceValid(from.x,from.y,from.yaw,cost,true,clearance1))
+            clearance0=clearance1;
+        return sweptFootprintValid(from, to, cornerRadius(), map_.getResolution(),
+            clearance0, clearance1, allow_start_unknown,
+            [this](const Pose2D& pose, double clearance, bool allow_unknown, float& terrain) {
+                return footprintWithClearanceValid(pose.x, pose.y, pose.yaw,
+                                                    terrain, allow_unknown, clearance);
+            }, cost);
     }
 
     // Half the body diagonal: how far a corner stands from the centre, and therefore the
@@ -932,94 +935,66 @@ private:
     // their sweep; rotations, which sweep the most, did not. The step keeps corner travel
     // under one cell, which is the spacing footprintValid samples the body at anyway.
     bool rotationValid(double x, double y, double yaw0, double yaw1, float& cost,
-                       bool allow_unknown = false) const {
-        const double dyaw = wrap(yaw1 - yaw0);
-        const int n = std::max(1, static_cast<int>(std::ceil(std::abs(dyaw) * cornerRadius() /
-                                                             map_.getResolution())));
-        cost = 0.0f;
-        for(int i = 1; i <= n; ++i)
-            if(!trajectoryFootprintValid(x, y, wrap(yaw0 + dyaw*i/n), cost,
-                                         allow_unknown)) return false;
-        return true;  // cost is the end pose's, which is what the caller charges for
+                       bool departure = false) const {
+        return sweptSegmentValid({x,y,yaw0}, {x,y,yaw1},
+                                 departure ? 0.0 : trajectoryClearance(),
+                                 trajectoryClearance(), departure, cost);
     }
 
     // Transform primitive samples from the start-body frame into the world, validate the
     // swept footprint along the primitive, accumulate terrain cost, and return the endpoint.
     bool primitiveValid(double px, double py, double pyaw, const MotionPrimitive& prim,
-                        float& avg_cost, double& ex, double& ey, double& eyaw) const {
-        const int n = static_cast<int>(prim.samples.size());
-        if(n == 0) return false;
+                        float& avg_cost, double& ex, double& ey, double& eyaw,
+                        bool departure = false) const {
+        if(prim.samples.empty()) return false;
         const double c = std::cos(pyaw), s = std::sin(pyaw);
-        const double r = map_.getResolution();
-        const double step_len = prim.length / std::max(1, n);
-        // Rotation moves the corners even when the centre stays put, and an in-place
-        // primitive has length ~ 0, so a stride derived from path length alone would
-        // collapse to "endpoint only" on exactly the primitives that sweep the widest.
-        const double step_sweep = std::abs(prim.samples[n-1].yaw) / std::max(1, n-1) * cornerRadius();
-        const int stride = std::max(1, static_cast<int>(std::lround(
-            r / std::max(step_len + step_sweep, 1e-3))));
-        float cost_sum = 0.0f; int checks = 0;
-        for(int i = 0; i < n; i += stride) {
+        auto worldPose = [&](size_t i) {
             const auto& smp = prim.samples[i];
-            const double wx = px + c*smp.x - s*smp.y;
-            const double wy = py + s*smp.x + c*smp.y;
-            const double wyaw = wrap(pyaw + smp.yaw);
-            float terrain;
-            if(!trajectoryFootprintValid(wx, wy, wyaw, terrain)) return false;
-            cost_sum += terrain; ++checks;
-        }
-        const auto& last = prim.samples[n-1];
-        ex = px + c*last.x - s*last.y;
-        ey = py + s*last.x + c*last.y;
-        eyaw = wrap(pyaw + last.yaw);
-        float terrain_end;
-        if(!trajectoryFootprintValid(ex, ey, eyaw, terrain_end)) return false;
-        if((n-1) % stride != 0) { cost_sum += terrain_end; ++checks; }
-        avg_cost = checks ? cost_sum / checks : terrain_end;
-        return true;
+            return Pose2D{px+c*smp.x-s*smp.y,py+s*smp.x+c*smp.y,wrap(pyaw+smp.yaw)};
+        };
+        const auto last = worldPose(prim.samples.size()-1);
+        ex=last.x; ey=last.y; eyaw=last.yaw;
+        return sampledFootprintValid({px,py,pyaw},prim.samples.size(),worldPose,
+            cornerRadius(),map_.getResolution(),trajectoryClearance(),departure,
+            [this](const Pose2D& pose,double clearance,bool allow_unknown,float& cost) {
+                return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
+                                                    cost,allow_unknown,clearance);
+            },avg_cost);
     }
 
-    bool transition(const State& from, int direction, int turn, State& to, float& edge_cost) const {
+    bool transition(const State& from, int direction, int turn, State& to, float& edge_cost,
+                    bool departure = false) const {
         grid_map::Position p;
         if(!map_.getPosition(grid_map::Index(from.x, from.y), p)) return false;
         const double yaw0 = yawForBin(from.t);
         if(direction == 0) {
             to = from; to.t = (from.t + turn + bins_) % bins_;
             float terrain;
-            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain)) return false;
+            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain, departure)) return false;
             edge_cost = static_cast<float>(rotation_cost_ * primitive_length_ + terrain * 0.002);
             return true;
         }
 
         const double dyaw = turn * 2.0 * M_PI / bins_;
         const double yaw1 = yaw0 + dyaw;
-        // Collision-check the swept footprint at a coarse spacing. The footprint
-        // (footprint_length_) is several times longer than one primitive step, so
-        // consecutive footprints overlap heavily and the already-validated parent
-        // footprint covers the rear; a spacing of half a body length is safe. Add
-        // samples only if the heading sweeps more than ~11 deg across the step.
-        const int n = std::max({1,
-                                static_cast<int>(std::ceil(primitive_length_/(footprint_length_*0.5))),
-                                static_cast<int>(std::ceil(std::abs(dyaw)/0.2))});
-        float terrain_sum = 0.0f;
-        for(int i=1; i<=n; ++i) {
-            const double q = static_cast<double>(i)/n;
-            const double yaw = yaw0 + q*dyaw;
-            const double d = direction * primitive_length_ * q;
-            const double x = p.x() + d*std::cos(yaw0 + q*dyaw*0.5);
-            const double y = p.y() + d*std::sin(yaw0 + q*dyaw*0.5);
-            float terrain;
-            if(!trajectoryFootprintValid(x, y, yaw, terrain)) return false;
-            terrain_sum += terrain;
-        }
         const double x1 = p.x() + direction*primitive_length_*std::cos(yaw0 + dyaw*0.5);
         const double y1 = p.y() + direction*primitive_length_*std::sin(yaw0 + dyaw*0.5);
         grid_map::Index idx;
         if(!map_.getIndex(grid_map::Position(x1,y1), idx)) return false;
         to = {idx(0), idx(1), binForYaw(yaw1)};
+        grid_map::Position endpoint;
+        float terrain;
+        if(!map_.getPosition(idx, endpoint) ||
+           !latticeArcFootprintValid({p.x(),p.y(),yaw0},
+                {endpoint.x(),endpoint.y(),yawForBin(to.t)}, direction*primitive_length_,dyaw,
+                cornerRadius(),map_.getResolution(),trajectoryClearance(),departure,
+                [this](const Pose2D& pose, double clearance, bool allow_unknown, float& cost) {
+                    return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
+                                                        cost,allow_unknown,clearance);
+                },terrain)) return false;
         const double motion_factor = direction < 0 ? reverse_cost_ : 1.0;
         edge_cost = static_cast<float>(motion_factor * primitive_length_ *
-                    (1.0 + 0.01 * terrain_sum/n));
+                    (1.0 + 0.01 * terrain));
         return !(to.x == from.x && to.y == from.y && to.t == from.t);
     }
 
@@ -1341,9 +1316,9 @@ private:
         map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
         // The current body cannot be required to retroactively satisfy a clearance margin
         // that a refined map has just moved across it. Known lethal terrain under the
-        // physical rectangle is still rejected; only the extra band is omitted here. Every
-        // successor is checked with the full trajectory clearance, so a plan can only move
-        // out of the band, never continue through it.
+        // physical rectangle is still rejected. On the root's outgoing edge only, grow
+        // the extra band to full clearance at its endpoint; requiring the full band at
+        // the very first swept sample could leave a safe departure with zero successors.
         if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
                            /*allow_unknown=*/true)) {
             float actual_cost;
@@ -1358,6 +1333,20 @@ private:
                               actual.position.x, actual.position.y, tf2::getYaw(actual.orientation),
                               actual_valid ? "true" : "false", map_stamp_.toSec());
             last_fail_reason_ = "start_footprint";
+            return false;
+        }
+        const auto& actual_start = start_pose.pose;
+        if(!sweptSegmentValid(
+                {actual_start.position.x, actual_start.position.y,
+                 tf2::getYaw(actual_start.orientation)},
+                {sp.x(), sp.y(), yawForBin(start.t)},
+                0.0, 0.0, /*allow_start_unknown=*/true, dummy)) {
+            ROS_WARN_THROTTLE(1.0, "plan: START lattice connector invalid: goal_id=%u "
+                              "actual=(%.3f,%.3f,%.3f) lattice=(%.3f,%.3f,%.3f)",
+                              goal_id_, actual_start.position.x, actual_start.position.y,
+                              tf2::getYaw(actual_start.orientation),
+                              sp.x(), sp.y(), yawForBin(start.t));
+            last_fail_reason_ = "start_connector";
             return false;
         }
         if(!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
@@ -1394,7 +1383,7 @@ private:
         g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
         int reached=-1;
         float reached_error=std::numeric_limits<float>::infinity();
-        int expanded=0;
+        int expanded=0, root_successors=0;
         while(!open.empty()) {
             if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) break;
             const int ck=open.top().key; open.pop();
@@ -1440,11 +1429,21 @@ private:
                 for(size_t pi=0; pi<prims.size(); ++pi) {
                     const MotionPrimitive& prim=prims[pi];
                     float terrain; double ex,ey,eyaw;
-                    if(!primitiveValid(cp.x(),cp.y(),cyaw,prim,terrain,ex,ey,eyaw)) continue;
+                    if(!primitiveValid(cp.x(),cp.y(),cyaw,prim,terrain,ex,ey,eyaw,
+                                       /*departure=*/ck==sk)) continue;
                     grid_map::Index idx;
                     if(!map_.getIndex(grid_map::Position(ex,ey),idx)) continue;
                     State next{idx(0),idx(1),prim.end_bin};
                     if(next.x==cur.x && next.y==cur.y && next.t==cur.t) continue;
+                    // The next primitive starts at the lattice centre/bin, not at the
+                    // previous primitive's unquantised last sample. Validate that join.
+                    grid_map::Position next_position;
+                    float join_cost;
+                    if(!map_.getPosition(idx,next_position) ||
+                       !sweptSegmentValid({ex,ey,eyaw},
+                            {next_position.x(),next_position.y(),yawForBin(next.t)},
+                            trajectoryClearance(), trajectoryClearance(), false, join_cost)) continue;
+                    if(ck==sk) ++root_successors;
                     const int nk=key(next,cols); if(closed[nk]) continue;
                     const float ec=static_cast<float>(prim.base_cost*(1.0+0.01*terrain));
                     const float ng=g[ck]+ec;
@@ -1454,25 +1453,33 @@ private:
             } else {
                 for(int direction : {-1,1}) for(int turn=-1;turn<=1;++turn) {
                     State next; float ec;
-                    if(!transition(cur,direction,turn,next,ec)) continue;
+                    if(!transition(cur,direction,turn,next,ec,/*departure=*/ck==sk)) continue;
+                    if(ck==sk) ++root_successors;
                     const int nk=key(next,cols); if(closed[nk]) continue;
                     const float ng=g[ck]+ec;
                     if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; open.push({ng+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
                 }
                 for(int turn : {-1,1}) {
                     State next; float ec;
-                    if(!transition(cur,0,turn,next,ec)) continue;
+                    if(!transition(cur,0,turn,next,ec,/*departure=*/ck==sk)) continue;
+                    if(ck==sk) ++root_successors;
                     const int nk=key(next,cols); if(g[ck]+ec<g[nk]) { g[nk]=g[ck]+ec; parent[nk]=ck; open.push({g[nk]+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
                 }
             }
         }
         if(reached<0) {
             const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+            const bool start_has_band = footprintWithClearanceValid(
+                sp.x(),sp.y(),yawForBin(start.t),dummy,true,trajectoryClearance());
             ROS_WARN_THROTTLE(1.0, "plan: search exhausted without reaching goal "
-                              "(mode=%s, expanded=%d nodes, %.3fs, goal_bin=%d, goal_tol=%.2f). "
-                              "Start footprints ok, so this is search/goal-tolerance, not the start.",
-                              use_dynamics?"dynamics":"arcs", expanded, elapsed, goal.t, goal_tolerance_);
-            last_fail_reason_ = "search_exhausted";
+                              "(goal_id=%u mode=%s expanded=%d nodes root_successors=%d "
+                              "elapsed=%.3fs goal_bin=%d goal_tol=%.2f "
+                              "start_clearance_valid=%s clearance=%.2fm budget_exhausted=%s).",
+                              goal_id_, use_dynamics?"dynamics":"arcs", expanded, root_successors,
+                              elapsed, goal.t, goal_tolerance_, start_has_band ? "true" : "false",
+                              trajectoryClearance(), elapsed >= max_planning_time_ ? "true" : "false");
+            last_fail_reason_ = expanded==1 && root_successors==0 ? "start_no_successor"
+                                 : (elapsed >= max_planning_time_ ? "search_timeout" : "search_exhausted");
             return false;
         }
         if(reached_error > 1e-4f) {

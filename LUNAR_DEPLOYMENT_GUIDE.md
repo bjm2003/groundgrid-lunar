@@ -274,6 +274,17 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 都不代表车辆到达。当前完整 `mixed/flat` 测试还要求可解困难目标实际完成，
 不能用恢复率的条件分母排除中止目标来代替任务完成验证。
 
+遇到 `search exhausted` 时，应同时检查 `expanded`、`root_successors`、
+`start_clearance_valid` 和 `budget_exhausted`。只展开 1 个节点且没有有效后继，
+表示车辆无法通过当前起步检查，不等于用完 1 秒预算或已经证明目标不可达。
+`last_fail=start_no_successor` 与 `search_timeout` 分别标识这两类情况。
+
+当前起点可能因地图细化而不满足额外安全带：只在第一条起步边内从零逐步恢复
+到原有余量，段末和后续边必须满足完整余量。实际车体全程检查，未知区域例外
+只限起点；不会放行已知障碍或超限坡度。弧线搜索还检查最终发布的量化线段，
+Rotate/BackOut 与保留路径共用扫掠检查。可用 `rosrun groundgrid planner_safety_selfcheck`
+运行离线几何回归，但它不代替完整 ROS 巡回验证。
+
 正常状态应为：
 
 ```text

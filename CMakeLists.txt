@@ -212,9 +212,12 @@ add_executable(skidsteer_selfcheck src/skidsteer_selfcheck.cpp)
 target_link_libraries(skidsteer_selfcheck ${PROJECT_NAME}_skidsteer_lib)
 add_executable(trajectory_tracking_selfcheck src/trajectory_tracking_selfcheck.cpp)
 target_link_libraries(trajectory_tracking_selfcheck ${PROJECT_NAME}_skidsteer_lib)
+add_executable(planner_safety_selfcheck src/planner_safety_selfcheck.cpp)
+target_link_libraries(planner_safety_selfcheck ${PROJECT_NAME}_skidsteer_lib)
 if(CATKIN_ENABLE_TESTING)
     add_test(NAME skidsteer_selfcheck COMMAND skidsteer_selfcheck)
     add_test(NAME trajectory_tracking_selfcheck COMMAND trajectory_tracking_selfcheck)
+    add_test(NAME planner_safety_selfcheck COMMAND planner_safety_selfcheck)
 endif()
 
 #############
@@ -235,6 +238,7 @@ install(
         generate_motion_primitives
         skidsteer_selfcheck
         trajectory_tracking_selfcheck
+        planner_safety_selfcheck
     ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

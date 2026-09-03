@@ -34,6 +34,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - Keep `min_point_distance < sensor_blind_radius`. The current lunar values are 1.2 m and 2.5 m. Changing only one can mark an unseen near-field obstacle region as safe.
 - Treat the rover as its rectangular footprint for clearance and collision metrics; do not replace it with a circumscribed circle.
 - Collision checking must include the swept body during in-place rotations and transitions, not only endpoint poses.
+- A start-clearance ramp is limited to the occupied start's first edge, with full clearance
+  restored at its endpoint. It never permits a known hazard under the physical body. Search
+  must check the quantised/exported segment as well as the ideal primitive geometry.
 - Unknown terrain is normally invalid. The sensor blind disc and the goal-snap margin are narrowly scoped exceptions and must not silently relax known hazards.
 - A recovery rotate/back-out manoeuvre is not a successful nominal plan. Keep recovery, abort, planning-success, reach, and obstacle-avoidance metrics distinct.
 - The map is a 60 m rolling window centred on the rover. Fixed world goals can legitimately leave the map as the rover moves.
@@ -56,6 +59,8 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
 - Build and run `skidsteer_selfcheck` for pure dynamics changes.
 - Build and run `trajectory_tracking_selfcheck` for follower targeting/phase changes; it
   exercises the same ROS-free stateful core used by the live follower.
+- Build and run `planner_safety_selfcheck` for departure/footprint changes; it exercises the
+  production swept checker with synthetic rectangular-body hazards, not a recorded ROS map.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.
