@@ -24,7 +24,10 @@ SCENARIO_LABEL = {"mixed": "mixed 综合", "flat": "flat 平坦区域",
 
 RATE_ROWS = [("规划成功率 (巡回)", "plan_success_tour"),
              ("规划成功率 (含难目标)", "plan_success_all"),
-             ("到达率", "reach_rate"),
+             ("进入目标距离阈值率（全部）", "reach_rate"),
+             ("进入目标距离阈值率（巡回）", "reach_tour"),
+             ("任务完成率（全部，双方确认）", "completion_rate"),
+             ("任务完成率（巡回，双方确认）", "completion_tour"),
              ("避障成功率", "obstacle_avoidance"),
              ("近障恢复率", "near_obstacle_recovery"),
              ("资源占用超标率", "cpu_overrun"),
@@ -44,6 +47,10 @@ STAT_ROWS = [("规划耗时 (ms)", "plan_ms"),
 LIMITATIONS = """\
 ## 已知局限
 
+- **进入距离阈值不等于完成任务**：`reach_rate` / `reach_tour` 记录曾进入请求目标
+  0.5 m 范围；`completion_rate` / `completion_tour` 才要求规划器和跟踪器双方确认完成，
+  并排除超时或中止。吸附目标可能完成而未进入原始目标范围。旧报告缺少完成率时显示
+  `n/a`，不能从旧到达率推断任务完成率。
 - **感知无法区分坑与石**：`GroundSegmentation` 的 `step_height` 是窗口内的无符号极差，
   `obstacle_height` 只取正向，所以负障碍场景测的是「凹陷能否被当成障碍避开」，不是
   「能否被识别为凹陷」。

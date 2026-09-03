@@ -33,6 +33,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from std_msgs.msg import Float32MultiArray, String
 from groundgrid.msg import LunarTrajectory
+from groundgrid.trial_metrics import completion_summary, mission_completed
 
 # The body, from state_lattice_planner/footprint_{length,width}. Clearance is measured
 # against this rectangle rather than its circumscribed circle: the circle sits 0.42 m
@@ -419,6 +420,9 @@ class LunarPipelineTest(unittest.TestCase):
         clearances = []
         worst = None
         reached = False
+        end_reason = "timeout"
+        rospy.loginfo("trial start goal=(%.3f, %.3f, %.3f) start=(%.3f, %.3f) timeout=%.1fs",
+                      gx, gy, gyaw, x0, y0, timeout)
         while not rospy.is_shutdown() and rospy.Time.now() < end:
             final = rospy.wait_for_message("/localization/odometry/filtered_map", Odometry, timeout=2)
             fx, fy = final.pose.pose.position.x, final.pose.pose.position.y
@@ -448,12 +452,18 @@ class LunarPipelineTest(unittest.TestCase):
                 mission_done = (self.planner_goal_reached and
                                 self.follower_goal_reached)
             if mission_done:
+                end_reason = "completed"
                 break
             # The planner has given up and will stay silent until a new goal; waiting out
             # the rest of the timeout would only inflate the test runtime.
             if aborted:
+                end_reason = "aborted"
                 break
             rate.sleep()
+
+        if end_reason == "timeout" and rospy.is_shutdown():
+            end_reason = "shutdown"
+        finished_at = rospy.Time.now()
 
         with self.lock:
             latency = ((self.first_success_time - goal_time).to_sec()
@@ -470,6 +480,10 @@ class LunarPipelineTest(unittest.TestCase):
             follower_goal_reached = self.follower_goal_reached
             planner_goal_reached = self.planner_goal_reached
             diagnostics = dict(self.diag)
+        rospy.loginfo("trial end goal=(%.3f, %.3f) reason=%s reached=%s "
+                      "planner_done=%s follower_done=%s duration=%.3fs",
+                      gx, gy, end_reason, reached, planner_goal_reached,
+                      follower_goal_reached, (finished_at-goal_time).to_sec())
         # Relative, so legs of different lengths are comparable. Undefined when no route
         # for this goal was captured, or when it was a turn on the spot.
         detour = ((path_len - chord) / chord
@@ -477,9 +491,15 @@ class LunarPipelineTest(unittest.TestCase):
         return {
             "goal": (gx, gy),
             "start": (x0, y0),
+            "start_yaw_rad": _yaw_of(initial.pose.pose.orientation),
+            "goal_yaw_rad": gyaw,
             "final": (final.pose.pose.position.x, final.pose.pose.position.y,
                       _yaw_of(final.pose.pose.orientation)),
             "reached": reached,
+            "end_reason": end_reason,
+            "goal_sent_at_s": goal_time.to_sec(),
+            "finished_at_s": finished_at.to_sec(),
+            "duration_s": (finished_at-goal_time).to_sec(),
             "planned": any(s.startswith("success") for s in statuses),
             "statuses": statuses,
             "anomaly": any(s not in NOMINAL_STATUSES for s in statuses),
@@ -601,6 +621,8 @@ class LunarPipelineTest(unittest.TestCase):
                         "trajectory never reached its actual endpoint")
         self.assertTrue(trial["planner_goal_reached"],
                         "planner never confirmed mission completion")
+        self.assertEqual(trial["end_reason"], "completed",
+                         "completion was not observed before the trial ended")
         # Required in both modes: 3.2 lists the desired linear and angular velocity as a
         # planner output, and the arc mode is the shipping default.
         self.assertGreater(n_poses, 0, "planner published no path")
@@ -636,6 +658,7 @@ class LunarPipelineTest(unittest.TestCase):
 
     def _report(self, every, tour, hard):
         """Compute and log every task-book metric; returns the JSON-serialisable summary."""
+        completion = completion_summary(every, tour)
         tour_rate = sum(1 for t in tour if t["planned"]) / len(tour)
         # Goals with no solution are scored separately, by assertion. See UNREACHABLE_GOALS.
         solvable = [t for t in every if tuple(t["goal"]) not in UNREACHABLE_GOALS]
@@ -710,6 +733,8 @@ class LunarPipelineTest(unittest.TestCase):
                   "recovery_aborts": aborts, "collisions": len(collisions),
                   "clearance_measured": len(measured),
                   "avoidance_attempts": len(attempted), "paths_emitted": len(emitted)}
+        counts.update(completion["counts"])
+        rates.update(completion["rates"])
         # Carried in the summary itself (not just the per-trial dump) so the assertion
         # message can name the offending goal and rock on the console.
         collided = [{"goal": list(t["goal"]), "clearance_min_m": t["clearance_min"],
@@ -725,8 +750,12 @@ class LunarPipelineTest(unittest.TestCase):
                       len(every) - len(solvable))
         rospy.loginfo("  reached goal      = %d/%d", sum(1 for t in every if t["reached"]),
                       len(every))
-        rospy.loginfo("  reached tour      = %.3f (%d/%d)", rates["reach_tour"],
+        rospy.loginfo("  entered goal radius (tour) = %.3f (%d/%d)", rates["reach_tour"],
                       sum(1 for t in tour if t["reached"]), len(tour))
+        rospy.loginfo("  completed tour    = %.3f (%d/%d; both completion signals)",
+                      rates["completion_tour"], counts["tour_missions_completed"], len(tour))
+        rospy.loginfo("  completed all     = %.3f (%d/%d; snapped missions included)",
+                      rates["completion_rate"], counts["missions_completed"], len(every))
         rospy.loginfo("  避障成功率        = %.3f (%d collision-free / %d attempts; "
                       "%d measured, %d correctly aborted)", avoid_rate,
                       sum(1 for t in attempted if not t["collided"]), len(attempted),
@@ -755,9 +784,11 @@ class LunarPipelineTest(unittest.TestCase):
             else:
                 rospy.loginfo("  %-18s no samples", label)
         for t in every:
-            rospy.loginfo("    goal (%.1f, %.1f) planned=%s reached=%s clr_min=%.2f "
-                          "statuses=%s", t["goal"][0], t["goal"][1], t["planned"],
-                          t["reached"], t["clearance_min"], ",".join(sorted(t["statuses"])))
+            rospy.loginfo("    goal (%.1f, %.1f) planned=%s reached=%s completed=%s "
+                          "reason=%s clr_min=%.2f statuses=%s",
+                          t["goal"][0], t["goal"][1], t["planned"], t["reached"],
+                          mission_completed(t), t["end_reason"], t["clearance_min"],
+                          ",".join(sorted(t["statuses"])))
         return {"scenario": self.scenario, "counts": counts, "rates": rates,
                 "metrics": metrics, "collided": collided,
                 "cpu_budget_pct": self.cpu_budget}
@@ -775,7 +806,12 @@ class LunarPipelineTest(unittest.TestCase):
         report = dict(report)
         report["trials"] = [
             {"goal": list(t["goal"]), "start": list(t["start"]),
+             "start_yaw_rad": t["start_yaw_rad"], "goal_yaw_rad": t["goal_yaw_rad"],
              "final": list(t["final"]), "reached": t["reached"],
+             "mission_completed": mission_completed(t), "end_reason": t["end_reason"],
+             "goal_sent_at_s": t["goal_sent_at_s"], "finished_at_s": t["finished_at_s"],
+             "duration_s": t["duration_s"], "final_err_m": t["final_err"],
+             "diagnostics": t["diagnostics"],
              "planned": t["planned"], "anomaly": t["anomaly"], "collided": t["collided"],
              "produced_path": t["produced_path"], "profile_ok": t["profile_ok"],
              "angular_profile_seen": t["angular_profile_seen"],
@@ -815,7 +851,15 @@ class LunarPipelineTest(unittest.TestCase):
             self.assertGreaterEqual(rates["plan_success_all"], 0.90,
                                     "规划成功率 including hard goals")
             self.assertGreaterEqual(rates["reach_tour"], 0.99,
-                                    "open-terrain tour goals must actually be reached")
+                                    "open-terrain tour goals must enter the requested goal radius")
+            # Distance is an ever-entered flag: it can stay True after leaving the radius,
+            # timing out, or starting recovery. Do not confuse it with mission completion.
+            self.assertGreaterEqual(
+                rates["completion_tour"], 0.99,
+                "open-terrain tour missions must complete, not merely enter the goal radius; "
+                "incomplete legs: %s" % [
+                    (i+1, t["goal"], t["end_reason"], sorted(t["statuses"]))
+                    for i, t in enumerate(tour) if not mission_completed(t)])
             # Guards the failure mode the tiering could otherwise hide: a planner that
             # declares reachable goals unreachable. Open terrain must never abort.
             self.assertFalse([t for t in tour if "aborted" in t["statuses"]],
