@@ -49,6 +49,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   are compatibility and visualisation outputs, not control inputs.
 - A trajectory twist is desired effective body motion before slip compensation. Apply
   terrain scaling in the planner and `inverseCommand()` once in the follower.
+- The simulator must capture a cloud's pose and timestamp together under the dynamics
+  lock. Ray-cast computation does not advance the measurement time; stamping old geometry
+  with the latest TF time corrupts the perceived map while moving.
 - Withdraw a known-invalid active trajectory before any blocking replacement search.
   Require the follower's `empty_trajectory` acknowledgement for the exact `goal_id` and
   `trajectory_stamp_ns`, then a TF newer than acknowledgement receipt. A new goal cannot

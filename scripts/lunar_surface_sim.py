@@ -162,10 +162,9 @@ class LunarSurfaceSim:
             self.w = float(np.clip(msg.angular.z, -self.w_cmd_limit, self.w_cmd_limit))
 
     def update(self, _event):
-        now = rospy.Time.now()
-        dt = min(max((now-self.last).to_sec(), 0.0), 0.1)
-        self.last = now
         with self.lock:
+            now = rospy.Time.now()
+            dt = min(max((now-self.last).to_sec(), 0.0), 0.1)
             v_cmd, w_cmd, yaw = self.v, self.w, self.yaw
             # Terrain-frame gradient projected onto heading (skid-steer slip model,
             # kept in sync with groundgrid::SkidSteerModel::effectiveTwist).
@@ -180,6 +179,9 @@ class LunarSurfaceSim:
             self.x += (c*vx - s*vy)*dt
             self.y += (s*vx + c*vy)*dt
             self.yaw += omega*dt
+            # Commit the dynamics pose and its TF/odometry timestamp atomically. A cloud
+            # snapshot must not see the new stamp with the preceding integration state.
+            self.last = now
             x, y, yaw = self.x, self.y, self.yaw
         z = self.height_at(x, y)
         q = tf.transformations.quaternion_from_euler(0.0, 0.0, yaw)
@@ -208,7 +210,7 @@ class LunarSurfaceSim:
         so the march costs about a tenth of the naive rays x steps product.
         """
         with self.lock:
-            x0, y0, yaw = self.x, self.y, self.yaw
+            x0, y0, yaw, capture_stamp = self.x, self.y, self.yaw, self.last
         z_sensor = self.height_at(x0, y0) + self.sensor_height
         caz, saz = np.cos(self.ray_az + yaw), np.sin(self.ray_az + yaw)
 
@@ -250,9 +252,11 @@ class LunarSurfaceSim:
                   PointField("z",8,PointField.FLOAT32,1),
                   PointField("intensity",12,PointField.FLOAT32,1),
                   PointField("ring",16,PointField.UINT16,1)]
-        # Use the most recent dynamics/TF timestamp to avoid asking TF for a
-        # transform a few milliseconds into the future.
-        header = Header(stamp=self.last, frame_id="velodyne")
+        # Ray construction may span several dynamics ticks. The points all describe the
+        # captured pose, not the pose at publication; a newer stamp would misregister the
+        # whole cloud when GroundGrid transforms it with TF at header.stamp. Do not hold
+        # the dynamics lock during the expensive ray cast to conceal this timing error.
+        header = Header(stamp=capture_stamp, frame_id="velodyne")
         self.cloud_pub.publish(point_cloud2.create_cloud(header, fields, points))
 
 
