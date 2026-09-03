@@ -109,7 +109,11 @@ state_lattice_planner:
   # Escalation rungs that command motion. The rotate probe is deliberately smaller than a
   # heading bin pair so it changes the outgoing primitive set without a large blind sweep;
   # BackOut retraces actual stamped odometry, with full body/sweep checks on the latest map.
-  # Its margin is restored over one frozen manoeuvre, not each dense history sample.
+  # Its ordinary trajectory_clearance margin is restored over one frozen manoeuvre, not
+  # each dense history sample; goal_snap_clearance applies only to a later snapped route.
+  # Preparation checks the complete retreat. While moving, each actual odometry step plus
+  # the remaining frozen suffix is rechecked; a new hazard solely behind the rover is not
+  # treated as a collision still waiting to happen.
   # The budget counts translation + half-diagonal * absolute yaw travel, so rotation also
   # consumes it. Actual sampled motion, no-progress and a fixed duration gate bound execution.
   recovery_rotate_step: 0.6       # rad of in-place turn per rotate attempt

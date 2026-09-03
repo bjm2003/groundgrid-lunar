@@ -645,8 +645,12 @@ private:
             return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,cost,unknown,margin);
         };
         SweptFootprintRejection rejected;
+        // BackOut is a repositioning manoeuvre, not a route to the snapped endpoint. Restore
+        // the ordinary trajectory reserve here. If the next route still needs goal snapping,
+        // normal search must independently grow and hold goal_snap_clearance_. Using the last
+        // failed snap attempt here incorrectly raised the escape requirement from 0.25 to 0.50m.
         if(!pending_backout_.prepare(poses,cornerRadius(),map_.getResolution(),
-                                     recovery_backout_distance_,trajectoryClearance(),check,&rejected)) {
+                                     recovery_backout_distance_,trajectory_clearance_,check,&rejected)) {
             logSweptRejection("recovery_backout",rejected);
             return false;
         }
@@ -673,7 +677,7 @@ private:
         for(const auto& pose : path.poses)
             poses.push_back({pose.pose.position.x,pose.pose.position.y,tf2::getYaw(pose.pose.orientation)});
         if(!pending_backout_.prepare(poses,cornerRadius(),map_.getResolution(),
-                                     recovery_backout_distance_,trajectoryClearance(),check,&rejected)) {
+                                     recovery_backout_distance_,trajectory_clearance_,check,&rejected)) {
             logSweptRejection("recovery_backout_export",rejected);
             return false;
         }

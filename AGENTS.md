@@ -43,8 +43,14 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - The user-authorised BackOut exception may restore clearance over ONE bounded retreat
   built from actual stamped localisation history, never from an old planned route. Its
   cumulative corner-motion budget is `recovery_backout_distance` (currently 1 m); its
-  frozen clearance schedule cannot restart on a map update or republish. The body and
-  complete sweep always reject known hazards; the endpoint must have full clearance.
+  frozen clearance schedule cannot restart on a map update or republish. BackOut restores
+  the ordinary `trajectory_clearance`; the larger `goal_snap_clearance` belongs to a later
+  snapped nominal route and must not leak from a failed snap attempt into the escape gate.
+  Preparation checks the whole retreat. Execution checks actual motion since the previous
+  localisation sample, the current-to-route connector, and the whole unexecuted suffix;
+  newly perceived hazards solely on an already traversed prefix do not revoke safe motion.
+  The body and every current/future sweep always reject known hazards; the endpoint must
+  have full ordinary clearance.
   Execution completion additionally requires full clearance at the actual rover pose.
   New goals revoke retreat execution with the exact stop handshake but retain independent
   observed history. Recovery completion is not mission completion or recovery confirmation.

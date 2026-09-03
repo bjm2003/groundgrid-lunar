@@ -121,6 +121,9 @@ private:
 // A frozen exception ONLY for one bounded observed-history retreat. Normal search and
 // rotate rules do not change. Clearance grows with cumulative corner motion, independent
 // of sample spacing, and never restarts on republish, a new map, or observed regression.
+// Preparation checks the complete manoeuvre. During execution, newly observed hazards
+// invalidate actual motion since the previous check and the unexecuted suffix; a hazard
+// discovered only behind the rover cannot retroactively make already-observed motion unsafe.
 class BoundedBackout {
 public:
     void clear() { poses_.clear(); progress_.clear(); observed_progress_=0.0; actual_motion_=0.0; }
@@ -158,18 +161,18 @@ public:
 
     template<typename CheckFootprint>
     bool validate(const Pose2D& current, double max_tracking_error, CheckFootprint check,
-                  SweptFootprintRejection* rejection=nullptr) {
+                   SweptFootprintRejection* rejection=nullptr) {
         if(rejection) *rejection={};
         failure_="backout_invalid_pose";
         if(!active() || !recoveryPoseFinite(current) || !std::isfinite(max_tracking_error) ||
            max_tracking_error<=0) return false;
-        actual_motion_+=recoveryMotion(previous_actual_,current,radius_);
-        previous_actual_=current;
+        const Pose2D previous_actual=previous_actual_;
+        const double previous_progress=observed_progress_;
+        actual_motion_+=recoveryMotion(previous_actual,current,radius_);
         if(actual_motion_>budget_+1e-6) { failure_="backout_motion_budget"; return false; }
         // Project using position AND yaw so a stationary rotation is not mistaken for
         // completed translation. The requirement can advance but never decrease.
         double best=std::numeric_limits<double>::infinity(), distance=0.0;
-        Pose2D anchor;
         for(std::size_t i=1;i<poses_.size();++i) {
             const auto& a=poses_[i-1]; const auto& b=poses_[i];
             const double dx=b.x-a.x, dy=b.y-a.y;
@@ -180,21 +183,30 @@ public:
             const auto candidate=recoveryInterpolate(a,b,q);
             const double error=recoveryMotion(current,candidate,radius_);
             if(error<best) {
-                best=error; anchor=candidate;
+                best=error;
                 distance=progress_[i-1]+q*(progress_[i]-progress_[i-1]);
             }
         }
         if(best>max_tracking_error) { failure_="backout_tracking_error"; return false; }
         observed_progress_=std::max(observed_progress_,distance);
+        const Pose2D anchor=poseAt(observed_progress_);
+        const double previous_margin=marginAt(previous_progress);
         const double margin=marginAt(observed_progress_);
         float cost;
+        // Check what the rover really did since the previous timer tick. This prevents a
+        // projection jump from skipping a cusp or a hazard between localisation samples.
+        failure_="backout_actual_sweep";
+        if(!sweptFootprintValid(previous_actual,current,radius_,resolution_,
+                                previous_margin,margin,true,check,cost,rejection)) return false;
         failure_="backout_current_connector";
         if(!sweptFootprintValid(current,anchor,radius_,resolution_,margin,margin,true,
                                 check,cost,rejection)) return false;
-        // Recheck the WHOLE short frozen manoeuvre, including its past samples. This is
-        // conservative and avoids skipping unexecuted cusps based on nearest-point alone.
-        failure_="backout_frozen_sweep";
-        if(!validateFrozen(check,false,rejection)) return false;
+        // The schedule and geometry remain frozen, but only its unexecuted suffix can still
+        // collide. Rechecking the prefix made a freshly perceived hazard behind the rover
+        // abort an otherwise safe retreat after the body had already passed it.
+        failure_="backout_remaining_sweep";
+        if(!validateRemaining(anchor,observed_progress_,check,rejection)) return false;
+        previous_actual_=current;
         failure_="none";
         return true;
     }
@@ -207,14 +219,42 @@ public:
     }
 
 private:
+    Pose2D poseAt(double distance) const {
+        if(distance<=0.0) return poses_.front();
+        if(distance>=length()) return poses_.back();
+        const auto upper=std::upper_bound(progress_.begin(),progress_.end(),distance);
+        const std::size_t i=static_cast<std::size_t>(upper-progress_.begin());
+        const double span=progress_[i]-progress_[i-1];
+        const double q=span>1e-12 ? (distance-progress_[i-1])/span : 0.0;
+        return recoveryInterpolate(poses_[i-1],poses_[i],q);
+    }
+
     template<typename CheckFootprint>
     bool validateFrozen(CheckFootprint check, bool allow_initial_unknown,
-                        SweptFootprintRejection* rejection) const {
+                         SweptFootprintRejection* rejection) const {
         for(std::size_t i=1;i<poses_.size();++i) {
             float cost;
             if(!sweptFootprintValid(poses_[i-1],poses_[i],radius_,resolution_,
                 marginAt(progress_[i-1]),marginAt(progress_[i]),allow_initial_unknown && i==1,
                 check,cost,rejection)) return false;
+        }
+        return true;
+    }
+
+    template<typename CheckFootprint>
+    bool validateRemaining(const Pose2D& anchor, double distance, CheckFootprint check,
+                           SweptFootprintRejection* rejection) const {
+        if(distance>=length()-1e-9) return true;
+        const auto upper=std::upper_bound(progress_.begin(),progress_.end(),distance);
+        std::size_t i=static_cast<std::size_t>(upper-progress_.begin());
+        if(i==0 || i>=poses_.size()) return false;
+        float cost;
+        if(!sweptFootprintValid(anchor,poses_[i],radius_,resolution_,marginAt(distance),
+                                marginAt(progress_[i]),false,check,cost,rejection)) return false;
+        for(++i;i<poses_.size();++i) {
+            if(!sweptFootprintValid(poses_[i-1],poses_[i],radius_,resolution_,
+                                    marginAt(progress_[i-1]),marginAt(progress_[i]),
+                                    false,check,cost,rejection)) return false;
         }
         return true;
     }

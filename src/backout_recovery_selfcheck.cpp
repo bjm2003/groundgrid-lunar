@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -105,6 +106,28 @@ int main() {
            "new body hazard invalidates active retreat even after it started");
     expect(!plan.prepare(route(20),radius,.15,1,.5,obstacle(-.525,.075)),
            "known hazard anywhere along measured history is not assumed safe today");
+    plan.prepare(route(20),radius,.15,1,.5,free);
+    expect(plan.validate({-.4,0,0},.8,free),"retreat establishes checked execution progress");
+    const auto past_hazard=[](const Pose2D& pose,double,bool,float& c) {
+        c=0; return pose.x<=-.25;
+    };
+    expect(plan.validate({-.6,0,0},.8,past_hazard),
+           "new hazard solely behind actual checked motion does not invalidate the remaining retreat");
+    plan.prepare(route(20),radius,.15,1,.5,free);
+    expect(plan.validate({-.4,0,0},.8,free),"actual-sweep fixture establishes prior pose");
+    const auto actual_hazard=[](const Pose2D& pose,double,bool,float& c) {
+        c=0; return pose.x>=-.48 || pose.x<=-.52;
+    };
+    expect(!plan.validate({-.6,0,0},.8,actual_hazard) &&
+           std::string(plan.failure())=="backout_actual_sweep",
+           "new hazard between localisation samples revokes the retreat");
+    plan.prepare(route(20),radius,.15,1,.5,free);
+    expect(plan.validate({-.6,0,0},.8,free),"future-sweep fixture establishes progress");
+    const auto future_hazard=[](const Pose2D& pose,double,bool,float& c) {
+        c=0; return pose.x>=-.8;
+    };
+    expect(!plan.validate({-.65,0,0},.8,future_hazard),
+           "new hazard on the unexecuted suffix still revokes the retreat");
     const auto corner=obstacle(1.125,.075);
     expect(corner({0,0,0},0,false,cost) && corner({0,0,1.57079632679},0,false,cost),
            "rotation fixture has clear endpoint footprints");
