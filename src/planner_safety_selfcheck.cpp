@@ -272,6 +272,50 @@ int main() {
     const auto bad_cost=[nan](const Pose2D&,double,bool,float& c) { c=float(nan); return true; };
     check(!sweptFootprintValid(a,b,radius,.15,0,.5,true,bad_cost,cost),
           "nonfinite terrain cost fails closed");
+    {
+        SweptFootprintRejection rejected;
+        float plain_cost=0.0f, traced_cost=0.0f;
+        const bool plain=sweptFootprintValid({0,0,0},{-2,0,0},radius,.15,0,.5,
+                                             true,between,plain_cost);
+        const bool traced=sweptFootprintValid({0,0,0},{-2,0,0},radius,.15,0,.5,
+                                              true,between,traced_cost,&rejected);
+        check(!plain && plain==traced && plain_cost==traced_cost && rejected.has_sample &&
+              rejected.pose.x<0 && rejected.clearance>0 && !rejected.allow_unknown,
+              "trace identifies actual failed back-out sweep sample without changing result");
+        check(latticeArcFootprintValid({1.2,0,0},{1.65,0,0},.45,0,radius,.15,.5,
+                                       true,wall,traced_cost,&rejected) && !rejected.has_sample,
+              "failed initial clearance probe is not reported as a rejected departure edge");
+        check(!latticeArcFootprintValid(a,shifted,.45,0,radius,.15,.5,false,narrow,
+                                        traced_cost,&rejected) && rejected.has_sample &&
+              rejected.pose.y>0 && rejected.clearance==.5,
+              "trace follows rejection in quantised export rather than valid ideal arc");
+        check(!sweptFootprintValid({0,0,0},{-2,0,0},radius,.15,0,.5,true,wall,
+                                   traced_cost,&rejected) && rejected.has_sample &&
+              rejected.pose.x==0 && rejected.clearance==0 && rejected.allow_unknown,
+              "body hazard at the initial pose is recorded even with unknown exception");
+        check(!sweptFootprintValid({nan,0,0},b,radius,.15,0,.5,true,free,
+                                   traced_cost,&rejected) && !rejected.has_sample,
+              "invalid geometry clears old diagnostic sample");
+        bool identical=true;
+        for(int direction : {-1,1}) for(int turn : {-1,0,1}) for(int departure : {0,1}) {
+            const Pose2D from{1.2,0,0};
+            const double dyaw=turn*pi/8;
+            const Pose2D to{from.x+direction*.45*std::cos(dyaw*.5),
+                            from.y+direction*.45*std::sin(dyaw*.5),dyaw};
+            const bool without=latticeArcFootprintValid(from,to,direction*.45,dyaw,
+                radius,.15,.5,departure,wall,plain_cost);
+            const bool with=latticeArcFootprintValid(from,to,direction*.45,dyaw,
+                radius,.15,.5,departure,wall,traced_cost,&rejected);
+            identical &= without==with && plain_cost==traced_cost;
+        }
+        check(identical,"optional arc trace preserves acceptance and costs across departure cases");
+        const bool without=sampledFootprintValid({1.2,0,0},samples.size(),pose_at,
+            radius,.15,.5,true,wall,plain_cost);
+        const bool with=sampledFootprintValid({1.2,0,0},samples.size(),pose_at,
+            radius,.15,.5,true,wall,traced_cost,&rejected);
+        check(without==with && plain_cost==traced_cost && !rejected.has_sample,
+              "optional sampled-primitive trace preserves successful departure");
+    }
     std::printf("planner_safety_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }

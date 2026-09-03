@@ -293,6 +293,15 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 表示车辆无法通过当前起步检查，不等于用完 1 秒预算或已经证明目标不可达。
 `last_fail=start_no_successor` 与 `search_timeout` 分别标识这两类情况。
 
+需要区分“起点全带不满足”和“每个起步动作都不合法”时，完整 rostest 使用
+`debug_control:=true` 会同时开启规划器 `debug_start_rejections`（节点默认关闭）。
+理想弧线模式的 `root_actions/root_action` 对应前进/倒车的三种转向与两种原地转向；
+`sweep_reject` 给出实际失败的扫掠位姿与渐增余量，再由同 context 的
+`footprint_reject` 给出格子原因。每批八个动作共享同一锁内地图，3 s 限频，
+不改变搜索结果；该逐动作诊断暂不覆盖动力学基元模式。
+`recovery_reject` 或 `context=recovery_rotate/recovery_backout` 区分恢复时没有
+历史路径与扫掠检查拒绝。调试输出增加开销，不用于正式性能基线。
+
 `actual_body_valid=false` 表示实际矩形车身也被感知地图拒绝，不只是量化起点或
 额外安全带不足。检查 `footprint_reject` 的 `context/reason`、采样点、栅格中心和
 `terrain_cost/slope_x/slope_y/slope/step_height/obstacle_height/obstacle_confidence/roughness`，

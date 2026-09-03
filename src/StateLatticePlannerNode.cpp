@@ -68,6 +68,7 @@ public:
         pnh_.param<std::string>("map_frame", map_frame_, "map");
         pnh_.param<std::string>("base_frame", base_frame_, "base_link");
         pnh_.param("use_dynamics_primitives", use_dynamics_primitives_, false);
+        pnh_.param("debug_start_rejections", debug_start_rejections_, false);
         pnh_.param<std::string>("motion_primitive_file", motion_primitive_file_, "");
         pnh_.param("terrain_speed_gain", terrain_speed_gain_, 0.6);
         pnh_.param("min_speed_scale", min_speed_scale_, 0.25);
@@ -562,7 +563,12 @@ private:
         // over-slope cells are still rejected, and the whole sweep is checked, not just
         // the end yaw -- this probe is issued when the rover is already boxed in, which is
         // exactly where a corner has something to hit.
-        if(!rotationValid(x, y, yaw, target_yaw, cost, /*departure=*/true)) return false;
+        SweptFootprintRejection rejected;
+        if(!rotationValid(x, y, yaw, target_yaw, cost, /*departure=*/true,
+                          debug_start_rejections_ ? &rejected : nullptr)) {
+            if(debug_start_rejections_) logSweptRejection("recovery_rotate",rejected);
+            return false;
+        }
 
         path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
         path.poses.clear();
@@ -583,7 +589,11 @@ private:
     bool recoveryBackOut(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
                          std_msgs::Float32MultiArray& vel) {
         const auto& history = retained_route_.path();
-        if(history.poses.size() < 2) return false;
+        if(history.poses.size() < 2) {
+            if(debug_start_rejections_)
+                ROS_WARN("recovery_reject goal_id=%u action=backout reason=no_history",goal_id_);
+            return false;
+        }
         const double x = start.pose.position.x, y = start.pose.position.y;
         size_t nearest = 0; double nearest_d = std::numeric_limits<double>::infinity();
         for(size_t i = 0; i < history.poses.size(); ++i) {
@@ -603,18 +613,27 @@ private:
             float cost;
             const auto& prev = path.poses.back().pose;
             const bool departure = path.poses.size() == 1;
+            SweptFootprintRejection rejected;
             if(!sweptSegmentValid(
                     {prev.position.x, prev.position.y, tf2::getYaw(prev.orientation)},
                     {src.pose.position.x, src.pose.position.y, tf2::getYaw(src.pose.orientation)},
                     departure ? 0.0 : trajectoryClearance(), trajectoryClearance(),
-                    departure, cost)) return false;
+                    departure, cost, nullptr, debug_start_rejections_ ? &rejected : nullptr)) {
+                if(debug_start_rejections_) logSweptRejection("recovery_backout",rejected);
+                return false;
+            }
             travelled += std::hypot(src.pose.position.x - prev.position.x,
                                      src.pose.position.y - prev.position.y);
             geometry_msgs::PoseStamped pose = src; pose.header = path.header;
             path.poses.push_back(pose);
             if(travelled >= recovery_backout_distance_) break;
         }
-        if(path.poses.size() < 2) return false;
+        if(path.poses.size() < 2) {
+            if(debug_start_rejections_)
+                ROS_WARN("recovery_reject goal_id=%u action=backout reason=no_earlier_pose "
+                         "nearest=%zu nearest_d=%.3f",goal_id_,nearest,nearest_d);
+            return false;
+        }
         buildVelocityProfile(path, vel);
         return true;
     }
@@ -958,7 +977,8 @@ private:
     // Ground-truth clearance does not justify overriding a perceived lethal cell. These
     // fields distinguish obstacle/step/slope rejection before considering a map change.
     void logFootprintRejection(const Pose2D& pose,const char* context,
-                               double margin=0.0,bool allow_body_unknown=true) const {
+                               double margin=0.0,bool allow_body_unknown=true,
+                               bool force=false) const {
         FootprintRejection rejection;
         float cost;
         double rejected_margin=0.0;
@@ -976,7 +996,9 @@ private:
         const auto layer=[&](const char* name) {
             return indexed && map_.exists(name) ? double(map_.at(name,index)) : nan;
         };
-        ROS_WARN_THROTTLE(1.0,"footprint_reject goal_id=%u context=%s reason=%s margin=%.3f "
+        char message[1024];
+        std::snprintf(message,sizeof(message),
+                          "footprint_reject goal_id=%u context=%s reason=%s margin=%.3f "
                           "pose=(%.3f,%.3f,%.3f) sample=(%.3f,%.3f) cell=(%.3f,%.3f) "
                           "terrain_cost=%.3f slope_x=%.4f slope_y=%.4f slope=%.3f "
                           "step_height=%.3f obstacle_height=%.3f obstacle_confidence=%.3f "
@@ -987,6 +1009,19 @@ private:
                           layer("terrain_cost"),layer("slope_x"),layer("slope_y"),layer("slope"),
                           layer("step_height"),layer("obstacle_height"),layer("obstacle_confidence"),
                           layer("roughness"),map_stamp_.toSec());
+        if(force) { ROS_WARN("%s",message); }
+        else { ROS_WARN_THROTTLE(1.0,"%s",message); }
+    }
+
+    void logSweptRejection(const char* context,const SweptFootprintRejection& rejected) const {
+        ROS_WARN("sweep_reject goal_id=%u context=%s sample=%s "
+                 "pose=(%.6f,%.6f,%.6f) margin=%.6f allow_unknown=%s map_stamp=%.6f",
+                 goal_id_,context,rejected.has_sample ? "true" : "false",
+                 rejected.pose.x,rejected.pose.y,rejected.pose.yaw,rejected.clearance,
+                 rejected.allow_unknown ? "true" : "false",map_stamp_.toSec());
+        if(rejected.has_sample)
+            logFootprintRejection(rejected.pose,context,rejected.clearance,
+                                  rejected.allow_unknown,/*force=*/true);
     }
 
     // Validate the physical body strictly, then reserve a configurable band around it from
@@ -1022,7 +1057,8 @@ private:
     bool sweptSegmentValid(const Pose2D& from, const Pose2D& to,
                             double clearance0, double clearance1,
                             bool allow_start_unknown, float& cost,
-                            const char* rejection_context=nullptr) const {
+                            const char* rejection_context=nullptr,
+                            SweptFootprintRejection* rejection=nullptr) const {
         if(allow_start_unknown && clearance0==0.0 && clearance1>0.0 &&
            footprintWithClearanceValid(from.x,from.y,from.yaw,cost,true,clearance1))
             clearance0=clearance1;
@@ -1035,7 +1071,7 @@ private:
                 if(!valid && rejection_context)
                     logFootprintRejection(pose,rejection_context,clearance,allow_unknown);
                 return valid;
-            }, cost);
+            }, cost, rejection);
     }
 
     // Half the body diagonal: how far a corner stands from the centre, and therefore the
@@ -1052,10 +1088,10 @@ private:
     // their sweep; rotations, which sweep the most, did not. The step keeps corner travel
     // under one cell, which is the spacing footprintValid samples the body at anyway.
     bool rotationValid(double x, double y, double yaw0, double yaw1, float& cost,
-                       bool departure = false) const {
+                       bool departure = false, SweptFootprintRejection* rejection=nullptr) const {
         return sweptSegmentValid({x,y,yaw0}, {x,y,yaw1},
                                  departure ? 0.0 : trajectoryClearance(),
-                                 trajectoryClearance(), departure, cost);
+                                 trajectoryClearance(), departure, cost, nullptr, rejection);
     }
 
     // Transform primitive samples from the start-body frame into the world, validate the
@@ -1080,14 +1116,15 @@ private:
     }
 
     bool transition(const State& from, int direction, int turn, State& to, float& edge_cost,
-                    bool departure = false) const {
+                    bool departure = false, SweptFootprintRejection* rejection=nullptr) const {
+        if(rejection) *rejection=SweptFootprintRejection{};
         grid_map::Position p;
         if(!map_.getPosition(grid_map::Index(from.x, from.y), p)) return false;
         const double yaw0 = yawForBin(from.t);
         if(direction == 0) {
             to = from; to.t = (from.t + turn + bins_) % bins_;
             float terrain;
-            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain, departure)) return false;
+            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain, departure,rejection)) return false;
             edge_cost = static_cast<float>(rotation_cost_ * primitive_length_ + terrain * 0.002);
             return true;
         }
@@ -1108,11 +1145,41 @@ private:
                 [this](const Pose2D& pose, double clearance, bool allow_unknown, float& cost) {
                     return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
                                                         cost,allow_unknown,clearance);
-                },terrain)) return false;
+                },terrain,rejection)) return false;
         const double motion_factor = direction < 0 ? reverse_cost_ : 1.0;
         edge_cost = static_cast<float>(motion_factor * primitive_length_ *
                     (1.0 + 0.01 * terrain));
         return !(to.x == from.x && to.y == from.y && to.t == from.t);
+    }
+
+    // Re-run only the eight root actions after an exhausted arc search. This uses the
+    // same production checker on the same locked map, but cannot publish or select a
+    // route. Batch throttling retains every action's reason instead of suppressing seven
+    // of them with the ordinary shared per-cell log throttle.
+    void diagnoseRootActions(const State& start) {
+        if(!debug_start_rejections_) return;
+        const ros::Time now=ros::Time::now();
+        if(last_root_debug_goal_==goal_id_ && !last_root_debug_time_.isZero() &&
+           (now-last_root_debug_time_).toSec()<3.0) return;
+        last_root_debug_goal_=goal_id_;
+        last_root_debug_time_=now;
+        grid_map::Position origin;
+        if(!map_.getPosition(grid_map::Index(start.x,start.y),origin)) return;
+        ROS_WARN("root_actions goal_id=%u mode=arcs start=(%.6f,%.6f,%.6f) "
+                 "clearance=%.3f map_stamp=%.6f",goal_id_,origin.x(),origin.y(),
+                 yawForBin(start.t),trajectoryClearance(),map_stamp_.toSec());
+        for(int direction : {-1,0,1}) for(int turn : {-1,0,1}) {
+            if(direction==0 && turn==0) continue;
+            State next{};
+            float cost=0.0f;
+            SweptFootprintRejection rejected;
+            const bool valid=transition(start,direction,turn,next,cost,true,&rejected);
+            char context[64];
+            std::snprintf(context,sizeof(context),"root_d%d_t%d",direction,turn);
+            ROS_WARN("root_action goal_id=%u context=%s valid=%s",goal_id_,context,
+                     valid ? "true" : "false");
+            if(!valid) logSweptRejection(context,rejected);
+        }
     }
 
     float heuristic(const State& a, const State& b) const {
@@ -1602,6 +1669,7 @@ private:
             if(expanded==1 && root_successors==0) {
                 logFootprintRejection({sp.x(),sp.y(),yawForBin(start.t)},
                                        "start_clearance",trajectoryClearance());
+                if(!use_dynamics) diagnoseRootActions(start);
             }
             return false;
         }
@@ -1691,6 +1759,9 @@ private:
     double footprint_length_,footprint_width_,max_long_slope_,max_lat_slope_;
     std::string map_frame_,base_frame_;
     bool use_dynamics_primitives_=false; std::string motion_primitive_file_;
+    bool debug_start_rejections_=false;
+    uint32_t last_root_debug_goal_=0;
+    ros::Time last_root_debug_time_;
     MotionPrimitiveLibrary primitive_lib_;
     std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
     SkidSteerParams sp_;

@@ -9,6 +9,15 @@
 
 namespace groundgrid {
 
+// Optional observation of the first failed swept sample. It never changes acceptance;
+// a failed full-band departure probe is not an edge failure and is not recorded here.
+struct SweptFootprintRejection {
+    bool has_sample = false;
+    Pose2D pose;
+    double clearance = 0.0;
+    bool allow_unknown = false;
+};
+
 template<typename CheckFootprint>
 double departureClearance(const Pose2D& start, double full_clearance,
                            bool departure, CheckFootprint check) {
@@ -32,8 +41,9 @@ bool sweptFootprintValid(const Pose2D& from, const Pose2D& to,
                          double corner_radius, double resolution,
                          double clearance0, double clearance1,
                          bool allow_start_unknown, CheckFootprint check,
-                         float& mean_cost) {
+                         float& mean_cost, SweptFootprintRejection* rejection = nullptr) {
     mean_cost = 0.0f;
+    if(rejection) *rejection = SweptFootprintRejection{};
     if(!std::isfinite(from.x) || !std::isfinite(from.y) || !std::isfinite(from.yaw) ||
        !std::isfinite(to.x) || !std::isfinite(to.y) || !std::isfinite(to.yaw) ||
        !std::isfinite(corner_radius) || corner_radius < 0.0 ||
@@ -56,8 +66,12 @@ bool sweptFootprintValid(const Pose2D& from, const Pose2D& to,
         const Pose2D pose{from.x+q*dx, from.y+q*dy,
                           SkidSteerModel::wrap(from.yaw+q*dyaw)};
         float cost = 0.0f;
-        if(!check(pose, clearance0+q*(clearance1-clearance0),
-                  allow_start_unknown && i==0, cost) || !std::isfinite(cost)) return false;
+        const double margin = clearance0+q*(clearance1-clearance0);
+        const bool unknown = allow_start_unknown && i==0;
+        if(!check(pose, margin, unknown, cost) || !std::isfinite(cost)) {
+            if(rejection) *rejection = {true, pose, margin, unknown};
+            return false;
+        }
         if(i) sum += cost;
     }
     mean_cost = static_cast<float>(sum/n);
@@ -72,8 +86,10 @@ bool latticeArcFootprintValid(const Pose2D& from, const Pose2D& lattice_end,
                               double signed_length, double heading_delta,
                               double corner_radius, double resolution,
                               double clearance, bool departure,
-                              CheckFootprint check, float& mean_cost) {
+                              CheckFootprint check, float& mean_cost,
+                              SweptFootprintRejection* rejection = nullptr) {
     mean_cost = 0.0f;
+    if(rejection) *rejection = SweptFootprintRejection{};
     if(!std::isfinite(signed_length) || !std::isfinite(heading_delta) ||
        !std::isfinite(resolution) || resolution <= 0.0) return false;
     const double steps = std::max({1.0, std::ceil(std::abs(signed_length)/resolution),
@@ -93,14 +109,14 @@ bool latticeArcFootprintValid(const Pose2D& from, const Pose2D& lattice_end,
         const double margin1 = initial_clearance+(clearance-initial_clearance)*q;
         float cost;
         if(!sweptFootprintValid(previous,current,corner_radius,resolution,
-                                margin0,margin1,departure && i==1,check,cost)) return false;
+                                margin0,margin1,departure && i==1,check,cost,rejection)) return false;
         sum += cost;
         previous = current;
     }
     float exported_cost;
     if(!sweptFootprintValid(from,lattice_end,corner_radius,resolution,
                             initial_clearance,clearance,departure,
-                            check,exported_cost)) return false;
+                            check,exported_cost,rejection)) return false;
     mean_cost = static_cast<float>(sum/n);
     return true;
 }
@@ -110,8 +126,10 @@ bool latticeArcFootprintValid(const Pose2D& from, const Pose2D& lattice_end,
 template<typename PoseAt, typename CheckFootprint>
 bool sampledFootprintValid(const Pose2D& start, std::size_t count, PoseAt pose_at,
                            double corner_radius, double resolution, double clearance,
-                           bool departure, CheckFootprint check, float& mean_cost) {
+                           bool departure, CheckFootprint check, float& mean_cost,
+                           SweptFootprintRejection* rejection = nullptr) {
     mean_cost = 0.0f;
+    if(rejection) *rejection = SweptFootprintRejection{};
     if(count==0 || count>1000000) return false;
     const double initial_clearance=departureClearance(start,clearance,departure,check);
     Pose2D previous=start;
@@ -122,7 +140,7 @@ bool sampledFootprintValid(const Pose2D& start, std::size_t count, PoseAt pose_a
         const double margin1=initial_clearance+(clearance-initial_clearance)*double(i+1)/count;
         float cost;
         if(!sweptFootprintValid(previous,current,corner_radius,resolution,
-                                margin0,margin1,departure && i==0,check,cost)) return false;
+                                margin0,margin1,departure && i==0,check,cost,rejection)) return false;
         previous=current;
         sum+=cost;
     }
