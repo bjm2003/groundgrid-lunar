@@ -14,7 +14,9 @@
     <node pkg="groundgrid" type="lunar_traversability_node"
           name="lunar_traversability" output="screen" />
     <node pkg="groundgrid" type="state_lattice_planner_node"
-          name="state_lattice_planner" output="screen" />
+          name="state_lattice_planner" output="screen">
+        <param name="odometry_topic" value="$(arg odometry_topic)" />
+    </node>
     <node pkg="groundgrid" type="lunar_path_follower_node"
           name="lunar_path_follower" output="screen">
         <remap from="/cmd_vel" to="$(arg cmd_vel_topic)" />

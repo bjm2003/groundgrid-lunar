@@ -37,9 +37,20 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   rotated point lattice. On one map, increasing clearance must include all cells from
   the smaller footprint. Search and execution revalidation share this rasterisation.
 - Collision checking must include the swept body during in-place rotations and transitions, not only endpoint poses.
-- A start-clearance ramp is limited to the occupied start's first edge, with full clearance
-  restored at its endpoint. It never permits a known hazard under the physical body. Search
-  must check the quantised/exported segment as well as the ideal primitive geometry.
+- Normal search/rotation start-clearance ramps remain limited to the occupied start's
+  first edge, with full clearance restored at its endpoint. Search must check the
+  quantised/exported segment as well as the ideal primitive geometry.
+- The user-authorised BackOut exception may restore clearance over ONE bounded retreat
+  built from actual stamped localisation history, never from an old planned route. Its
+  cumulative corner-motion budget is `recovery_backout_distance` (currently 1 m); its
+  frozen clearance schedule cannot restart on a map update or republish. The body and
+  complete sweep always reject known hazards; the endpoint must have full clearance.
+  Execution completion additionally requires full clearance at the actual rover pose.
+  New goals revoke retreat execution with the exact stop handshake but retain independent
+  observed history. Recovery completion is not mission completion or recovery confirmation.
+- Retreat history is local and bounded, not a persistent obstacle map. Discontinuous,
+  wrongly framed, stale or invalid localisation must not create a synthetic connection.
+  Software execution gates are sampled checks, not physical braking-distance guarantees.
 - Unknown terrain is normally invalid. The sensor blind disc and the goal-snap margin are narrowly scoped exceptions and must not silently relax known hazards.
 - A recovery rotate/back-out manoeuvre is not a successful nominal plan. Keep recovery, abort, planning-success, reach, and obstacle-avoidance metrics distinct.
 - The map is a 60 m rolling window centred on the rover. Fixed world goals can legitimately leave the map as the rover moves.
@@ -76,6 +87,9 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
   not test ROS message transport or physical braking.
 - Build and run `planner_safety_selfcheck` for departure/footprint changes; it exercises the
   production swept checker with synthetic rectangular-body hazards, not a recorded ROS map.
+- Build and run `backout_recovery_selfcheck` for observed-history/retreat changes; it covers
+  clearance scheduling, lifetime, discontinuities and production follower/stop-barrier
+  interaction on synthetic maps. ROS callbacks and real braking still require runtime tests.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.

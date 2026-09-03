@@ -300,7 +300,7 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 `footprint_reject` 给出格子原因。每批八个动作共享同一锁内地图，3 s 限频，
 不改变搜索结果；该逐动作诊断暂不覆盖动力学基元模式。
 `recovery_reject` 或 `context=recovery_rotate/recovery_backout` 区分恢复时没有
-历史路径与扫掠检查拒绝。调试输出增加开销，不用于正式性能基线。
+合格的实际行驶历史与扫掠检查拒绝。调试输出增加开销，不用于正式性能基线。
 
 `actual_body_valid=false` 表示实际矩形车身也被感知地图拒绝，不只是量化起点或
 额外安全带不足。检查 `footprint_reject` 的 `context/reason`、采样点、栅格中心和
@@ -320,8 +320,33 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 当前起点可能因地图细化而不满足额外安全带：只在第一条起步边内从零逐步恢复
 到原有余量，段末和后续边必须满足完整余量。实际车体全程检查，未知区域例外
 只限起点；不会放行已知障碍或超限坡度。弧线搜索还检查最终发布的量化线段，
-Rotate/BackOut 与保留路径共用扫掠检查。可用 `rosrun groundgrid planner_safety_selfcheck`
+Rotate 与保留路径共用扫掠检查。可用 `rosrun groundgrid planner_safety_selfcheck`
 运行离线几何回归，但它不代替完整 ROS 巡回验证。
+
+经用户确认，BackOut 使用独立的有界恢复策略，不再从旧规划路径取“已经走过的路”。
+规划器订阅 `LunarSystem.launch` 的 `odometry_topic`（默认
+`/localization/odometry/filtered_map`），要求消息 frame 为配置的 `map_frame`、child frame
+为 `base_frame`，与用于执行的 TF 一致。历史最多保留回退预算的 4 倍角点运动量、60 s、
+4096 个观测；消息队列为 200，时间间隔超过 0.5 s、时间倒退、定位跳变或非法消息会断开
+历史，不跨缺口插值。定位连续性允许的误差为一个地图格子及对应的角度量，不是可穿越障碍的余量。
+没有合格历史只会拒绝 BackOut，不能改用尚未执行的名义路径冒充。
+
+BackOut 的 1 m 预算按平移距离加半对角线乘转角计算，包含转动消耗；只沿观测序列逆序
+回退，必要时截断末段，不向历史之外延伸。额外安全余量按累计运动量在整个机动内恢复到
+原有标准，端点必须全余量有效；起点本就满足全余量时不享受减小例外。车体、连接段和
+全部扫掠仍检查已知危险/坡度，未知车体区域的例外仍只限开始位置。速度仍由原有地形缩放和包络生成。
+
+执行期间保持同一轨迹及余量进度，重发不重开例外；重新检查整条短机动及实际位姿连接段，
+已观测运动预算耗尽、地图/TF 失效、定位断裂或跟踪偏离均撤回轨迹。仅在实际终态位置/航向
+满足原门槛且实际车体已恢复完整额外余量时，允许重新尝试 Relax/正常路径；不计为到达或恢复确认。
+执行机动不受普通 2 s 阶梯切换提前打断，但使用原 6 s 无进展门槛，另设固定截止时刻：
+发布速度曲线估计时长加原无进展门槛，不能重发续期。失败后经停车确认进入 Abort，不无限生成新回退。
+新目标仍清理旧任务缓存/活动回退并等待旧 goal_id 的停车确认，但保留独立观测历史。
+
+日志 `backout_execution result=started/clearance_restored/stopped` 和 `reason` 分别表明开始、
+实际余量恢复或安全撤回；`recovery_reject` 给出无法生成的原因。运行
+`rosrun groundgrid backout_recovery_selfcheck` 验证离线机制。这是有限频率的软件门控，
+不是实际行程/制动距离的硬保证，也不是公里级历史障碍地图或五场景通过证明。
 
 跟踪日志中的 `feedback_w` 是混合前的原始纠偏需求，可以超过 0.8 rad/s；控制器
 按 0.5 前馈/0.5 反馈混合后统一限幅，检查输出约束应看 `desired_w/cmd_w`。

@@ -266,7 +266,7 @@ int main() {
         tracker.setTrajectory(recovered_route,changed);
         check(!cache.reusable() && cache.path().size() == old_route.size() &&
               cache.profile() == old_profile && !cache.wasSnapped(),
-              "unconfirmed recovery revokes reuse but preserves checked back-out history");
+              "unconfirmed recovery revokes reuse but preserves inactive route bookkeeping");
         tracker.setTrajectory(old_route,changed);  // former confirmed-recovery bug
         const auto rejected = tracker.step(rover,p);
         check(changed && rejected.status == TrackingStatus::Invalid &&
@@ -294,7 +294,7 @@ int main() {
         const Path manoeuvre{sample(.6,-.3,-.4),sample(.6,-.3,0,0,.6)};
         cache.published(manoeuvre,Profile{},false,false);
         check(!cache.reusable() && cache.profile() == recovered_profile && cache.wasSnapped(),
-              "recovery manoeuvre neither reactivates nor overwrites nominal back-out history");
+              "recovery manoeuvre neither reactivates nor overwrites inactive nominal route");
         cache.published(old_route,old_profile,false,true);
         check(cache.reusable() && !cache.wasSnapped() && cache.profile() == old_profile,
               "fresh validated nominal plan replaces interrupted cache and snap metadata");

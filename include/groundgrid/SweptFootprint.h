@@ -36,6 +36,9 @@ double departureClearance(const Pose2D& start, double full_clearance,
 // A departure from the *current* start may grow clearance from zero to the normal value
 // over ONE edge. This is not permission to cross a hazard: every physical body is checked,
 // the edge endpoint must have full clearance, and all later edges keep full clearance.
+// BoundedBackout is a separate, explicitly authorised whole-manoeuvre schedule built
+// from measured motion. It calls this sampler with frozen per-segment margins; it does
+// not alter the normal search/rotation departure rule or any physical-body predicate.
 template<typename CheckFootprint>
 bool sweptFootprintValid(const Pose2D& from, const Pose2D& to,
                          double corner_radius, double resolution,

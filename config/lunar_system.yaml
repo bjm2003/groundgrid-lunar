@@ -84,7 +84,8 @@ state_lattice_planner:
   # physical body stays strict-known; only the extra band may contain unknown shadow cells.
   # The occupied start is a narrow exception: its first outgoing edge grows the band from
   # zero to full at the endpoint. All swept physical bodies remain checked; later edges
-  # cannot restart this ramp. This lets a safe rover leave a newly refined obstacle band.
+  # cannot restart this ramp. The separately bounded observed-history BackOut below has
+  # an explicit whole-manoeuvre ramp; normal search/Rotate keep the one-edge rule.
   # If the start already has the full band, the departure keeps that full band too.
   trajectory_clearance: 0.25
   # A snapped route lies beside an invalid/occluded requested goal. In the mixed hard-goal
@@ -107,10 +108,12 @@ state_lattice_planner:
   min_recovery_interval: 3.0      # s of nominal operation required between recoveries
   # Escalation rungs that command motion. The rotate probe is deliberately smaller than a
   # heading bin pair so it changes the outgoing primitive set without a large blind sweep;
-  # the back-out distance is roughly one body length, enough to leave a pinch point but
-  # short enough that it stays on ground the rover just drove over.
+  # BackOut retraces actual stamped odometry, with full body/sweep checks on the latest map.
+  # Its margin is restored over one frozen manoeuvre, not each dense history sample.
+  # The budget counts translation + half-diagonal * absolute yaw travel, so rotation also
+  # consumes it. Actual sampled motion, no-progress and a fixed duration gate bound execution.
   recovery_rotate_step: 0.6       # rad of in-place turn per rotate attempt
-  recovery_backout_distance: 1.0  # m retraced along the last successful path
+  recovery_backout_distance: 1.0  # m corner-motion budget retraced from observed history
   # Inside one follower lookahead, reuse the last safe terminal trajectory instead of
   # allowing equivalent replans to alternate their initial forward/reverse direction.
   terminal_replan_distance: 0.8

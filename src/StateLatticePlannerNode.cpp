@@ -17,6 +17,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/GetPlan.h>
+#include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <std_msgs/String.h>
 #include <std_msgs/Float32MultiArray.h>
@@ -34,6 +35,7 @@
 #include "groundgrid/SweptFootprint.h"
 #include "groundgrid/ReplanStopBarrier.h"
 #include "groundgrid/FootprintRaster.h"
+#include "groundgrid/BackoutRecovery.h"
 
 namespace groundgrid {
 
@@ -67,6 +69,7 @@ public:
         pnh_.param("max_lateral_slope_deg", max_lat_slope_, 15.0);
         pnh_.param<std::string>("map_frame", map_frame_, "map");
         pnh_.param<std::string>("base_frame", base_frame_, "base_link");
+        pnh_.param<std::string>("odometry_topic", odometry_topic_, "/localization/odometry/filtered_map");
         pnh_.param("use_dynamics_primitives", use_dynamics_primitives_, false);
         pnh_.param("debug_start_rejections", debug_start_rejections_, false);
         pnh_.param<std::string>("motion_primitive_file", motion_primitive_file_, "");
@@ -140,6 +143,9 @@ public:
         }
 
         map_sub_ = nh_.subscribe("/terrain/grid_map", 1, &StateLatticePlannerNode::mapCallback, this);
+        // Keep observations queued through a blocking search; do not substitute the
+        // planned route for actual motion. The history itself has independent bounds.
+        odom_sub_ = nh_.subscribe(odometry_topic_, 200, &StateLatticePlannerNode::odometryCallback, this);
         goal_sub_ = nh_.subscribe("/move_base_simple/goal", 1, &StateLatticePlannerNode::goalCallback, this);
         follower_diag_sub_ = nh_.subscribe("/lunar_path_follower/diagnostics", 10,
                                            &StateLatticePlannerNode::followerDiagnosticCallback, this);
@@ -181,7 +187,8 @@ private:
                             const std_msgs::Float32MultiArray& profile,
                             bool reaches_goal,
                             bool was_snapped,
-                            bool retain_route = false) {
+                            bool retain_route = false,
+                            bool preserve_backout = false) {
         path_pub_.publish(path);
         vel_pub_.publish(profile);
 
@@ -225,9 +232,10 @@ private:
         active_trajectory_reaches_goal_ = finite && !path.poses.empty() && reaches_goal;
         active_trajectory_was_snapped_ = active_trajectory_reaches_goal_ && was_snapped;
         active_trajectory_map_stamp_ = finite && !path.poses.empty() ? map_stamp_ : ros::Time();
+        if(!preserve_backout || !finite || path.poses.empty()) active_backout_.clear();
         // All publications pass through this handoff. Even a transient empty trajectory
         // clears follower phase progress, so an interrupted cache cannot later be replayed
-        // from an arbitrary nearest point. Its history remains available to back-out only.
+        // from an arbitrary nearest point. Back-out uses separate measured odometry.
         retained_route_.published(trajectory.path, profile, was_snapped,
                                   active_trajectory_reaches_goal_ && retain_route);
         trajectory_pub_.publish(trajectory);
@@ -320,13 +328,14 @@ private:
     }
 
     void resetRecoveryState() {
-        // A new mission clears recovery history, not an outstanding safety stop. Its
-        // acknowledgement is still scoped to the revoked trajectory's original goal.
+        // A new mission clears goal-owned routes/retreat execution, not measured motion
+        // history or an outstanding stop scoped to the revoked trajectory's old goal.
         mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
         recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
         best_goal_dist_ = std::numeric_limits<double>::infinity();
         last_progress_time_ = ros::Time::now();
         retained_route_.clear();
+        active_backout_.clear(); pending_backout_.clear();
         active_trajectory_reaches_goal_ = false;
         active_trajectory_was_snapped_ = false;
         last_path_.poses.clear();
@@ -445,8 +454,39 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         grid_map::GridMapRosConverter::fromMessage(*msg, map_);
         map_stamp_ = msg->info.header.stamp;
-        have_map_ = map_.exists("terrain_cost") && map_.exists("slope_x") && map_.exists("slope_y");
-        if(have_map_) { buildTraversabilityCache(); replan_requested_ = true; }
+        have_map_ = msg->info.header.frame_id==map_frame_ && map_.exists("terrain_cost") &&
+                    map_.exists("slope_x") && map_.exists("slope_y");
+        if(have_map_) {
+            if(history_resolution_!=map_.getResolution()) {
+                if(active_backout_.active()) history_discontinuous_=true;
+                history_resolution_=map_.getResolution();
+                motion_history_.configure(cornerRadius(),history_resolution_,sp_.v_max,sp_.w_max,
+                                          4.0*recovery_backout_distance_);
+            }
+            buildTraversabilityCache(); replan_requested_ = true;
+        }
+    }
+
+    void odometryCallback(const nav_msgs::OdometryConstPtr& msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!have_map_) return;
+        const auto& p=msg->pose.pose.position;
+        const auto& q=msg->pose.pose.orientation;
+        const double norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+        if(msg->header.frame_id!=map_frame_ || msg->child_frame_id!=base_frame_ ||
+           !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+           !std::isfinite(norm) || std::abs(norm-1.0)>1e-3 ||
+           msg->header.stamp>ros::Time::now()+ros::Duration(0.5)) {
+            motion_history_.clear();
+            history_discontinuous_=true;
+            ROS_WARN_THROTTLE(1.0,"backout_history rejected odometry frame/pose/stamp; "
+                              "expected %s -> %s",map_frame_.c_str(),base_frame_.c_str());
+            return;
+        }
+        if(!motion_history_.observe({p.x,p.y,tf2::getYaw(q)},msg->header.stamp.toNSec())) {
+            history_discontinuous_=true;
+            ROS_WARN_THROTTLE(1.0,"backout_history discontinuity; previous measured route discarded");
+        }
     }
 
     // Flatten the per-cell traversability inputs into contiguous arrays so the footprint
@@ -481,6 +521,9 @@ private:
 
     void goalCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Revoke an in-flight retreat using its OLD goal id before accepting another
+        // mission. resetRecoveryState must not clear this exact stop acknowledgement.
+        if(active_backout_.active()) withdrawInvalidTrajectory("backout_goal_changed");
         goal_ = *msg; have_goal_ = true; replan_requested_ = true;
         ++goal_id_;
         if(goal_id_ == 0) ++goal_id_;  // reserve zero for unscoped/startup telemetry
@@ -505,7 +548,7 @@ private:
         }
     }
 
-    void withdrawInvalidTrajectory() {
+    void withdrawInvalidTrajectory(const char* reason="active_trajectory_invalid") {
         nav_msgs::Path empty;
         empty.header.frame_id=map_frame_;
         empty.header.stamp=ros::Time::now();
@@ -513,12 +556,12 @@ private:
         stop_barrier_.request(goal_id_,empty.header.stamp.toNSec());
         last_path_=empty;
         publishPlanOutputs(empty,std_msgs::Float32MultiArray(),false,false);
-        last_fail_reason_="active_trajectory_invalid";
+        last_fail_reason_=reason;
         replan_requested_=true;
         publishStatus("no_path");
         ROS_WARN("plan: withdrawing invalid execution trajectory before search: "
-                 "goal_id=%u trajectory_stamp_ns=%llu",goal_id_,
-                 static_cast<unsigned long long>(stop_barrier_.stamp()));
+                 "goal_id=%u trajectory_stamp_ns=%llu reason=%s",goal_id_,
+                 static_cast<unsigned long long>(stop_barrier_.stamp()),reason);
     }
 
     bool robotPose(geometry_msgs::PoseStamped& pose) {
@@ -583,59 +626,130 @@ private:
         return true;
     }
 
-    // Retreat along the last path that actually planned, which by construction is ground the
-    // vehicle has already traversed. Poses keep their forward orientation so the follower's
-    // own reverse detection makes the rover back up rather than turn around in place.
+    // Retrace stamped localisation, NOT the last planned path (which may never have been
+    // driven). Keep the observed orientations; the normal profiler determines reverse,
+    // rotation and direction changes. No goal/profile data crosses the history boundary.
     bool recoveryBackOut(const geometry_msgs::PoseStamped& start, nav_msgs::Path& path,
                          std_msgs::Float32MultiArray& vel) {
-        const auto& history = retained_route_.path();
-        if(history.poses.size() < 2) {
-            if(debug_start_rejections_)
-                ROS_WARN("recovery_reject goal_id=%u action=backout reason=no_history",goal_id_);
+        pending_backout_.clear();
+        std::vector<Pose2D> poses;
+        const char* reason="none";
+        const Pose2D current{start.pose.position.x,start.pose.position.y,tf2::getYaw(start.pose.orientation)};
+        if(!motion_history_.backtrack(current,start.header.stamp.toNSec(),
+                                      recovery_backout_distance_,poses,reason)) {
+            ROS_WARN("recovery_reject goal_id=%u action=backout reason=%s observations=%zu",
+                     goal_id_,reason,motion_history_.size());
             return false;
         }
-        const double x = start.pose.position.x, y = start.pose.position.y;
-        size_t nearest = 0; double nearest_d = std::numeric_limits<double>::infinity();
-        for(size_t i = 0; i < history.poses.size(); ++i) {
-            const auto& p = history.poses[i].pose.position;
-            const double d = std::hypot(p.x - x, p.y - y);
-            if(d < nearest_d) { nearest_d = d; nearest = i; }
+        auto check=[this](const Pose2D& pose,double margin,bool unknown,float& cost) {
+            return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,cost,unknown,margin);
+        };
+        SweptFootprintRejection rejected;
+        if(!pending_backout_.prepare(poses,cornerRadius(),map_.getResolution(),
+                                     recovery_backout_distance_,trajectoryClearance(),check,&rejected)) {
+            logSweptRejection("recovery_backout",rejected);
+            return false;
         }
-        path.header.frame_id = map_frame_; path.header.stamp = ros::Time::now();
+        // A path whose endpoint already satisfies the follower's pose gate would be
+        // reported reached without any movement. It cannot promise to regain clearance.
+        if(trajectoryEndpointReached(std::hypot(poses.back().x-current.x,poses.back().y-current.y),
+                wrap(poses.back().yaw-current.yaw),execution_goal_pos_tolerance_,execution_goal_yaw_tolerance_)) {
+            pending_backout_.clear();
+            ROS_WARN("recovery_reject goal_id=%u action=backout reason=endpoint_already_acquired",goal_id_);
+            return false;
+        }
+        path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
         path.poses.clear();
-        geometry_msgs::PoseStamped first = start; first.header = path.header;
-        path.poses.push_back(first);
-        double travelled = 0.0;
-        for(size_t i = nearest; i-- > 0;) {
-            const auto& src = history.poses[i];
-            // Re-check the connector and every swept segment, not only the history poses.
-            // Only the occupied start may lack the band; restore it by the first endpoint.
-            float cost;
-            const auto& prev = path.poses.back().pose;
-            const bool departure = path.poses.size() == 1;
-            SweptFootprintRejection rejected;
-            if(!sweptSegmentValid(
-                    {prev.position.x, prev.position.y, tf2::getYaw(prev.orientation)},
-                    {src.pose.position.x, src.pose.position.y, tf2::getYaw(src.pose.orientation)},
-                    departure ? 0.0 : trajectoryClearance(), trajectoryClearance(),
-                    departure, cost, nullptr, debug_start_rejections_ ? &rejected : nullptr)) {
-                if(debug_start_rejections_) logSweptRejection("recovery_backout",rejected);
-                return false;
-            }
-            travelled += std::hypot(src.pose.position.x - prev.position.x,
-                                     src.pose.position.y - prev.position.y);
-            geometry_msgs::PoseStamped pose = src; pose.header = path.header;
+        for(const auto& observed : poses) {
+            geometry_msgs::PoseStamped pose; pose.header=path.header;
+            pose.pose.position.x=observed.x; pose.pose.position.y=observed.y;
+            tf2::Quaternion q; q.setRPY(0,0,observed.yaw); pose.pose.orientation=tf2::toMsg(q);
             path.poses.push_back(pose);
-            if(travelled >= recovery_backout_distance_) break;
-        }
-        if(path.poses.size() < 2) {
-            if(debug_start_rejections_)
-                ROS_WARN("recovery_reject goal_id=%u action=backout reason=no_earlier_pose "
-                         "nearest=%zu nearest_d=%.3f",goal_id_,nearest,nearest_d);
-            return false;
         }
         buildVelocityProfile(path, vel);
+        // The profiler inserts midpoint samples. Freeze/recheck the exact exported
+        // geometry; cumulative-motion margins are invariant under that densification.
+        poses.clear();
+        for(const auto& pose : path.poses)
+            poses.push_back({pose.pose.position.x,pose.pose.position.y,tf2::getYaw(pose.pose.orientation)});
+        if(!pending_backout_.prepare(poses,cornerRadius(),map_.getResolution(),
+                                     recovery_backout_distance_,trajectoryClearance(),check,&rejected)) {
+            logSweptRejection("recovery_backout_export",rejected);
+            return false;
+        }
         return true;
+    }
+
+    double backoutDuration(const nav_msgs::Path& path, const std_msgs::Float32MultiArray& vel) const {
+        if(path.poses.size()<2 || vel.data.size()!=2*path.poses.size()) return 0.0;
+        double duration=0.0;
+        for(size_t i=1;i<path.poses.size();++i) {
+            const auto& a=path.poses[i-1].pose; const auto& b=path.poses[i].pose;
+            const double ds=std::hypot(b.position.x-a.position.x,b.position.y-a.position.y);
+            const double yaw=std::abs(wrap(tf2::getYaw(b.orientation)-tf2::getYaw(a.orientation)));
+            const double v=.5*(std::abs(vel.data[2*i])+std::abs(vel.data[2*(i-1)]));
+            const double w=.5*(std::abs(vel.data[2*i+1])+std::abs(vel.data[2*(i-1)+1]));
+            if(!std::isfinite(v) || !std::isfinite(w) || v>sp_.v_max+1e-6 || w>sp_.w_max+1e-6) return 0.0;
+            if(ds>1e-3) {
+                if(v<1e-6) return 0.0;
+                duration+=std::max(ds/v,yaw/(w>1e-6 ? w : sp_.w_max));
+            } else if(yaw>1e-3) {
+                if(w<1e-6) return 0.0;
+                duration+=yaw/w;
+            }
+        }
+        return std::isfinite(duration) ? duration : 0.0;
+    }
+
+    void finishBackout(bool completed, const char* reason) {
+        ROS_WARN("backout_execution goal_id=%u result=%s reason=%s progress=%.3f length=%.3f actual_motion=%.3f",
+                 goal_id_,completed ? "clearance_restored" : "stopped",reason,
+                 active_backout_.progress(),active_backout_.length(),active_backout_.actualMotion());
+        // Completion is only permission to retry nominal planning, never mission success
+        // or recovery confirmation. Failed retreat advances to Abort after a safe stop.
+        recovery_escalation_=completed ? 0 : 3;
+        action_=completed ? RecoveryAction::Relax : RecoveryAction::Abort;
+        confirm_count_=0;
+        recovery_step_start_=ros::Time::now();
+        withdrawInvalidTrajectory(reason);
+    }
+
+    void executeBackout(const geometry_msgs::PoseStamped& start) {
+        if(history_discontinuous_) {
+            finishBackout(false,"backout_localisation_discontinuity");
+            return;
+        }
+        const Pose2D current{start.pose.position.x,start.pose.position.y,tf2::getYaw(start.pose.orientation)};
+        auto check=[this](const Pose2D& pose,double margin,bool unknown,float& cost) {
+            return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,cost,unknown,margin);
+        };
+        SweptFootprintRejection rejected;
+        if(!active_backout_.validate(current,terminal_replan_distance_,check,&rejected)) {
+            logSweptRejection("active_backout",rejected);
+            finishBackout(false,active_backout_.failure());
+            return;
+        }
+        const auto& endpoint=active_backout_.poses().back();
+        const bool acquired=trajectoryEndpointReached(std::hypot(endpoint.x-current.x,endpoint.y-current.y),
+                wrap(endpoint.yaw-current.yaw),execution_goal_pos_tolerance_,execution_goal_yaw_tolerance_);
+        const bool restored=acquired && active_backout_.clearanceRestored(current,check);
+        if(!backout_lease_.update(ros::Time::now().toSec(),active_backout_.progress())) {
+            finishBackout(false,acquired && !restored ? "backout_actual_clearance_missing" : "backout_execution_timeout");
+            return;
+        }
+        if(restored) {
+            finishBackout(true,"backout_clearance_restored");
+            return;
+        }
+        // No replanning/restarting of the escape ramp while it executes. Refresh only
+        // timestamps, leaving follower phase progress and the fixed lease unchanged.
+        last_path_.header.stamp=ros::Time::now();
+        for(auto& pose : last_path_.poses) pose.header=last_path_.header;
+        publishPlanOutputs(last_path_,backout_profile_,false,false,false,/*preserve_backout=*/true);
+        replan_requested_=false;
+        publishStatus("recovery_backout");
+        ROS_INFO_THROTTLE(1.0,"backout_execution goal_id=%u progress=%.3f length=%.3f full_margin=%.3f",
+                          goal_id_,active_backout_.progress(),active_backout_.length(),active_backout_.fullClearance());
     }
 
     // One rung of the escalation ladder. Returns whether it produced a usable path, and
@@ -674,7 +788,10 @@ private:
 
     void timerCallback(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if(!have_map_) return;
+        if(!have_map_) {
+            if(active_backout_.active()) finishBackout(false,"backout_map_unavailable");
+            return;
+        }
         // Checked before have_goal_, which abort clears: the latched status has to keep
         // saying "aborted" so `rostopic echo /lunar_planner/status` explains the silence.
         if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); return; }
@@ -686,13 +803,29 @@ private:
             return;
         }
         geometry_msgs::PoseStamped start;
-        if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
+        if(!robotPose(start)) {
+            if(active_backout_.active()) finishBackout(false,"backout_tf_unavailable");
+            else publishStatus("tf_unavailable");
+            return;
+        }
         if(!stop_barrier_.canSearch(start.header.stamp.toNSec())) {
             ROS_WARN_THROTTLE(1.0,"plan: stop acknowledged but waiting for fresh start TF: goal_id=%u",
                               goal_id_);
             return;
         }
         stop_barrier_.clear();
+
+        // The user-authorised bounded retreat has its own frozen clearance schedule.
+        // Neither ordinary revalidation nor the two-second escalation rung may replace
+        // it halfway through. It still fails closed on stale terrain/TF.
+        if(active_backout_.active()) {
+            if((ros::Time::now()-map_stamp_).toSec()>max_map_age_)
+                finishBackout(false,"backout_stale_map");
+            else if((ros::Time::now()-start.header.stamp).toSec()>max_map_age_)
+                finishBackout(false,"backout_stale_tf");
+            else executeBackout(start);
+            return;
+        }
 
         // The follower stops against the *active* trajectory endpoint. That can differ from
         // retained_route_ while recovery owns a rotate/back-out or a relaxed goal plan, so
@@ -830,6 +963,16 @@ private:
             ++recovery_escalation_; confirm_count_ = 0; recovery_step_start_ = ros::Time::now();
         }
 
+        // A still-valid rotate/relaxed path may be moving when its rung expires. Stop it
+        // before taking the backtrack snapshot, not after computing a route from a pose
+        // that has already changed. The exact acknowledgement gate above owns the wait.
+        if(mode_==PlannerMode::Recovery &&
+           ladder_[std::min<size_t>(recovery_escalation_,ladder_.size()-1)]==RecoveryAction::BackOut &&
+           !last_path_.poses.empty()) {
+            withdrawInvalidTrajectory("backout_prepare_stop");
+            return;
+        }
+
         nav_msgs::Path path;
         std_msgs::Float32MultiArray vel;
         const bool in_recovery = (mode_ == PlannerMode::Recovery);
@@ -842,9 +985,30 @@ private:
             // streak and satisfy the confirm counter, so the ladder would reset here and
             // never escalate to Abort -- a hopeless goal would be retried forever, and the
             // 避障恢复率 metric would score a manoeuvre as a recovery.
+            const bool backout=action_==RecoveryAction::BackOut;
+            if(backout) {
+                const double duration=backoutDuration(path,vel);
+                if(!pending_backout_.active() || duration<=0.0) {
+                    pending_backout_.clear();
+                    ++consecutive_failures_;
+                    last_path_.poses.clear();
+                    publishPlanOutputs(last_path_,std_msgs::Float32MultiArray(),false,false);
+                    ROS_WARN("recovery_reject goal_id=%u action=backout reason=invalid_velocity_profile",goal_id_);
+                    publishStatus(recoveryStatus());
+                    return;
+                }
+                active_backout_=std::move(pending_backout_);
+                pending_backout_.clear();
+                history_discontinuous_=false;
+                backout_profile_=vel;
+                backout_lease_.start(ros::Time::now().toSec(),duration,no_progress_timeout_,progress_epsilon_);
+                ROS_INFO("backout_execution goal_id=%u result=started length=%.3f full_margin=%.3f "
+                         "estimated_duration=%.3f observations=%zu",goal_id_,active_backout_.length(),
+                         active_backout_.fullClearance(),duration,motion_history_.size());
+            }
             last_path_ = path;
             publishPlanOutputs(path, vel,
-                               /*reaches_goal=*/false, /*was_snapped=*/false);
+                               /*reaches_goal=*/false, /*was_snapped=*/false, false,backout);
             publishStatus(recoveryStatus());
         } else if(ok) {
             consecutive_failures_ = 0;
@@ -1750,14 +1914,14 @@ private:
         return true;
     }
 
-    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_,follower_diag_sub_;
+    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_,follower_diag_sub_,odom_sub_;
     ros::Publisher path_pub_,vel_pub_,trajectory_pub_,status_pub_,snapped_goal_pub_,diag_pub_;
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
     bool have_map_=false,have_goal_=false,replan_requested_=false;
     int bins_; double primitive_length_,heuristic_weight_,reverse_cost_,rotation_cost_,max_planning_time_,max_map_age_,goal_tolerance_;
     double footprint_length_,footprint_width_,max_long_slope_,max_lat_slope_;
-    std::string map_frame_,base_frame_;
+    std::string map_frame_,base_frame_,odometry_topic_;
     bool use_dynamics_primitives_=false; std::string motion_primitive_file_;
     bool debug_start_rejections_=false;
     uint32_t last_root_debug_goal_=0;
@@ -1793,6 +1957,12 @@ private:
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
     RetainedTrajectoryCache<nav_msgs::Path, std_msgs::Float32MultiArray> retained_route_;
     ReplanStopBarrier stop_barrier_;
+    RecentMotionHistory motion_history_;
+    double history_resolution_=0.0;
+    bool history_discontinuous_=false;
+    BoundedBackout active_backout_, pending_backout_;
+    BackoutExecutionLease backout_lease_;
+    std_msgs::Float32MultiArray backout_profile_;
     ros::Time active_trajectory_map_stamp_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
