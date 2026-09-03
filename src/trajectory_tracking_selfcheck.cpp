@@ -1,7 +1,9 @@
 // Stateful, multi-step controller regression tests. All fixtures below are synthetic;
-// they verify index/phase semantics, not ROS timing, perception, or collision clearance.
+// they verify index/phase and stop-barrier semantics, not ROS transport, physical braking,
+// perception, or collision clearance.
 #include "groundgrid/TrajectoryTracking.h"
 #include "groundgrid/RetainedTrajectoryCache.h"
+#include "groundgrid/ReplanStopBarrier.h"
 
 #include <cstdio>
 #include <vector>
@@ -267,6 +269,81 @@ int main() {
         tracker.setTrajectory(cusp,changed);
         auto speed_change = cusp; speed_change[1].v = -.4;
         check(tracker.setTrajectory(speed_change,changed) && !changed, "speed-only update preserves phase identity");
+    }
+    {
+        ReplanStopBarrier barrier;
+        const std::uint64_t stamp=1788428079729038841ULL;
+        const auto ack=[&](unsigned goal,std::uint64_t ts,const char* status) {
+            return "goal_id="+std::to_string(goal)+" trajectory_stamp_ns="+std::to_string(ts)+
+                   " snapshot_seq=123 status="+status;
+        };
+        const auto observe=[&](const std::string& message) { return barrier.observe(message,stamp); };
+        check(barrier.canSearch(0) && !barrier.waiting(),
+              "ordinary replanning has no stop barrier");
+        barrier.request(15,stamp);
+        check(barrier.waiting() && !barrier.canSearch(stamp+1000000000ULL),
+              "revoked path blocks search even after a full planning-budget interval");
+        check(!observe(ack(14,stamp,"empty_trajectory")) &&
+              !observe(ack(15,stamp-1,"empty_trajectory")) &&
+              !observe(ack(15,stamp,"goal_reached")) &&
+              !observe(ack(15,stamp,"tracking")) && barrier.waiting(),
+              "old goal, adjacent nanosecond stamp and non-stop status cannot release barrier");
+        check(!observe("goal_id=15 status=empty_trajectory") &&
+              !observe("goal_id=15 trajectory_stamp_ns=-1 status=empty_trajectory") &&
+              !observe("goal_id=15 trajectory_stamp_ns=18446744073709551616 status=empty_trajectory") &&
+              !observe(ack(15,stamp,"empty_trajectory")+" goal_id=15") &&
+              !observe(ack(15,stamp,"empty_trajectory")+" trajectory_stamp_ns=4") &&
+              !observe(ack(15,stamp,"empty_trajectory")+" status=empty_trajectory"),
+              "missing, malformed, overflowing and duplicate acknowledgement fields fail closed");
+        check(observe(ack(15,stamp,"empty_trajectory")) && !barrier.waiting() &&
+              !barrier.canSearch(stamp-1) && !barrier.canSearch(stamp) && barrier.canSearch(stamp+1),
+              "exact stop acknowledgement still requires a post-stop pose for search");
+        check(!observe(ack(15,stamp,"empty_trajectory")),
+              "duplicate acknowledgement cannot trigger another transition");
+        barrier.request(15,stamp+100);
+        check(!observe(ack(15,stamp,"empty_trajectory")) && barrier.waiting() &&
+              observe(ack(15,stamp+100,"empty_trajectory")),
+              "second stop of same goal requires its own trajectory acknowledgement");
+        check(followerStatusChanged("empty_trajectory",stamp+100,"empty_trajectory",stamp) &&
+              !followerStatusChanged("empty_trajectory",stamp,"empty_trajectory",stamp) &&
+              followerStatusChanged("empty_trajectory",stamp,"tracking",stamp),
+              "follower emits a new stop acknowledgement when only trajectory stamp changes");
+        barrier.clear();
+        check(!barrier.pending() && barrier.canSearch(0) &&
+              !observe(ack(15,stamp+100,"empty_trajectory")),
+              "completed barrier reset ignores old acknowledgement");
+        barrier.request(15,stamp);
+        check(!observe(ack(16,stamp,"empty_trajectory")) && barrier.waiting() &&
+              observe(ack(15,stamp,"empty_trajectory")),
+              "new mission cannot acknowledge a previous mission's outstanding stop");
+        barrier.request(15,stamp);
+        check(barrier.observe(ack(15,stamp,"empty_trajectory"),stamp+100) &&
+              !barrier.canSearch(stamp+1) && !barrier.canSearch(stamp+100) &&
+              barrier.canSearch(stamp+101),
+              "TF newer than stop publication but older than acknowledgement cannot release search");
+        barrier.request(0,0);
+        check(barrier.waiting() && !observe(ack(0,0,"empty_trajectory")) &&
+              !barrier.canSearch(stamp),"invalid stop identity cannot release safety barrier");
+
+        TrajectoryTracking tracker;
+        const std::vector<TrackingSample> path{sample(0,0,0),sample(1,0,0,.5),sample(2,0,0)};
+        tracker.setTrajectory(path,changed);
+        Pose2D old_rover{}, stopped_rover{};
+        SkidSteerModel model;
+        for(int tick=0;tick<20;++tick) {
+            const auto out=tracker.step(old_rover,p);
+            old_rover=model.integrate(old_rover,out.desired_v,out.desired_w,.05);
+        }
+        barrier.request(15,stamp);
+        tracker.clear(); // empty atomic trajectory accepted by the follower before its ack
+        bool held=true;
+        for(int tick=0;tick<20;++tick) {
+            const auto out=tracker.step(stopped_rover,p);
+            held &= out.desired_v==0 && out.desired_w==0 && !barrier.canSearch(stamp+1);
+            stopped_rover=model.integrate(stopped_rover,out.desired_v,out.desired_w,.05);
+        }
+        check(old_rover.x>.45 && held && stopped_rover.x==0,
+              "synthetic one-second search no longer permits half-metre travel on revoked path");
     }
     std::printf("trajectory_tracking_selfcheck: %d failure(s)\n",failures);
     return failures ? 1 : 0;

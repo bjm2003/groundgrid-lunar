@@ -270,6 +270,15 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 `goal_recovery_events/successes/aborts` 在同一消息中发布；完成和中止立即发布，
 不会等待周期诊断。`snapshot_seq` 用于拒绝旧快照。原有状态、路径和速度话题保持兼容。
 
+跟踪器诊断还包含 `trajectory_stamp_ns`，精确对应原子轨迹的时间戳。地图判定正在
+执行的轨迹无效时，规划器先发布空轨迹并结束当前回调，不会先阻塞搜索。跟踪器清空
+轨迹、发布零速度后，回传该 `goal_id + trajectory_stamp_ns` 的 `empty_trajectory`；
+规划器收到确认，再等一个时间戳晚于确认接收时刻的 TF，才以新位姿搜索。
+这是软件停车命令确认，不代表真实车辆已经完成制动。它不是到达，也不是轨迹超时。
+若一直出现 `waiting for trajectory stop acknowledgement`，先核对两个节点是否均已
+重新编译并重启、诊断话题是否连通；不要通过取消确认来恢复运动。新规划器配旧跟踪器
+不会收到新字段，安全门会一直阻止后续搜索。新目标也不会取消尚未完成的停车确认。
+
 `goal_received` 仅表示规划器已接收请求，`success_snapped` 仅表示产出吸附路径，
 都不代表车辆到达。当前完整 `mixed/flat` 测试还要求可解困难目标实际完成，
 不能用恢复率的条件分母排除中止目标来代替任务完成验证。
@@ -278,6 +287,12 @@ rostopic echo -n 1 /lunar_path_follower/diagnostics
 `start_clearance_valid` 和 `budget_exhausted`。只展开 1 个节点且没有有效后继，
 表示车辆无法通过当前起步检查，不等于用完 1 秒预算或已经证明目标不可达。
 `last_fail=start_no_successor` 与 `search_timeout` 分别标识这两类情况。
+
+`actual_body_valid=false` 表示实际矩形车身也被感知地图拒绝，不只是量化起点或
+额外安全带不足。检查 `footprint_reject` 的 `context/reason`、采样点、栅格中心和
+`terrain_cost/slope_x/slope_y/slope/step_height/obstacle_height/obstacle_confidence/roughness`，
+结合 `map_stamp` 区分哪一类栅格触发拒绝。仿真真值净空为正不能据此绕过感知的已知危险；
+该日志只增加可观测性，不改变碰撞与坡度判定。
 
 当前起点可能因地图细化而不满足额外安全带：只在第一条起步边内从零逐步恢复
 到原有余量，段末和后续边必须满足完整余量。实际车体全程检查，未知区域例外

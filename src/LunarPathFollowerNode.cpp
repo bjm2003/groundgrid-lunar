@@ -19,6 +19,7 @@
 #include "groundgrid/SkidSteerModel.h"
 #include "groundgrid/TrajectoryControl.h"
 #include "groundgrid/TrajectoryTracking.h"
+#include "groundgrid/ReplanStopBarrier.h"
 
 namespace groundgrid {
 
@@ -68,14 +69,15 @@ public:
 
 private:
     void publishStatus(const std::string& status) {
-        if(status == last_status_) return;
+        if(!followerStatusChanged(status,received_.toNSec(),last_status_,last_status_stamp_)) return;
         last_status_ = status;
+        last_status_stamp_ = received_.toNSec();
         std_msgs::String msg;
         msg.data = status;
         status_pub_.publish(msg);
         std::ostringstream snapshot;
         snapshot << "goal_id=" << goal_id_ << " snapshot_seq=" << ++diagnostic_seq_
-                 << " status=" << status;
+                 << " status=" << status << " trajectory_stamp_ns=" << received_.toNSec();
         msg.data = snapshot.str();
         diag_pub_.publish(msg);
     }
@@ -281,6 +283,7 @@ private:
     size_t trajectory_id_=0;
     uint32_t goal_id_=0;
     uint64_t diagnostic_seq_=0;
+    uint64_t last_status_stamp_=0;
 };
 
 } // namespace groundgrid

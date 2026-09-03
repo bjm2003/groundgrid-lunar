@@ -46,6 +46,11 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   are compatibility and visualisation outputs, not control inputs.
 - A trajectory twist is desired effective body motion before slip compensation. Apply
   terrain scaling in the planner and `inverseCommand()` once in the follower.
+- Withdraw a known-invalid active trajectory before any blocking replacement search.
+  Require the follower's `empty_trajectory` acknowledgement for the exact `goal_id` and
+  `trajectory_stamp_ns`, then a TF newer than acknowledgement receipt. A new goal cannot
+  cancel an outstanding stop. This is a software command acknowledgement, not proof of
+  physical braking; missing acknowledgement must not silently release execution.
 - Correlate test observations with the acknowledged goal: atomic trajectory
   `path.header.seq` carries `goal_id`; planner/follower diagnostic snapshots carry the
   same id. Legacy untagged status strings cannot end a trial or supply recovery counters.
@@ -57,8 +62,9 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
 - Compile all Python sources without importing ROS modules.
 - Parse package, launch, and rostest XML.
 - Build and run `skidsteer_selfcheck` for pure dynamics changes.
-- Build and run `trajectory_tracking_selfcheck` for follower targeting/phase changes; it
-  exercises the same ROS-free stateful core used by the live follower.
+- Build and run `trajectory_tracking_selfcheck` for follower targeting/phase or stop-before-
+  replan changes; it exercises the production ROS-free tracker and stop barrier, but does
+  not test ROS message transport or physical braking.
 - Build and run `planner_safety_selfcheck` for departure/footprint changes; it exercises the
   production swept checker with synthetic rectangular-body hazards, not a recorded ROS map.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.

@@ -103,6 +103,19 @@ class TrialObservationTest(unittest.TestCase):
         self.assertFalse(state.planner(planner(seq=2, events=0)))
         self.assertEqual(state.counters["recovery_events"], 1)
 
+    def test_stop_acknowledgement_is_neither_arrival_nor_stale(self):
+        state = TrialObservation(1400)
+        state.planner(planner())
+        state.follower(follower())
+        state.follower(follower(seq=2, status="goal_reached"))
+        message = follower(seq=3, status="empty_trajectory")
+        message["trajectory_stamp_ns"] = "1788428079729038841"
+        self.assertTrue(state.follower(message))
+        self.assertFalse(state.follower_done)
+        self.assertFalse(state.planner_done)
+        self.assertFalse(state.follower_stale)
+        self.assertEqual(state.status, "goal_received")
+
     def test_another_id_cannot_rebind_an_acknowledged_stamp(self):
         state = TrialObservation(1400)
         state.planner(planner())

@@ -32,11 +32,17 @@
 #include "groundgrid/TrajectoryControl.h"
 #include "groundgrid/RetainedTrajectoryCache.h"
 #include "groundgrid/SweptFootprint.h"
+#include "groundgrid/ReplanStopBarrier.h"
 
 namespace groundgrid {
 
 class StateLatticePlannerNode {
     struct State { int x, y, t; };
+    struct FootprintRejection {
+        const char* reason="none";
+        double sample_x=0.0, sample_y=0.0;
+        int row=-1, col=-1;
+    };
     struct QueueNode {
         float f; int key;
         bool operator<(const QueueNode& other) const { return f > other.f; }
@@ -133,6 +139,8 @@ public:
 
         map_sub_ = nh_.subscribe("/terrain/grid_map", 1, &StateLatticePlannerNode::mapCallback, this);
         goal_sub_ = nh_.subscribe("/move_base_simple/goal", 1, &StateLatticePlannerNode::goalCallback, this);
+        follower_diag_sub_ = nh_.subscribe("/lunar_path_follower/diagnostics", 10,
+                                           &StateLatticePlannerNode::followerDiagnosticCallback, this);
         path_pub_ = nh_.advertise<nav_msgs::Path>("/lunar_planner/path", 1, true);
         vel_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/lunar_planner/velocity_profile", 1, true);
         trajectory_pub_ = nh_.advertise<groundgrid::LunarTrajectory>("/lunar_planner/trajectory", 1, true);
@@ -309,6 +317,8 @@ private:
     }
 
     void resetRecoveryState() {
+        // A new mission clears recovery history, not an outstanding safety stop. Its
+        // acknowledgement is still scoped to the revoked trajectory's original goal.
         mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
         recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
         best_goal_dist_ = std::numeric_limits<double>::infinity();
@@ -326,6 +336,14 @@ private:
            retained_route_.profile().data.size() != path.poses.size()*2) {
             return false;
         }
+        return executionTrajectoryStillValid(start,path);
+    }
+
+    // Check the path currently at the follower, even if it is an unconfirmed recovery
+    // route/manoeuvre and therefore ineligible for retained-cache reuse.
+    bool executionTrajectoryStillValid(const geometry_msgs::PoseStamped& start,
+                                       const nav_msgs::Path& path) const {
+        if(path.poses.empty()) return false;
         size_t nearest = 0;
         double nearest_distance = std::numeric_limits<double>::infinity();
         for(size_t i=0; i<path.poses.size(); ++i) {
@@ -377,6 +395,7 @@ private:
                               tf2::getYaw(from.orientation), actual_valid ? "true" : "false",
                               nearest, nearest_pose.position.x, nearest_pose.position.y,
                               tf2::getYaw(nearest_pose.orientation), map_stamp_.toSec());
+            if(!actual_valid) logFootprintRejection(from,"current_pose");
             return false;
         }
         for(size_t i=nearest+1; i<path.poses.size(); ++i) {
@@ -469,6 +488,32 @@ private:
         last_fail_reason_.clear(); last_plan_ms_ = 0.0; last_snap_dist_ = 0.0;
         last_status_.clear();
         publishStatus("goal_received");
+    }
+
+    void followerDiagnosticCallback(const std_msgs::StringConstPtr& msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(stop_barrier_.observe(msg->data,ros::Time::now().toNSec())) {
+            replan_requested_=true;
+            ROS_INFO("plan: stop acknowledged goal_id=%u trajectory_stamp_ns=%llu; "
+                     "next search requires a fresh pose",stop_barrier_.goal(),
+                     static_cast<unsigned long long>(stop_barrier_.stamp()));
+        }
+    }
+
+    void withdrawInvalidTrajectory() {
+        nav_msgs::Path empty;
+        empty.header.frame_id=map_frame_;
+        empty.header.stamp=ros::Time::now();
+        // Set the barrier BEFORE publishing, so even a prompt acknowledgement is scoped.
+        stop_barrier_.request(goal_id_,empty.header.stamp.toNSec());
+        last_path_=empty;
+        publishPlanOutputs(empty,std_msgs::Float32MultiArray(),false,false);
+        last_fail_reason_="active_trajectory_invalid";
+        replan_requested_=true;
+        publishStatus("no_path");
+        ROS_WARN("plan: withdrawing invalid execution trajectory before search: "
+                 "goal_id=%u trajectory_stamp_ns=%llu",goal_id_,
+                 static_cast<unsigned long long>(stop_barrier_.stamp()));
     }
 
     bool robotPose(geometry_msgs::PoseStamped& pose) {
@@ -611,8 +656,20 @@ private:
         // saying "aborted" so `rostopic echo /lunar_planner/status` explains the silence.
         if(mode_ == PlannerMode::Aborted) { publishStatus("aborted"); return; }
         if(!have_goal_) return;
+        if(stop_barrier_.waiting()) {
+            ROS_WARN_THROTTLE(1.0,"plan: waiting for trajectory stop acknowledgement: goal_id=%u "
+                              "trajectory_stamp_ns=%llu; search held",stop_barrier_.goal(),
+                              static_cast<unsigned long long>(stop_barrier_.stamp()));
+            return;
+        }
         geometry_msgs::PoseStamped start;
         if(!robotPose(start)) { publishStatus("tf_unavailable"); return; }
+        if(!stop_barrier_.canSearch(start.header.stamp.toNSec())) {
+            ROS_WARN_THROTTLE(1.0,"plan: stop acknowledged but waiting for fresh start TF: goal_id=%u",
+                              goal_id_);
+            return;
+        }
+        stop_barrier_.clear();
 
         // The follower stops against the *active* trajectory endpoint. That can differ from
         // retained_route_ while recovery owns a rotate/back-out or a relaxed goal plan, so
@@ -677,6 +734,15 @@ private:
         // is what lets consecutive plans disagree and the rover oscillate.
         if(!replan_requested_) return;
         replan_requested_ = false;
+
+        // Never spend a planning budget while the follower executes a path this map has
+        // already invalidated. Publish an empty atomic trajectory and RETURN; waiting for
+        // its exact acknowledgement also prevents a fast replan from overwriting the stop
+        // in a queue of size one. The next timer obtains a post-stop start TF.
+        if(!last_path_.poses.empty() && !executionTrajectoryStillValid(start,last_path_)) {
+            withdrawInvalidTrajectory();
+            return;
+        }
 
         const double requested_goal_dist = std::hypot(
             goal_.pose.position.x - start.pose.position.x,
@@ -838,7 +904,12 @@ private:
     // scan, but cells whose slope magnitude is already within the (stricter) lateral limit
     // skip the direction-dependent slope trig entirely.
     bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false,
-                        double margin = 0.0) const {
+                        double margin = 0.0, FootprintRejection* rejection = nullptr) const {
+        if(rejection) *rejection=FootprintRejection{};
+        const auto reject = [rejection](const char* reason,double wx,double wy,int row,int col) {
+            if(rejection) *rejection={reason,wx,wy,row,col};
+            return false;
+        };
         cost = 0.0f; int samples = 0;
         const double r = map_.getResolution();
         const double half_l = footprint_length_/2 + margin, half_w = footprint_width_/2 + margin;
@@ -850,31 +921,64 @@ private:
                 grid_map::Index idx;
                 if(!map_.getIndex(grid_map::Position(wx, wy), idx)) {
                     if(allow_unknown) continue;
-                    return false;
+                    return reject("off_map",wx,wy,-1,-1);
                 }
                 const size_t lin = static_cast<size_t>(idx(0)) * cell_cols_ + idx(1);
                 const float c = cell_cost_[lin];
                 if(!std::isfinite(c)) {
                     if(allow_unknown) continue;
-                    return false;
+                    return reject("unknown_cost",wx,wy,idx(0),idx(1));
                 }
-                if(c >= 100.0f) return false;
+                if(c >= 100.0f) return reject("lethal_cost",wx,wy,idx(0),idx(1));
                 const float sm = cell_slopemag_[lin];
                 if(!std::isfinite(sm)) {
                     if(allow_unknown) continue;
-                    return false;
+                    return reject("unknown_slope",wx,wy,idx(0),idx(1));
                 }
                 if(sm > max_lat_slope_) {  // steep cell: fall back to the directional check
                     const float gx = cell_gx_[lin], gy = cell_gy_[lin];
                     const double longitudinal = std::atan(std::abs(gx*cyaw + gy*syaw)) * 180.0/M_PI;
                     const double lateral = std::atan(std::abs(-gx*syaw + gy*cyaw)) * 180.0/M_PI;
-                    if(longitudinal > max_long_slope_ || lateral > max_lat_slope_) return false;
+                    if(longitudinal > max_long_slope_ || lateral > max_lat_slope_)
+                        return reject(longitudinal > max_long_slope_ ? "longitudinal_slope"
+                                                                     : "lateral_slope",
+                                      wx,wy,idx(0),idx(1));
                 }
                 cost += c; ++samples;
             }
         }
         if(samples) cost /= samples;
         return true;
+    }
+
+    // Observability only: report the exact rejected cell and original terrain layers.
+    // Ground-truth clearance does not justify overriding a perceived lethal cell. These
+    // fields distinguish obstacle/step/slope rejection before considering a map change.
+    void logFootprintRejection(const geometry_msgs::Pose& pose,const char* context,
+                               double margin=0.0) const {
+        FootprintRejection rejection;
+        float cost;
+        if(footprintValid(pose.position.x,pose.position.y,tf2::getYaw(pose.orientation),
+                          cost,true,margin,&rejection)) return;
+        const bool indexed=rejection.row>=0 && rejection.col>=0;
+        const grid_map::Index index(rejection.row,rejection.col);
+        const double nan=std::numeric_limits<double>::quiet_NaN();
+        grid_map::Position cell(nan,nan);
+        if(indexed) map_.getPosition(index,cell);
+        const auto layer=[&](const char* name) {
+            return indexed && map_.exists(name) ? double(map_.at(name,index)) : nan;
+        };
+        ROS_WARN_THROTTLE(1.0,"footprint_reject goal_id=%u context=%s reason=%s margin=%.3f "
+                          "pose=(%.3f,%.3f,%.3f) sample=(%.3f,%.3f) cell=(%.3f,%.3f) "
+                          "terrain_cost=%.3f slope_x=%.4f slope_y=%.4f slope=%.3f "
+                          "step_height=%.3f obstacle_height=%.3f obstacle_confidence=%.3f "
+                          "roughness=%.3f map_stamp=%.6f",
+                          goal_id_,context,rejection.reason,margin,
+                          pose.position.x,pose.position.y,tf2::getYaw(pose.orientation),
+                          rejection.sample_x,rejection.sample_y,cell.x(),cell.y(),
+                          layer("terrain_cost"),layer("slope_x"),layer("slope_y"),layer("slope"),
+                          layer("step_height"),layer("obstacle_height"),layer("obstacle_confidence"),
+                          layer("roughness"),map_stamp_.toSec());
     }
 
     // Validate the physical body strictly, then reserve a configurable band around it from
@@ -1332,6 +1436,7 @@ private:
                               sp.x(), sp.y(), yawForBin(start.t), goal_id_,
                               actual.position.x, actual.position.y, tf2::getYaw(actual.orientation),
                               actual_valid ? "true" : "false", map_stamp_.toSec());
+            logFootprintRejection(actual,"start_body");
             last_fail_reason_ = "start_footprint";
             return false;
         }
@@ -1480,6 +1585,13 @@ private:
                               trajectoryClearance(), elapsed >= max_planning_time_ ? "true" : "false");
             last_fail_reason_ = expanded==1 && root_successors==0 ? "start_no_successor"
                                  : (elapsed >= max_planning_time_ ? "search_timeout" : "search_exhausted");
+            if(expanded==1 && root_successors==0) {
+                geometry_msgs::Pose lattice=start_pose.pose;
+                lattice.position.x=sp.x(); lattice.position.y=sp.y();
+                tf2::Quaternion q; q.setRPY(0,0,yawForBin(start.t));
+                lattice.orientation=tf2::toMsg(q);
+                logFootprintRejection(lattice,"start_clearance",trajectoryClearance());
+            }
             return false;
         }
         if(reached_error > 1e-4f) {
@@ -1559,7 +1671,7 @@ private:
         return true;
     }
 
-    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_;
+    ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_,follower_diag_sub_;
     ros::Publisher path_pub_,vel_pub_,trajectory_pub_,status_pub_,snapped_goal_pub_,diag_pub_;
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
@@ -1598,6 +1710,7 @@ private:
     ros::Time last_cpu_time_;
     ros::Time last_progress_time_, recovery_step_start_, last_recovery_end_, last_diag_time_;
     RetainedTrajectoryCache<nav_msgs::Path, std_msgs::Float32MultiArray> retained_route_;
+    ReplanStopBarrier stop_barrier_;
     std::string last_fail_reason_;
     mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
     mutable std::vector<double> prof_yaw_;
