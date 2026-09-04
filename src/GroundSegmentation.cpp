@@ -467,7 +467,7 @@ void GroundSegmentation::spiral_ground_interpolation(
     const BlindZoneSupportPlane support=BlindZoneSupportPlane::fromPose(
         t.x,t.y,t.z,q.x,q.y,q.z,q.w);
     const int support_cells=static_cast<int>(std::ceil(
-        std::sqrt(static_cast<double>(minDistSquared))/map.getResolution()))+1;
+        static_cast<double>(groundSupportRadius)/map.getResolution()))+1;
 
     // Preserve GroundGrid's original high-confidence seed, but put it under the exact
     // capture-time base pose instead of assuming a particular matrix-centre convention.
@@ -544,17 +544,18 @@ void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x
     static const grid_map::Matrix& gpl = map["points"];
     static const grid_map::Matrix& raw = map["elevation_raw"];
 
-    // No usable ground return can exist inside min_point_distance: insert_cloud rejects
-    // it as a possible self-return.  Re-averaging those cells every frame lets an adjacent
-    // boulder's high ground estimate diffuse under the physical body.  Preserve direct
-    // historical height where it exists; otherwise use the rover's capture-time support
-    // plane.  Current measurements and every cell outside the mask keep the original path.
+    // No usable ground return can exist inside min_point_distance, and the LiDAR's lowest
+    // beam leaves a larger ground-return blind disc. Re-averaging empty cells there every
+    // frame lets an adjacent boulder's high ground estimate diffuse beneath the physical
+    // body. Preserve direct historical height where it exists; otherwise use the rover's
+    // capture-time support plane. Current measurements and every cell outside the configured
+    // support disc keep the original path, so elevated obstacle returns are not erased.
     grid_map::Position position;
     double support_height=0.0;
     if(may_be_in_support_mask &&
        map.getPosition(grid_map::Index(static_cast<int>(x),static_cast<int>(y)),position) &&
        support.heightForUnmeasuredCell(position.x(),position.y(),
-           mask_x,mask_y,std::sqrt(static_cast<double>(minDistSquared)),
+            mask_x,mask_y,static_cast<double>(groundSupportRadius),
            gpl(x,y),raw(x,y),support_height)) {
         ggl(x,y)=static_cast<float>(support_height);
         return;
@@ -578,6 +579,8 @@ void GroundSegmentation::setConfig(const groundgrid::GroundGridConfig &config)
 {
     mConfig = config;
     minDistSquared = static_cast<float>(config.min_point_distance * config.min_point_distance);
+    groundSupportRadius = static_cast<float>(
+        std::max(config.min_point_distance, config.ground_support_radius));
 }
 
 

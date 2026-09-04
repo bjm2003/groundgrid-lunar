@@ -16,10 +16,12 @@ groundgrid:
   # measured perfectly well a second earlier. 1.2 m is the body half-diagonal (1.17 m),
   # i.e. the radius inside which a return could only be the vehicle itself. Cells in this
   # self-mask with no usable return retain direct historical height, or fall back to the
-  # capture-time base support plane when never measured; this prevents repeated interpolation
-  # from diffusing a nearby boulder underneath the rover. Terrain outside the mask and every
-  # usable measured cell retain the original estimator.
+  # capture-time base support plane when never measured. The lowest LiDAR beam also leaves a
+  # 2.16 m ground-return hole, so ground_support_radius covers the same 2.5 m disc that the
+  # traversability node marks known. Current usable returns (including elevated obstacle
+  # returns) and historical direct hazards always win; only otherwise-empty ground is anchored.
   min_point_distance: 1.2
+  ground_support_radius: 2.5
   slope_enable: true
   height_correction_enable: true
   height_correction_iterations: 1
@@ -122,8 +124,10 @@ state_lattice_planner:
   # consumes it. Actual sampled motion, no-progress and a fixed duration gate bound execution.
   recovery_rotate_step: 0.6       # rad of in-place turn per rotate attempt
   recovery_backout_distance: 1.0  # m corner-motion budget retraced from observed history
-  # Inside one follower lookahead, reuse the last safe terminal trajectory instead of
-  # allowing equivalent replans to alternate their initial forward/reverse direction.
+  # Maximum distance for reconnecting the current pose to an uninterrupted retained route.
+  # Every fresh map still revalidates the full unexecuted body sweep; a valid goal route is
+  # kept while its measured remaining motion decreases, avoiding half-second forward/reverse
+  # replans that never let either manoeuvre finish.
   terminal_replan_distance: 0.8
   # Match the follower's terminal gate. Once the actual retained endpoint (including a
   # snapped endpoint) is acquired, retire the operator goal so the next rolling-map update

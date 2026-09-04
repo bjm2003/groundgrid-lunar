@@ -332,7 +332,7 @@ private:
         // history or an outstanding stop scoped to the revoked trajectory's old goal.
         mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
         recovery_escalation_ = 0; consecutive_failures_ = 0; confirm_count_ = 0;
-        best_goal_dist_ = std::numeric_limits<double>::infinity();
+        best_progress_distance_ = std::numeric_limits<double>::infinity();
         last_progress_time_ = ros::Time::now();
         retained_route_.clear();
         active_backout_.clear(); pending_backout_.clear();
@@ -349,6 +349,27 @@ private:
             return false;
         }
         return executionTrajectoryStillValid(start,path);
+    }
+
+    bool routeRemainingMotion(const geometry_msgs::PoseStamped& start,
+                              const nav_msgs::Path& path,
+                              double& remaining) const {
+        std::size_t nearest=0;
+        const Pose2D rover{start.pose.position.x,start.pose.position.y,
+                           tf2::getYaw(start.pose.orientation)};
+        return remainingTrajectoryMotion(rover,path.poses.size(),cornerRadius(),
+            [&path](std::size_t i) {
+                const auto& pose=path.poses[i].pose;
+                return Pose2D{pose.position.x,pose.position.y,tf2::getYaw(pose.orientation)};
+            },remaining,nearest);
+    }
+
+    void resetRouteProgress(const geometry_msgs::PoseStamped& start,
+                            const nav_msgs::Path& path) {
+        double remaining=0.0;
+        best_progress_distance_=routeRemainingMotion(start,path,remaining)
+            ? remaining : std::numeric_limits<double>::infinity();
+        last_progress_time_=ros::Time::now();
     }
 
     // Check the path currently at the follower, even if it is an unconfirmed recovery
@@ -876,7 +897,7 @@ private:
                 consecutive_failures_ = 0;
                 recovery_escalation_ = 0;
                 confirm_count_ = 0;
-                best_goal_dist_ = requested_goal_dist;
+                best_progress_distance_ = requested_goal_dist;
                 last_progress_time_ = ros::Time::now();
                 retained_route_.clear();
                 active_trajectory_reaches_goal_ = false;
@@ -899,55 +920,61 @@ private:
         // already invalidated. Publish an empty atomic trajectory and RETURN; waiting for
         // its exact acknowledgement also prevents a fast replan from overwriting the stop
         // in a queue of size one. The next timer obtains a post-stop start TF.
-        if(!last_path_.poses.empty() && !executionTrajectoryStillValid(start,last_path_)) {
-            withdrawInvalidTrajectory();
-            return;
+        bool active_path_valid=true;
+        if(!last_path_.poses.empty()) {
+            active_path_valid=executionTrajectoryStillValid(start,last_path_);
+            if(!active_path_valid) {
+                withdrawInvalidTrajectory();
+                return;
+            }
         }
 
         const double requested_goal_dist = std::hypot(
             goal_.pose.position.x - start.pose.position.x,
             goal_.pose.position.y - start.pose.position.y);
-        // Recovery/progress must measure the endpoint the rover is actually executing. A
-        // snapped goal can legitimately stop farther than goal_tolerance_ from the original
-        // operator click; measuring the click made a completed safe snap look permanently
-        // stuck and forced it through the recovery ladder into Abort.
+        // Completion measures the endpoint the rover is actually executing. Progress uses
+        // remaining route motion below: Euclidean goal distance can increase on a valid
+        // detour, and treating that as stuck caused recovery to interrupt the manoeuvre.
         double execution_goal_dist = requested_goal_dist;
         if(active_trajectory_reaches_goal_ && !last_path_.poses.empty()) {
             const auto& endpoint = last_path_.poses.back().pose.position;
             execution_goal_dist = std::hypot(endpoint.x-start.pose.position.x,
                                              endpoint.y-start.pose.position.y);
         }
-        if(execution_goal_dist < best_goal_dist_ - progress_epsilon_) {
-            best_goal_dist_ = execution_goal_dist; last_progress_time_ = ros::Time::now();
+        double progress_distance=execution_goal_dist;
+        double route_remaining=0.0;
+        if(active_trajectory_reaches_goal_ &&
+           routeRemainingMotion(start,last_path_,route_remaining)) {
+            progress_distance=route_remaining;
+        }
+        if(progress_distance < best_progress_distance_ - progress_epsilon_) {
+            best_progress_distance_ = progress_distance; last_progress_time_ = ros::Time::now();
         }
 
         // Compute this before any path reuse. Otherwise a latched terminal route returns
         // early forever and silently disables the independent no-progress recovery gate.
-        const bool no_progress = execution_goal_dist > goal_tolerance_ &&
+        const bool no_progress = progress_distance > goal_tolerance_ &&
             (ros::Time::now() - last_progress_time_).toSec() > no_progress_timeout_;
 
-        // A snapped endpoint is a safety decision made against an invalid/occluded operator
-        // goal. Re-selecting it on every rolling map made the endpoint jump between several
-        // boundary cells and steered the rover into the conservative obstacle band. Keep a
-        // snapped route from the moment it is first accepted, just as ordinary routes are
-        // kept inside the terminal lookahead. A newly revealed hazard still invalidates the
-        // retained sweep immediately; no-progress also retains authority.
-        const bool terminal_region = terminalTrajectoryReuseAllowed(
-            execution_goal_dist, terminal_replan_distance_, mode_ == PlannerMode::Nominal,
-            /*retained_path_valid=*/true);
+        // Keep the complete accepted goal route while it remains valid and makes measured
+        // progress. A rolling-map replan every ~0.5 s can alternate equally valid initial
+        // forward/reverse actions before either finishes. The current map already revalidated
+        // the active path above; no-progress and newly revealed hazards retain authority.
+        const bool active_goal_route=retained_route_.reusable() &&
+            active_trajectory_reaches_goal_ && !last_path_.poses.empty();
         const bool stable_route_candidate = stableTrajectoryReuseAllowed(
-            retained_route_.wasSnapped(), terminal_region, no_progress,
-            mode_ == PlannerMode::Nominal, /*retained_path_valid=*/true);
+            active_goal_route, no_progress,
+            mode_ == PlannerMode::Nominal,active_path_valid);
         if(stable_route_candidate) {
-            const bool retained_path_valid = retainedTrajectoryStillValid(start);
-            if(stableTrajectoryReuseAllowed(retained_route_.wasSnapped(), terminal_region,
-                                            no_progress,
+            if(stableTrajectoryReuseAllowed(active_goal_route,no_progress,
                                             mode_ == PlannerMode::Nominal,
-                                            retained_path_valid)) {
+                                            active_path_valid)) {
                 ROS_INFO_THROTTLE(1.0,
-                                  "plan: reusing stable %s trajectory (%zu poses, goal_dist=%.3fm)",
-                                  retained_route_.wasSnapped() ? "snapped" : "terminal",
-                                  retained_route_.path().poses.size(), execution_goal_dist);
+                                  "plan: reusing stable %s trajectory (%zu poses, "
+                                  "remaining_motion=%.3fm, endpoint_dist=%.3fm)",
+                                  retained_route_.wasSnapped() ? "snapped" : "goal",
+                                  retained_route_.path().poses.size(),progress_distance,
+                                  execution_goal_dist);
                 republishRetainedTrajectory();
                 return;
             }
@@ -955,7 +982,7 @@ private:
 
         // Two independent triggers, because the task book names both failure modes: repeated
         // planning failure near obstacles, and making no headway while still producing paths
-        // (an oscillating planner replans happily forever but never improves best_goal_dist_).
+        // (an oscillating planner replans happily forever but never improves route progress).
         if(mode_ == PlannerMode::Nominal) {
             const bool cooled_down = last_recovery_end_.isZero() ||
                 (ros::Time::now() - last_recovery_end_).toSec() > min_recovery_interval_;
@@ -1025,6 +1052,7 @@ private:
             publishPlanOutputs(path, vel,
                                /*reaches_goal=*/true, snapped_goal_used_,
                                /*retain_route=*/!in_recovery || recovery_confirmed);
+            if(!in_recovery || recovery_confirmed) resetRouteProgress(start,path);
             if(in_recovery) {
                 // Require repeated success before declaring recovery over, otherwise a
                 // marginal situation chatters between recovery and nominal every cycle.
@@ -1032,10 +1060,6 @@ private:
                     mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
                     recovery_escalation_ = 0; confirm_count_ = 0;
                     last_recovery_end_ = ros::Time::now();
-                    const auto& endpoint = path.poses.back().pose.position;
-                    best_goal_dist_ = std::hypot(endpoint.x-start.pose.position.x,
-                                                  endpoint.y-start.pose.position.y);
-                    last_progress_time_ = ros::Time::now();
                     ROS_INFO("plan: recovery confirmed; retained route replaced (%zu poses)",
                              path.poses.size());
                     ++recovery_successes_;
@@ -1960,7 +1984,7 @@ private:
     uint32_t goal_id_=0;
     uint64_t diagnostic_seq_=0;
     std::string last_status_;
-    double best_goal_dist_ = std::numeric_limits<double>::infinity();
+    double best_progress_distance_ = std::numeric_limits<double>::infinity();
     double last_plan_ms_ = 0.0;
     double last_cpu_ticks_ = -1.0;
     ros::Time last_cpu_time_;

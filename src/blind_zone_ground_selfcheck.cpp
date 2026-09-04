@@ -35,6 +35,13 @@ int main() {
           "self-mask boundary is included despite floating-point roundoff");
     check(flat.heightForUnmeasuredCell(2.5,-3.0,2.5,-3.0,1.2,0,nan,height) && near(height,.7),
           "sensor-offset mask still evaluates height on the base support plane");
+    check(flat.heightForUnmeasuredCell(3.8,-3.0,2,-3,2.5,0,nan,height) && near(height,.7),
+          "empty ground-return blind cell beyond the self-mask uses vehicle support");
+    check(flat.heightForUnmeasuredCell(3.8,-3.0,2,-3,2.5,0,.63,height) && near(height,.63),
+          "direct history still wins in the larger ground-return blind disc");
+    check(!flat.heightForUnmeasuredCell(3.8,-3.0,2,-3,2.5,1,nan,height) &&
+          !flat.heightForUnmeasuredCell(4.6,-3.0,2,-3,2.5,0,nan,height),
+          "current returns and cells outside the ground-return blind disc are unchanged");
 
     const double pitch=.2;
     const auto tilted=BlindZoneSupportPlane::fromPose(

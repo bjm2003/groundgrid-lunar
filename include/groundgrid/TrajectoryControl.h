@@ -1,8 +1,11 @@
 #pragma once
 
+#include "groundgrid/SkidSteerModel.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cmath>
+#include <limits>
 
 namespace groundgrid {
 
@@ -21,29 +24,55 @@ inline bool retainedTrajectoryFallbackAllowed(bool nominal_mode,
     return nominal_mode && retained_path_valid;
 }
 
-// Stable execution is preferred for a snapped goal from the first accepted route, and for
-// an ordinary route inside the terminal lookahead. A no-progress condition must still hand
-// control to recovery, and fresh-map validation remains mandatory in both cases.
-inline bool stableTrajectoryReuseAllowed(bool retained_was_snapped,
-                                         bool terminal_region,
+// Keep one accepted route long enough for its ordered forward/reverse/rotation phases to
+// finish. Replanning the same clear route every rolling-map frame can alternate its first
+// direction and reset the follower forever. Every fresh map still validates the complete
+// unexecuted sweep, and genuine no-progress still hands control to recovery.
+inline bool stableTrajectoryReuseAllowed(bool active_goal_route,
                                          bool no_progress,
                                          bool nominal_mode,
                                          bool retained_path_valid) {
-    return !no_progress && (retained_was_snapped || terminal_region) &&
+    return active_goal_route && !no_progress &&
            retainedTrajectoryFallbackAllowed(nominal_mode, retained_path_valid);
 }
 
-// Replanning remains mandatory outside the terminal region, in recovery, or whenever the
-// retained path fails validation on the newest map. Invalid distances conservatively deny
-// reuse. Kept pure so the safety gate can be exercised without ROS.
-inline bool terminalTrajectoryReuseAllowed(double goal_distance,
-                                           double terminal_replan_distance,
-                                           bool nominal_mode,
-                                           bool retained_path_valid) {
-    return std::isfinite(goal_distance) && std::isfinite(terminal_replan_distance) &&
-           goal_distance >= 0.0 && terminal_replan_distance > 0.0 &&
-           retainedTrajectoryFallbackAllowed(nominal_mode, retained_path_valid) &&
-           goal_distance <= terminal_replan_distance;
+// Remaining route motion is the progress metric, rather than Euclidean goal distance.
+// A valid detour is allowed to move away from the goal, and an in-place rotation still
+// consumes corner motion. This is deliberately independent of ROS and map types.
+template<typename PoseAt>
+inline bool remainingTrajectoryMotion(const Pose2D& rover,
+                                      std::size_t pose_count,
+                                      double yaw_radius,
+                                      PoseAt pose_at,
+                                      double& remaining,
+                                      std::size_t& nearest) {
+    remaining = std::numeric_limits<double>::infinity();
+    nearest = 0;
+    if(pose_count == 0 || !std::isfinite(rover.x) || !std::isfinite(rover.y) ||
+       !std::isfinite(rover.yaw) || !std::isfinite(yaw_radius) || yaw_radius < 0.0) {
+        return false;
+    }
+    const auto motion = [yaw_radius](const Pose2D& a,const Pose2D& b) {
+        return std::hypot(b.x-a.x,b.y-a.y) +
+               yaw_radius*std::abs(SkidSteerModel::wrap(b.yaw-a.yaw));
+    };
+    double nearest_motion = std::numeric_limits<double>::infinity();
+    for(std::size_t i=0; i<pose_count; ++i) {
+        const Pose2D p=pose_at(i);
+        if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.yaw)) return false;
+        const double d=motion(rover,p);
+        if(d<nearest_motion) { nearest_motion=d; nearest=i; }
+    }
+    double value=nearest_motion;
+    Pose2D previous=pose_at(nearest);
+    for(std::size_t i=nearest+1; i<pose_count; ++i) {
+        const Pose2D current=pose_at(i);
+        value+=motion(previous,current);
+        previous=current;
+    }
+    if(!std::isfinite(value)) return false;
+    remaining=value;
+    return true;
 }
 
 // Once the follower has acquired the actual endpoint of a retained trajectory, the planner

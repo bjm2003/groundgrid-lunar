@@ -613,6 +613,21 @@ state_lattice_planner:
 
 这些值必须根据真实车辆外廓、质心、轮距、轴距、稳定裕量和轮地附着能力重新标定。不要直接把演示参数用于真实车辆。
 
+雷达近场参数也必须按安装高度、最低束角度和车体外廓成组标定：
+
+```yaml
+groundgrid:
+  min_point_distance: 1.2
+  ground_support_radius: 2.5
+lunar_traversability:
+  sensor_blind_radius: 2.5
+```
+
+`min_point_distance` 只排除可能属于车体的回波；`ground_support_radius` 为没有直接
+地面回波、也没有历史直接测量的格子提供采集时刻车体支撑平面；下游
+`sensor_blind_radius` 才定义已知区域例外。当前有效回波和历史直接危险始终优先，
+三者不能只改一个。演示值不代表真实雷达的标定结果。
+
 地形判定参数位于：
 
 ```yaml

@@ -31,7 +31,13 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 
 ## Safety and algorithm invariants
 
-- Keep `min_point_distance < sensor_blind_radius`. The current lunar values are 1.2 m and 2.5 m. Changing only one can mark an unseen near-field obstacle region as safe.
+- Keep `min_point_distance < ground_support_radius == sensor_blind_radius`. The current
+  lunar values are 1.2 m, 2.5 m and 2.5 m. `min_point_distance` rejects possible self
+  returns; `ground_support_radius` anchors otherwise-empty ground across the LiDAR's direct
+  ground-return blind disc; `sensor_blind_radius` defines the matching known-terrain
+  exception downstream. Current usable returns and direct historical hazards must always
+  take priority over support-plane fill. Changing only one can create either false slopes
+  or a near-field region that is marked safe without corresponding terrain support.
 - Treat the rover as its rectangular footprint for clearance and collision metrics; do not replace it with a circumscribed circle.
 - Enumerate every grid square touched by the oriented footprint; do not substitute a
   rotated point lattice. On one map, increasing clearance must include all cells from

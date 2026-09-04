@@ -149,7 +149,11 @@ New dynamic-reconfigure parameters (see `cfg/GroundGrid.cfg`):
 `slope_enable`, `height_correction_enable`, `height_correction_iterations`,
 `height_correction_confidence_blend`, `slope_aware_tolerance_enable`,
 `slope_aware_tolerance_factor`, `slope_max_traversable_deg`,
-`slope_save_raster`.
+`slope_save_raster`, `min_point_distance` and `ground_support_radius`. The last
+two have different roles: the first excludes possible vehicle self-returns;
+the second anchors otherwise-empty terrain in the LiDAR ground-return blind
+disc. A current usable return or direct historical measurement is never
+overwritten by that support fill.
 
 ## Saving the slope raster to disk
 

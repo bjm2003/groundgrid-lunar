@@ -17,10 +17,10 @@ using groundgrid::inPlaceRotationCompleted;
 using groundgrid::missionGoalReached;
 using groundgrid::requiresInPlaceRotationTracking;
 using groundgrid::requiresTerminalWaypointTracking;
+using groundgrid::remainingTrajectoryMotion;
 using groundgrid::retainedTrajectoryFallbackAllowed;
 using groundgrid::selectTrajectoryCommandIndex;
 using groundgrid::stableTrajectoryReuseAllowed;
-using groundgrid::terminalTrajectoryReuseAllowed;
 using groundgrid::trajectoryEndpointReached;
 
 namespace {
@@ -170,16 +170,24 @@ int main() {
               "distant pose without translation is rejected");
     }
 
-    // 10) Terminal trajectory locking is allowed only for a fresh, valid nominal remainder.
+    // 10) Progress follows remaining checked motion, including detours and rotations.
     {
-        check(terminalTrajectoryReuseAllowed(0.6, 0.8, true, true),
-              "valid terminal trajectory can be retained");
-        check(!terminalTrajectoryReuseAllowed(0.9, 0.8, true, true) &&
-              !terminalTrajectoryReuseAllowed(0.6, 0.8, false, true) &&
-              !terminalTrajectoryReuseAllowed(0.6, 0.8, true, false),
-              "terminal reuse never bypasses replanning or recovery safety gates");
-        check(!terminalTrajectoryReuseAllowed(NAN, 0.8, true, true),
-              "terminal reuse rejects non-finite input");
+        const double pi=std::acos(-1.0);
+        const std::vector<Pose2D> detour{{0,0,0},{0,1,pi/2},{1,1,0},{1,0,-pi/2}};
+        const auto at=[&detour](std::size_t i) { return detour[i]; };
+        double start_remaining=0.0, later_remaining=0.0;
+        std::size_t nearest=99;
+        check(remainingTrajectoryMotion(detour.front(),detour.size(),1.0,at,
+                                        start_remaining,nearest) && nearest==0 &&
+              remainingTrajectoryMotion(detour[1],detour.size(),1.0,at,
+                                        later_remaining,nearest) && nearest==1 &&
+              later_remaining<start_remaining,
+              "route progress decreases while a valid detour moves away from its goal");
+        check(!remainingTrajectoryMotion({NAN,0,0},detour.size(),1.0,at,
+                                         later_remaining,nearest) &&
+              !remainingTrajectoryMotion(detour.front(),0,1.0,at,
+                                         later_remaining,nearest),
+              "remaining route motion rejects invalid input");
     }
 
     // 11) A transient search failure may keep a revalidated nominal route, never an unsafe
@@ -192,15 +200,15 @@ int main() {
               "retained fallback never bypasses recovery or map validation");
     }
 
-    // 12) Snapped routes remain stable before the terminal region, but neither snapped nor
-    // terminal reuse may hide no-progress, recovery ownership, or a failed map check.
+    // 12) Any active goal route remains stable, but reuse cannot hide no-progress,
+    // recovery ownership, or a failed fresh-map check.
     {
-        check(stableTrajectoryReuseAllowed(true, false, false, true, true) &&
-              stableTrajectoryReuseAllowed(false, true, false, true, true),
-              "snapped and terminal routes remain stable while making progress");
-        check(!stableTrajectoryReuseAllowed(true, false, true, true, true) &&
-              !stableTrajectoryReuseAllowed(true, false, false, false, true) &&
-              !stableTrajectoryReuseAllowed(true, false, false, true, false),
+        check(stableTrajectoryReuseAllowed(true, false, true, true),
+              "active goal route remains stable while making progress");
+        check(!stableTrajectoryReuseAllowed(false, false, true, true) &&
+              !stableTrajectoryReuseAllowed(true, true, true, true) &&
+              !stableTrajectoryReuseAllowed(true, false, false, true) &&
+              !stableTrajectoryReuseAllowed(true, false, true, false),
               "stable reuse preserves progress, recovery, and map safety gates");
     }
 

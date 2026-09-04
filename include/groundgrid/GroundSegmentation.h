@@ -44,6 +44,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <groundgrid/GroundGridConfig.h>
 #include <groundgrid/BlindZoneGround.h>
 #include <array>
+#include <cmath>
 #include <mutex>
 
 
@@ -97,7 +98,9 @@ protected:
     // velodyne 128: Average distance in rad on the unit circle of the appr. 220k points per round/128 Lasers
     const float verticalPointAngDist = 0.00174532925*2; // 0.2 degrees HDL-64e //0.00174532925; // 0.1 degrees //(2*M_PI)/(220000.0/128.0); // ca. 0.00365567:
     // Near-field exclusion radius, squared. Configurable via min_point_distance; the
-    // default reproduces the original hard-coded 12.0.
+    // default reproduces the original hard-coded 12.0. groundSupportRadius additionally
+    // covers the sensor's ground-return blind disc without excluding elevated returns.
     float minDistSquared = 12.0f;
+    float groundSupportRadius = std::sqrt(12.0f);
 };
 }
