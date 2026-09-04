@@ -1164,19 +1164,25 @@ private:
         const auto layer=[&](const char* name) {
             return indexed && map_.exists(name) ? double(map_.at(name,index)) : nan;
         };
-        char message[1024];
+        char message[2048];
         std::snprintf(message,sizeof(message),
                           "footprint_reject goal_id=%u context=%s reason=%s margin=%.3f "
                           "pose=(%.3f,%.3f,%.3f) sample=(%.3f,%.3f) cell=(%.3f,%.3f) "
                           "terrain_cost=%.3f slope_x=%.4f slope_y=%.4f slope=%.3f "
                           "step_height=%.3f obstacle_height=%.3f obstacle_confidence=%.3f "
-                          "roughness=%.3f map_stamp=%.6f",
+                          "roughness=%.3f ground=%.3f ground_corrected=%.3f "
+                          "elevation_raw=%.3f observed=%.3f observation_age=%.3f "
+                          "ground_confidence=%.3f points_raw=%.3f points_used=%.3f "
+                          "map_stamp=%.6f",
                           goal_id_,context,rejection.reason,rejected_margin,
                           pose.x,pose.y,pose.yaw,
                           rejection.sample_x,rejection.sample_y,cell.x(),cell.y(),
                           layer("terrain_cost"),layer("slope_x"),layer("slope_y"),layer("slope"),
                           layer("step_height"),layer("obstacle_height"),layer("obstacle_confidence"),
-                          layer("roughness"),map_stamp_.toSec());
+                          layer("roughness"),layer("ground"),layer("ground_corrected"),
+                          layer("elevation_raw"),layer("observed"),layer("observation_age"),
+                          layer("groundpatch"),layer("pointsRaw"),layer("points"),
+                          map_stamp_.toSec());
         if(force) { ROS_WARN("%s",message); }
         else { ROS_WARN_THROTTLE(1.0,"%s",message); }
     }

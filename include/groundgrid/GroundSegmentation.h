@@ -42,6 +42,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Config
 #include <groundgrid/GroundGridConfig.h>
+#include <groundgrid/BlindZoneGround.h>
 #include <array>
 #include <mutex>
 
@@ -60,8 +61,13 @@ class GroundSegmentation {
     // used for parallel execution
     void detect_ground_patches(grid_map::GridMap &map, unsigned short section) const;
     template<int S> void detect_ground_patch(grid_map::GridMap &map, size_t i, size_t j) const;
-    void spiral_ground_interpolation(grid_map::GridMap &map, const geometry_msgs::TransformStamped &toBase) const;
-    void interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y) const;
+    void spiral_ground_interpolation(grid_map::GridMap &map,
+                                     const geometry_msgs::TransformStamped &toBase,
+                                     const PCLPoint& cloudOrigin) const;
+    void interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y,
+                          const BlindZoneSupportPlane& support,
+                          double mask_x, double mask_y,
+                          bool may_be_in_support_mask) const;
 
     // ------------------------------------------------------------------
     // Slope-aware extensions (TS-SatMVSNet inspired, arXiv:2501.01049)

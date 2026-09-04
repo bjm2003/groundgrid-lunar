@@ -29,6 +29,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <thread>
 #include <unordered_map>
@@ -134,7 +135,9 @@ pcl::PointCloud<GroundSegmentation::PCLPoint>::Ptr GroundSegmentation::filter_cl
         if(covered){
             map.at("observed", idx) = 1.0f;
             map.at("observation_age", idx) = 0.0f;
-            if(map.at("pointsRaw", idx) > 0.0f)
+            // `pointsRaw` also counts returns rejected by the self-mask.  Only a point
+            // admitted to ground estimation has a matching finite minGroundHeight.
+            if(map.at("points", idx) > 0.0f)
                 map.at("elevation_raw", idx) = map.at("minGroundHeight", idx);
         } else if(map.at("observed", idx) > 0.5f && std::isfinite(map.at("observation_age", idx))){
             map.at("observation_age", idx) += static_cast<float>(dt);
@@ -163,7 +166,7 @@ pcl::PointCloud<GroundSegmentation::PCLPoint>::Ptr GroundSegmentation::filter_cl
     ++time_vals;
 
     start = std::chrono::steady_clock::now();
-    spiral_ground_interpolation(map, mapToBase);
+    spiral_ground_interpolation(map, mapToBase, cloudOrigin);
     end = std::chrono::steady_clock::now();
     ROS_DEBUG_STREAM("ground interpolation took " << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count() << "ms");
 
@@ -451,20 +454,49 @@ template <int S> void GroundSegmentation::detect_ground_patch(grid_map::GridMap&
 }
 
 
-void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, const geometry_msgs::TransformStamped &toBase) const
+void GroundSegmentation::spiral_ground_interpolation(
+    grid_map::GridMap &map, const geometry_msgs::TransformStamped &toBase,
+    const PCLPoint& cloudOrigin) const
 {
     static grid_map::Matrix& ggl = map["ground"];
     static grid_map::Matrix& gvl = map["groundpatch"];
     const auto& map_size = map.getSize();
     const auto& center_idx = map_size(0)/2-1;
+    const auto& t=toBase.transform.translation;
+    const auto& q=toBase.transform.rotation;
+    const BlindZoneSupportPlane support=BlindZoneSupportPlane::fromPose(
+        t.x,t.y,t.z,q.x,q.y,q.z,q.w);
+    const int support_cells=static_cast<int>(std::ceil(
+        std::sqrt(static_cast<double>(minDistSquared))/map.getResolution()))+1;
 
-    gvl(center_idx,center_idx) = 1.0f;
-    geometry_msgs::PointStamped ps;
-    ps.header.frame_id = "base_link";
-    tf2::doTransform(ps,ps,toBase);
-
-    // Set center to current vehicle height
-    ggl(center_idx,center_idx) = ps.point.z;
+    // Preserve GroundGrid's original high-confidence seed, but put it under the exact
+    // capture-time base pose instead of assuming a particular matrix-centre convention.
+    grid_map::Index base_index;
+    const bool have_base_index=support.valid() &&
+        map.getIndex(grid_map::Position(support.x(),support.y()),base_index);
+    if(have_base_index) {
+        gvl(base_index(0),base_index(1)) = 1.0f;
+        ggl(base_index(0),base_index(1)) = static_cast<float>(support.z());
+    } else {
+        gvl(center_idx,center_idx) = 1.0f;
+        geometry_msgs::PointStamped ps;
+        ps.header.frame_id = "base_link";
+        tf2::doTransform(ps,ps,toBase);
+        ggl(center_idx,center_idx) = ps.point.z;
+    }
+    grid_map::Index mask_index;
+    const bool have_mask_index=support.valid() &&
+        map.getIndex(grid_map::Position(cloudOrigin.x,cloudOrigin.y),mask_index);
+    const auto interpolate=[&](int x,int y) {
+        // Avoid a world-coordinate lookup for virtually every cell in the 60 m map.
+        // The +1-cell box is only a cheap prefilter; the helper still applies the exact
+        // metric-circle test before changing a height.
+        const bool near_support=have_mask_index &&
+            std::abs(x-mask_index(0))<=support_cells &&
+            std::abs(y-mask_index(1))<=support_cells;
+        interpolate_cell(map,static_cast<size_t>(x),static_cast<size_t>(y),
+                         support,cloudOrigin.x,cloudOrigin.y,near_support);
+    };
 
     for(int i=center_idx-1; i>=1; --i){
         // rectangle_pos = x,y position of rectangle top left corner
@@ -479,7 +511,7 @@ void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, con
                 const int x = side%2 ? pos : rectangle_pos;
                 const int y = side%2 ? rectangle_pos : pos;
 
-                interpolate_cell(map, x, y);
+                interpolate(x,y);
             }
         }
 
@@ -490,7 +522,7 @@ void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, con
                 int x = side%2 ? pos : rectangle_pos;
                 int y = side%2 ? rectangle_pos : pos;
 
-                interpolate_cell(map, x, y);
+                interpolate(x,y);
             }
         }
     }
@@ -498,7 +530,10 @@ void GroundSegmentation::spiral_ground_interpolation(grid_map::GridMap &map, con
 
 
 
-void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y) const
+void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y,
+                                           const BlindZoneSupportPlane& support,
+                                           double mask_x, double mask_y,
+                                           bool may_be_in_support_mask) const
 {
     static const auto& center_idx = map.getSize()(0)/2-1;
     static const size_t blocksize = 3;
@@ -506,6 +541,24 @@ void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x
     static grid_map::Matrix& gvl = map["groundpatch"];
     // "ground" contains the ground height values
     static grid_map::Matrix& ggl = map["ground"];
+    static const grid_map::Matrix& gpl = map["points"];
+    static const grid_map::Matrix& raw = map["elevation_raw"];
+
+    // No usable ground return can exist inside min_point_distance: insert_cloud rejects
+    // it as a possible self-return.  Re-averaging those cells every frame lets an adjacent
+    // boulder's high ground estimate diffuse under the physical body.  Preserve direct
+    // historical height where it exists; otherwise use the rover's capture-time support
+    // plane.  Current measurements and every cell outside the mask keep the original path.
+    grid_map::Position position;
+    double support_height=0.0;
+    if(may_be_in_support_mask &&
+       map.getPosition(grid_map::Index(static_cast<int>(x),static_cast<int>(y)),position) &&
+       support.heightForUnmeasuredCell(position.x(),position.y(),
+           mask_x,mask_y,std::sqrt(static_cast<double>(minDistSquared)),
+           gpl(x,y),raw(x,y),support_height)) {
+        ggl(x,y)=static_cast<float>(support_height);
+        return;
+    }
     const auto& gvlblock = gvl.block<blocksize,blocksize>(x-blocksize/2,y-blocksize/2);
 
     float& height = ggl(x,y);

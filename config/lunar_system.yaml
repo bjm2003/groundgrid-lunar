@@ -14,7 +14,11 @@ groundgrid:
   # patch is ever detected, and `maxGroundHeight` stays at lowest() so obstacle_height
   # computes as 0 and obstacle_confidence decays away -- the rover drives into rocks it
   # measured perfectly well a second earlier. 1.2 m is the body half-diagonal (1.17 m),
-  # i.e. the radius inside which a return could only be the vehicle itself.
+  # i.e. the radius inside which a return could only be the vehicle itself. Cells in this
+  # self-mask with no usable return retain direct historical height, or fall back to the
+  # capture-time base support plane when never measured; this prevents repeated interpolation
+  # from diffusing a nearby boulder underneath the rover. Terrain outside the mask and every
+  # usable measured cell retain the original estimator.
   min_point_distance: 1.2
   slope_enable: true
   height_correction_enable: true
