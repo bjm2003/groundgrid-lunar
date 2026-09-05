@@ -289,4 +289,40 @@ private:
     double start_=0, last_progress_=0, last_check_=0, deadline_=0, timeout_=0, epsilon_=0, best_=0;
 };
 
+// Restoring clearance permits one bounded retry of the goal, not another full
+// Rotate/BackOut cycle. The caller opens this window only after the retreat's exact stop
+// acknowledgement and a fresh pose; waiting for that acknowledgement spends no search
+// budget. A publication, failed search or duplicate request cannot extend the deadline.
+// Clear only when the goal/recovery episode ends, never on a failed search or publication.
+class PostBackoutReplanWindow {
+public:
+    void clear() { *this=PostBackoutReplanWindow{}; }
+    void request() { pending_=true; }
+    bool pending() const { return pending_; }
+    bool started() const { return started_; }
+
+    bool allow(double now,double duration) {
+        if(!pending_ || exhausted_) return false;
+        if(!std::isfinite(now) || !std::isfinite(duration) || duration<=0.0) {
+            exhausted_=true;
+            return false;
+        }
+        if(!started_) {
+            deadline_=now+duration;
+            last_check_=now;
+            started_=true;
+        }
+        if(!std::isfinite(deadline_) || now<last_check_ || now>deadline_) {
+            exhausted_=true;
+            return false;
+        }
+        last_check_=now;
+        return true;
+    }
+
+private:
+    bool pending_=false, started_=false, exhausted_=false;
+    double deadline_=0.0, last_check_=0.0;
+};
+
 } // namespace groundgrid

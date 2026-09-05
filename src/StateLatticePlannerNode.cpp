@@ -336,6 +336,7 @@ private:
         last_progress_time_ = ros::Time::now();
         retained_route_.clear();
         active_backout_.clear(); pending_backout_.clear();
+        post_backout_replan_.clear();
         active_trajectory_reaches_goal_ = false;
         active_trajectory_was_snapped_ = false;
         last_path_.poses.clear();
@@ -730,8 +731,10 @@ private:
         ROS_WARN("backout_execution goal_id=%u result=%s reason=%s progress=%.3f length=%.3f actual_motion=%.3f",
                  goal_id_,completed ? "clearance_restored" : "stopped",reason,
                  active_backout_.progress(),active_backout_.length(),active_backout_.actualMotion());
-        // Completion is only permission to retry nominal planning, never mission success
-        // or recovery confirmation. Failed retreat advances to Abort after a safe stop.
+        // Completion permits one bounded Relax retry, never a new Rotate/BackOut cycle.
+        // The retry clock starts only after the stop acknowledgement and a fresh pose.
+        // Failed retreat advances to Abort after the same safe stop.
+        if(completed) post_backout_replan_.request();
         recovery_escalation_=completed ? 0 : 3;
         action_=completed ? RecoveryAction::Relax : RecoveryAction::Abort;
         confirm_count_=0;
@@ -897,6 +900,7 @@ private:
                 consecutive_failures_ = 0;
                 recovery_escalation_ = 0;
                 confirm_count_ = 0;
+                post_backout_replan_.clear();
                 best_progress_distance_ = requested_goal_dist;
                 last_progress_time_ = ros::Time::now();
                 retained_route_.clear();
@@ -988,7 +992,20 @@ private:
                 (ros::Time::now() - last_recovery_end_).toSec() > min_recovery_interval_;
             if((consecutive_failures_ >= recovery_fail_threshold_ || no_progress) && cooled_down) {
                 mode_ = PlannerMode::Recovery; recovery_escalation_ = 0; confirm_count_ = 0;
+                post_backout_replan_.clear();
                 recovery_step_start_ = ros::Time::now(); ++recovery_events_;
+            }
+        } else if(post_backout_replan_.pending()) {
+            const bool already_started=post_backout_replan_.started();
+            if(post_backout_replan_.allow(ros::Time::now().toSec(),recovery_step_timeout_)) {
+                recovery_escalation_=0;
+                if(!already_started) ROS_INFO("post_backout_replan goal_id=%u result=started budget=%.3fs",
+                                              goal_id_,recovery_step_timeout_);
+            } else {
+                if(recovery_escalation_!=3) ROS_WARN("post_backout_replan goal_id=%u result=exhausted; "
+                                                    "no confirmed goal route, advancing to Abort",goal_id_);
+                recovery_escalation_=3;
+                confirm_count_=0;
             }
         } else if((ros::Time::now() - recovery_step_start_).toSec() > recovery_step_timeout_) {
             ++recovery_escalation_; confirm_count_ = 0; recovery_step_start_ = ros::Time::now();
@@ -1059,6 +1076,7 @@ private:
                 if(recovery_confirmed) {
                     mode_ = PlannerMode::Nominal; action_ = RecoveryAction::None;
                     recovery_escalation_ = 0; confirm_count_ = 0;
+                    post_backout_replan_.clear();
                     last_recovery_end_ = ros::Time::now();
                     ROS_INFO("plan: recovery confirmed; retained route replaced (%zu poses)",
                              path.poses.size());
@@ -1996,6 +2014,7 @@ private:
     bool history_discontinuous_=false;
     BoundedBackout active_backout_, pending_backout_;
     BackoutExecutionLease backout_lease_;
+    PostBackoutReplanWindow post_backout_replan_;
     std_msgs::Float32MultiArray backout_profile_;
     ros::Time active_trajectory_map_stamp_;
     std::string last_fail_reason_;

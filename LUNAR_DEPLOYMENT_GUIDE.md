@@ -343,6 +343,12 @@ BackOut 的 1 m 预算按平移距离加半对角线乘转角计算，包含转�
 发布速度曲线估计时长加原无进展门槛，不能重发续期。失败后经停车确认进入 Abort，不无限生成新回退。
 新目标仍清理旧任务缓存/活动回退并等待旧 goal_id 的停车确认，但保留独立观测历史。
 
+回退成功也必须有退出边界：收到该回退的精确停车确认及更新后的 TF 后，仅保留一次
+`recovery_step_timeout=2.0 s` 的 Relax 重试窗口，满足原连续两次目标规划成功条件才
+确认恢复。窗口耗尽则进入 Abort；地图更新、失败搜索及重复回退完成消息均不能续期，
+也不能重新从 Rotate/BackOut 循环。`post_backout_replan result=started/exhausted`
+记录该窗口开始和耗尽；等待停车确认期间不会消耗这段规划时间。
+
 日志 `backout_execution result=started/clearance_restored/stopped` 和 `reason` 分别表明开始、
 实际余量恢复或安全撤回；`recovery_reject` 给出无法生成的原因。运行
 `rosrun groundgrid backout_recovery_selfcheck` 验证离线机制。这是有限频率的软件门控，

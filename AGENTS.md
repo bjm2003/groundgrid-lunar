@@ -60,6 +60,10 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   Execution completion additionally requires full clearance at the actual rover pose.
   New goals revoke retreat execution with the exact stop handshake but retain independent
   observed history. Recovery completion is not mission completion or recovery confirmation.
+  After a successful retreat, allow one final Relax window using `recovery_step_timeout`,
+  starting after the stop acknowledgement and fresh pose. Unless a goal route satisfies
+  the existing confirmation count in that window, advance to Abort; never restart the
+  Rotate/BackOut ladder merely because retreat clearance was restored.
 - Retreat history is local and bounded, not a persistent obstacle map. Discontinuous,
   wrongly framed, stale or invalid localisation must not create a synthetic connection.
   Software execution gates are sampled checks, not physical braking-distance guarantees.

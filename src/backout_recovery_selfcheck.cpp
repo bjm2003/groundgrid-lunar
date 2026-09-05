@@ -210,6 +210,60 @@ int main() {
                !barrier.canSearch(6000) && barrier.canSearch(6001),
                "next search waits for exact retreat stop acknowledgement and newer TF");
     }
+    {
+        PostBackoutReplanWindow retry;
+        expect(!retry.pending() && !retry.allow(10,2),
+               "ordinary recovery has no post-backout retry window");
+        retry.request();
+        ReplanStopBarrier barrier;
+        barrier.request(17,stamp(10));
+        expect(!barrier.canSearch(stamp(20)) && !retry.started(),
+               "completed retreat waits for exact stop without spending its retry budget");
+        expect(!barrier.observe("goal_id=16 trajectory_stamp_ns=10000000000 status=empty_trajectory",stamp(20)) &&
+               !retry.started(),"old-goal stop cannot start post-backout replanning");
+        expect(barrier.observe("goal_id=17 trajectory_stamp_ns=10000000000 status=empty_trajectory",stamp(20)) &&
+               !barrier.canSearch(stamp(20)) && barrier.canSearch(stamp(20.5)) && retry.allow(20.5,2),
+               "post-stop fresh pose starts a full existing two-second retry window");
+        retry.request();
+        expect(retry.allow(22,2) && retry.allow(22.5,2) && !retry.allow(22.5001,2),
+               "failed searches and duplicate completion requests cannot extend the final retry");
+        retry.request();
+        expect(retry.pending() && !retry.allow(23,200) && !retry.allow(21,2),
+               "exhausted retry remains exhausted despite a larger timeout or clock rollback");
+        retry.clear();
+        retry.request();
+        expect(retry.allow(30,2) && retry.allow(30.5,2),
+               "new goal or confirmed recovery permits a later independent recovery episode");
+        expect(!retry.allow(30.4,2) && !retry.allow(30.6,2),
+               "post-backout retry clock rollback latches exhaustion");
+        retry.clear(); retry.request();
+        expect(!retry.allow(nan,2) && !retry.allow(40,2),
+               "invalid retry time cannot grant a fresh window later");
+        retry.clear(); retry.request();
+        expect(!retry.allow(40,0),"nonpositive post-backout retry duration fails closed");
+
+        // Replay the first completed retreat from ce0908f goal 17. Its failed Relax
+        // searches formerly led to a second retreat at 1788615008.5236 and four retreats
+        // before the 35 s trial deadline. The same callback cadence must now exhaust the
+        // original two-second rung before that second manoeuvre can be selected.
+        retry.clear(); retry.request();
+        const double first=1788615004.019, second_backout=1788615008.5236;
+        double abort_at=0;
+        int attempts=0;
+        for(int i=0;i<70;++i) {
+            const double now=first+.5*i;
+            if(!retry.allow(now,2)) { abort_at=now; break; }
+            ++attempts;
+        }
+        expect(attempts>1 && abort_at>first && abort_at<second_backout &&
+               abort_at<1788614993.183283+35,
+               "logged unreachable-goal cadence exhausts retry before a second rotate/backout cycle");
+        retry.clear(); retry.request();
+        expect(retry.allow(50,2) && retry.allow(50.5,2),
+               "two consecutive valid goal plans can still confirm recovery inside the window");
+        retry.clear();
+        expect(!retry.pending(),"confirmed goal route leaves no expired retry attached to nominal tracking");
+    }
     std::printf("backout_recovery_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }

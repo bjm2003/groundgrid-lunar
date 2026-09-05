@@ -110,6 +110,9 @@ state_lattice_planner:
   no_progress_timeout: 6.0        # s without closing on the goal before entering recovery
   progress_epsilon: 0.10          # m of goal-distance improvement that counts as progress
   recovery_step_timeout: 2.0      # s per escalation rung before escalating
+  # Successful BackOut permits one final Relax window of this same duration after its
+  # stop acknowledgement and fresh pose. No confirmed goal route by then means Abort;
+  # restoring clearance cannot restart the Rotate/BackOut ladder indefinitely.
   recovery_confirm_count: 2       # consecutive successes needed to leave recovery
   min_recovery_interval: 3.0      # s of nominal operation required between recoveries
   # Escalation rungs that command motion. The rotate probe is deliberately smaller than a
