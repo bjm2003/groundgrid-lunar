@@ -728,6 +728,26 @@ public:
         return false;
     }
 
+    // A dynamics node is indexed by a lattice cell/bin but keeps its actual integrated
+    // pose. Grid-centre certificates cannot certify that different pose or be reused
+    // across competing arrivals at the same key. Check the physical endpoint directly.
+    bool snapPoseCandidate(const Pose2D& pose,const State& requested,
+                           double& penalty,double& distance) {
+        PlanningPosition r;
+        if(!core_map_.getPosition({requested.x,requested.y},r)) return false;
+        distance=std::hypot(pose.x-r.x(),pose.y-r.y());
+        const double heading=std::abs(wrap(pose.yaw-yawForBin(requested.t)));
+        if(distance>max_snap_distance_ || heading>goal_snap_heading_span_*(2.0*kPlannerPi/bins_))
+            return false;
+        float terrain;
+        ++result_.candidates_checked;
+        if(!footprintWithClearanceValid(pose.x,pose.y,pose.yaw,terrain,false,goal_snap_clearance_))
+            return false;
+        penalty=distance+goal_snap_heading_weight_*heading*primitive_length_
+                        +goal_snap_cost_weight_*(terrain/99.0);
+        return std::isfinite(penalty);
+    }
+
     float goalSetHeuristic(const State& state,const State& requested) const {
         PlanningPosition p,r;
         core_map_.getPosition({state.x,state.y},p); core_map_.getPosition({requested.x,requested.y},r);
@@ -815,7 +835,22 @@ public:
         std::vector<uint8_t> closed(count,0);
         std::priority_queue<QueueNode> open;
         const int sk=key(start,cols);
+        // Quantisation is an indexing/dominance decision, NOT a physical motion. Parents
+        // are closed before producing children and are never overwritten in dynamics
+        // mode, so each winning arrival's pose and parent chain remain consistent.
+        // Sparse storage avoids another full map-sized array of three doubles.
+        std::unordered_map<int,Pose2D> dynamics_poses;
+        std::unordered_map<int,std::size_t> dynamics_sample_counts;
+        if(use_dynamics) dynamics_poses.emplace(sk,Pose2D{sp.x(),sp.y(),yawForBin(start.t)});
         const auto estimate=[&](const State& s) {
+            if(use_dynamics) {
+                const auto& p=dynamics_poses.at(key(s,cols));
+                PlanningPosition target;core_map_.getPosition({goal.x,goal.y},target);
+                if(multi_goal) core_map_.getPosition({requested.x,requested.y},target);
+                const double angle=multi_goal ? 0.0 : std::abs(wrap(p.yaw-yawForBin(goal.t)));
+                return static_cast<float>(std::hypot(p.x-target.x(),p.y-target.y())+
+                    angle/(2.0*kPlannerPi/bins_)*primitive_length_*0.25);
+            }
             return multi_goal ? goalSetHeuristic(s,requested) : heuristic(s,goal);
         };
         g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*estimate(start),sk});
@@ -838,16 +873,23 @@ public:
             const State cur=stateFromKey(ck,cols);
             if(multi_goal) {
                 double penalty=0.0,distance=0.0;
-                if(snapCandidate(cur,requested,penalty,distance,&candidate_cache) && g[ck]+penalty<best_goal_score) {
+                const bool candidate=use_dynamics
+                    ? snapPoseCandidate(dynamics_poses.at(ck),requested,penalty,distance)
+                    : snapCandidate(cur,requested,penalty,distance,&candidate_cache);
+                if(candidate && g[ck]+penalty<best_goal_score) {
                     best_goal_score=g[ck]+penalty;
                     reached=ck; goal=cur; last_snap_dist_=distance;
                     PlanningPosition selected; core_map_.getPosition({cur.x,cur.y},selected);
-                    result_.selected_goal={selected.x(),selected.y(),yawForBin(cur.t)};
+                    result_.selected_goal=use_dynamics ? dynamics_poses.at(ck)
+                        : Pose2D{selected.x(),selected.y(),yawForBin(cur.t)};
                     result_.selected_goal_valid=true;
                     open.push({static_cast<float>(best_goal_score),-1});
                 }
             } else if(cur.t==goal.t) {
-                const float error = heuristic(cur,goal);
+                const float error = use_dynamics
+                    ? static_cast<float>(std::hypot(dynamics_poses.at(ck).x-gp.x(),
+                                                     dynamics_poses.at(ck).y-gp.y()))
+                    : heuristic(cur,goal);
                 // A tolerance hit is a valid fallback, but publishing the first such
                 // state makes the endpoint jump by several cells between replans. Near
                 // the goal that changed the first segment from forward to reverse on
@@ -865,46 +907,79 @@ public:
                                                         yawForBin(cur.t), endpoint_cost,
                                                         /*allow_body_unknown=*/false,
                                                         goal_snap_clearance_);
+                        if(use_dynamics) {
+                            double penalty=0.0,distance=0.0;
+                            endpoint_safe=endpoint_safe && snapPoseCandidate(
+                                dynamics_poses.at(ck),requested,penalty,distance);
+                        }
                     }
                     if(endpoint_safe) {
                         reached=ck;
                         reached_error=error;
                     }
                 }
-                if(cur.x==goal.x && cur.y==goal.y) {
+                if(cur.x==goal.x && cur.y==goal.y && (!use_dynamics || reached==ck)) {
                     reached=ck;
                     reached_error=0.0f;
                     break;
                 }
             }
             if(use_dynamics) {
-                PlanningPosition cp;
-                if(!core_map_.getPosition(PlanningIndex(cur.x,cur.y),cp)) continue;
-                const double cyaw=yawForBin(cur.t);
+                const Pose2D cp=dynamics_poses.at(ck);
+                const double cyaw=cp.yaw;
                 const auto& prims=primitive_lib_.primitivesFor(cur.t);
                 for(size_t pi=0; pi<prims.size(); ++pi) {
-                    const MotionPrimitive& prim=prims[pi];
-                    float terrain; double ex,ey,eyaw;
-                    if(!primitiveValid(cp.x(),cp.y(),cyaw,prim,terrain,ex,ey,eyaw,
-                                       /*departure=*/ck==sk)) continue;
-                    PlanningIndex idx;
-                    if(!core_map_.getIndex(PlanningPosition(ex,ey),idx)) continue;
-                    State next{idx(0),idx(1),prim.end_bin};
-                    if(next.x==cur.x && next.y==cur.y && next.t==cur.t) continue;
-                    // The next primitive starts at the lattice centre/bin, not at the
-                    // previous primitive's unquantised last sample. Validate that join.
-                    PlanningPosition next_position;
-                    float join_cost;
-                    if(!core_map_.getPosition(idx,next_position) ||
-                       !sweptSegmentValid({ex,ey,eyaw},
-                            {next_position.x(),next_position.y(),yawForBin(next.t)},
-                            trajectoryClearance(), trajectoryClearance(), false, join_cost)) continue;
-                    if(ck==sk) ++root_successors;
-                    const int nk=key(next,cols); if(closed[nk]) continue;
-                    const float ec=static_cast<float>(prim.base_cost*(1.0+0.01*terrain));
-                    const float ng=g[ck]+ec;
-                    if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; parent_prim[nk]=static_cast<int>(pi);
-                        open.push({ng+static_cast<float>(heuristic_weight_)*estimate(next),nk}); }
+                    const MotionPrimitive& full_primitive=prims[pi];
+                    MotionPrimitive terminal_prefix;
+                    // A valid exact lattice goal may lie ON the primitive, before its
+                    // fixed horizon ends. Keep that integrated prefix as a terminal
+                    // edge; do not drive past it and spend the budget looking for a loop
+                    // back. No interpolated/fake sample or looser tolerance is introduced.
+                    if(!multi_goal) {
+                        const double c=std::cos(cyaw),s=std::sin(cyaw);
+                        for(std::size_t j=0;j+1<full_primitive.samples.size();++j) {
+                            // Two translating samples leave a usable velocity between
+                            // stop boundaries; a one-sample translation would be all zero
+                            // after the acceleration envelope (e.g. after a rotation).
+                            if(j==0 && full_primitive.direction!=0) continue;
+                            const auto& smp=full_primitive.samples[j];PlanningIndex cell;
+                            const double x=cp.x+c*smp.x-s*smp.y,y=cp.y+s*smp.x+c*smp.y;
+                            if(core_map_.getIndex({x,y},cell) && cell.a==goal.x && cell.b==goal.y &&
+                               binForYaw(cyaw+smp.yaw)==goal.t) {
+                                terminal_prefix=full_primitive;
+                                terminal_prefix.samples.resize(j+1);
+                                terminal_prefix.v_profile.resize(j+1);
+                                terminal_prefix.w_profile.resize(j+1);
+                                terminal_prefix.base_cost*=double(j+1)/full_primitive.samples.size();
+                                break;
+                            }
+                        }
+                    }
+                    // Keep the full edge as well: an unsafe truncated endpoint must not
+                    // remove a safe through-route from the shared search frontier.
+                    const MotionPrimitive* options[2]={&terminal_prefix,&full_primitive};
+                    for(const auto* option:options) {
+                        const MotionPrimitive& prim=*option;
+                        if(prim.samples.empty()) continue;
+                        float terrain; double ex,ey,eyaw;
+                        if(!primitiveValid(cp.x,cp.y,cyaw,prim,terrain,ex,ey,eyaw,
+                                           /*departure=*/ck==sk)) continue;
+                        PlanningIndex idx;
+                        if(!core_map_.getIndex(PlanningPosition(ex,ey),idx)) continue;
+                        State next{idx(0),idx(1),binForYaw(eyaw)};
+                        if(next.x==cur.x && next.y==cur.y && next.t==cur.t) continue;
+                        // Start the next primitive at this exact checked endpoint. Jumping
+                        // back to a lattice centre creates an uncommanded translation before
+                        // a v=0 rotation, and the exported shortcut was not the checked join.
+                        if(ck==sk) ++root_successors;
+                        const int nk=key(next,cols); if(closed[nk]) continue;
+                        const float ec=static_cast<float>(prim.base_cost*(1.0+0.01*terrain));
+                        const float ng=g[ck]+ec;
+                        if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; parent_prim[nk]=static_cast<int>(pi);
+                            dynamics_poses[nk]={ex,ey,eyaw};
+                            dynamics_sample_counts[nk]=prim.samples.size();
+                            open.push({ng+static_cast<float>(heuristic_weight_)*estimate(next),nk}); }
+                    }
                 }
             } else {
                 for(int direction : {-1,1}) for(int turn=-1;turn<=1;++turn) {
@@ -935,6 +1010,11 @@ public:
         const auto profile_begin=std::chrono::steady_clock::now();
 
         if(use_dynamics) {
+            result_.selected_goal=dynamics_poses.at(reached);
+            if(snapped_goal_used_) {
+                PlanningPosition request; core_map_.getPosition({requested.x,requested.y},request);
+                last_snap_dist_=std::hypot(result_.selected_goal.x-request.x(),result_.selected_goal.y-request.y());
+            }
             const SkidSteerModel nominal_model(sp_);
             std::vector<int> node_keys;
             for(int k=reached;k>=0;k=parent[k]) { node_keys.push_back(k); if(k==sk) break; }
@@ -949,18 +1029,19 @@ public:
             for(size_t e=1;e<node_keys.size();++e) {
                 const int childK=node_keys[e], parentK=node_keys[e-1];
                 const State ps=stateFromKey(parentK,cols);
-                PlanningPosition pp; core_map_.getPosition(PlanningIndex(ps.x,ps.y),pp);
-                const double pyaw=yawForBin(ps.t);
+                const Pose2D pp=dynamics_poses.at(parentK);
+                const double pyaw=pp.yaw;
                 const auto& prims=primitive_lib_.primitivesFor(ps.t);
                 const int pi=parent_prim[childK];
                 if(pi<0 || pi>=static_cast<int>(prims.size())) continue;
                 const MotionPrimitive& prim=prims[pi];
-                if(e==1) result_.departure_end_index=prim.samples.size();
+                const std::size_t sample_count=dynamics_sample_counts.at(childK);
+                if(e==1) result_.departure_end_index=sample_count;
                 const double c=std::cos(pyaw), s=std::sin(pyaw);
-                for(size_t i=0;i<prim.samples.size();++i) {
+                for(size_t i=0;i<sample_count;++i) {
                     const auto& smp=prim.samples[i];
-                    const double wx=pp.x()+c*smp.x - s*smp.y;
-                    const double wy=pp.y()+s*smp.x + c*smp.y;
+                    const double wx=pp.x+c*smp.x - s*smp.y;
+                    const double wy=pp.y+s*smp.x + c*smp.y;
                     const double wyaw=wrap(pyaw+smp.yaw);
                     Pose2D pose;
                     pose.x=wx; pose.y=wy;

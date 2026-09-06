@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include "groundgrid/LatticePlannerCore.h"
 #include "groundgrid/PlanningReplayAudit.h"
+#include "groundgrid/TrajectoryTracking.h"
 
 using namespace groundgrid;
 static void check(bool ok,const char* message) {
@@ -96,6 +97,53 @@ int main() {
         const auto dynamic_rotate=LatticePlannerCore(dynamics).planCore(dynamics.start,dynamics.goal,10000);
         verifyPath(dynamics,dynamic_rotate);
         check(dynamic_rotate.path_length<1e-6,"dynamics in-place rotation remains supported");
+        auto joined=dynamics;
+        std::vector<MotionPrimitive> straight_and_rotate;
+        for(int bin=0;bin<16;++bin) {
+            straight_and_rotate.push_back(joined.primitives.primitivesFor(bin).at(0));
+            straight_and_rotate.push_back(joined.primitives.primitivesFor(bin).at(14));
+        }
+        check(joined.primitives.restore(16,straight_and_rotate),"restricted dynamics fixture");
+        joined.goal={-1.875,-1.575,kPlannerPi/4};
+        const auto joined_result=LatticePlannerCore(joined).planCore(joined.start,joined.goal,1000);
+        verifyPath(joined,joined_result);
+        bool rotation_after_translation=false, seen_translation=false;
+        std::vector<TrackingSample> track;
+        for(std::size_t i=0;i<joined_result.path.poses.size();++i) {
+            const auto& pose=joined_result.path.poses[i];
+            const double v=joined_result.profile.data[2*i],w=joined_result.profile.data[2*i+1];
+            track.push_back({pose,v,w});
+            seen_translation |= std::abs(v)>1e-6;
+            if(i && std::abs(v)<1e-6 && std::abs(w)>1e-6) {
+                const auto& previous=joined_result.path.poses[i-1];
+                check(std::hypot(pose.x-previous.x,pose.y-previous.y)<1e-10,
+                      "zero-ICR rotation has no phantom grid-centre translation");
+                rotation_after_translation |= seen_translation;
+            }
+        }
+        check(rotation_after_translation,"fixture actually exercises a translation/rotation seam");
+        const auto& actual_end=joined_result.path.poses.back();
+        check(std::hypot(actual_end.x-joined_result.selected_goal.x,
+                         actual_end.y-joined_result.selected_goal.y)<1e-10 &&
+              std::abs(SkidSteerModel::wrap(actual_end.yaw-joined_result.selected_goal.yaw))<1e-10,
+              "dynamics selected endpoint is the actual exported pose");
+        TrajectoryTracking tracker;TrackingParams tracking;bool changed;
+        check(tracker.setTrajectory(track,changed),"continuous dynamics trajectory accepted");
+        Pose2D rover=joined.start;bool complete=false;
+        for(int tick=0;tick<500;++tick) {
+            if(tick%10==0) check(tracker.setTrajectory(track,changed) && !changed,
+                                 "continuous route republish retains phase progress");
+            const auto step=tracker.step(rover,tracking);
+            check(step.status!=TrackingStatus::Invalid,"continuous seam has a usable phase command");
+            if(step.status==TrackingStatus::GoalReached) { complete=true;break; }
+            rover=SkidSteerModel{}.integrate(rover,step.desired_v,step.desired_w,0.05);
+        }
+        check(complete,"production follower completes continuous dynamics seam within 25s");
+        auto prefix=dynamics;prefix.goal={-2.625,-1.575,0};
+        const auto prefix_result=LatticePlannerCore(prefix).planCore(prefix.start,prefix.goal,1000);
+        verifyPath(prefix,prefix_result);
+        check(prefix_result.path.poses.size()>2 && prefix_result.path.poses.size()<19 &&
+              !prefix_result.budget_exhausted,"exact goal on a primitive uses a checked nonzero prefix");
         // Reproduce the real dynamics failure: a slope cell is outside the body but
         // inside its first exported sample's clearance band. Ramping across all 18
         // integration samples used to approve a rotation that execution immediately
@@ -192,6 +240,15 @@ int main() {
         check(probe.poseToState(wall.goal,request) && probe.poseToState(reachable.selected_goal,near_side),"candidate indices");
         near_side.t=(request.t+8)%16;
         check(!probe.snapCandidate(near_side,request,penalty,distance),"candidate heading range is not relaxed");
+        PlanningIndex inside_cell,outside_cell;
+        check(wall.map.getIndex({-2.900,0.075},inside_cell) &&
+              wall.map.getIndex({-2.950,0.075},outside_cell) && inside_cell.a==outside_cell.a &&
+              inside_cell.b==outside_cell.b,"different integrated endpoints share one grid key");
+        check(probe.snapPoseCandidate({-2.900,0.075,0},request,penalty,distance) &&
+              !probe.snapPoseCandidate({-2.950,0.075,0},request,penalty,distance),
+              "continuous endpoint range uses exact pose, never a cached centre certificate");
+        check(!probe.snapPoseCandidate({-2.900,0.075,0.80},request,penalty,distance),
+              "continuous endpoint heading cannot exceed the existing snap span");
         auto tiny=wall; tiny.config.max_snap_distance_=0.15;
         const auto no_candidate=LatticePlannerCore(tiny).planCore(tiny.start,tiny.goal,100);
         check(!no_candidate.ok && !no_candidate.selected_goal_valid,"no valid endpoint is not a fake snap");

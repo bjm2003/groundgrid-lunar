@@ -52,6 +52,12 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   integration primitive is not permission to delay that existing execution requirement.
   If no compatible successor exists, report failure and let the bounded recovery ladder
   act; do not repeatedly publish a route that execution must immediately withdraw.
+- Dynamics successors start at the preceding primitive's actual integrated endpoint.
+  Cell/heading quantisation is for search indexing, not an extra physical motion back
+  to a grid centre. Reconstruct from the same stored poses and check snap bounds and
+  clearance at the actual exported endpoint; a cell-centre certificate cannot certify
+  another continuous arrival in that cell. Exact-goal primitive prefixes use existing
+  checked integration samples and the same shared budget; retain the full edge too.
 - The user-authorised BackOut exception may restore clearance over ONE bounded retreat
   built from actual stamped localisation history, never from an old planned route. Its
   cumulative corner-motion budget is `recovery_backout_distance` (currently 1 m); its
@@ -82,6 +88,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
   are compatibility and visualisation outputs, not control inputs.
 - A trajectory twist is desired effective body motion before slip compensation. Apply
   terrain scaling in the planner and `inverseCommand()` once in the follower.
+- A runtime tracking-phase fault stops execution without forgetting progress for that
+  geometry. Republishing the same retained route must not restart completed phases.
+  Empty/invalid replacements and new goals still revoke it; a different route resets it.
 - Mix unsaturated angular feedback with planned feed-forward before the common angular
   command limit. Pre-clipping feedback halves available correction at the 0.5 blend;
   raw diagnostic `feedback_w` may exceed the command limit, but output commands may not.

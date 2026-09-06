@@ -225,7 +225,11 @@ private:
                      step.phase_endpoint.x, step.phase_endpoint.y, step.phase_endpoint.yaw,
                      step.endpoint_distance, step.arrival_distance, step.nearest_distance);
             path_.poses.clear();
-            tracker_.clear();
+            // Stop execution, but remember phase progress for this geometry. A latched
+            // planner republish is not a new route: clearing here made it restart phase
+            // zero and drive back along already completed sections after a phase fault.
+            // Empty/invalid atomic replacements and new goals still clear the tracker;
+            // a genuinely different valid geometry resets it in setTrajectory().
             stop("invalid_trajectory");
             return;
         }

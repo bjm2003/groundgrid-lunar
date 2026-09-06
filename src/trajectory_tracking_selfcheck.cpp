@@ -390,6 +390,30 @@ int main() {
         check(old_rover.x>.45 && held && stopped_rover.x==0,
               "synthetic one-second search no longer permits half-metre travel on revoked path");
     }
+    {
+        // A logged dynamics join used to introduce a zero-command reverse phase.
+        // Runtime rejection must stop, but an identical re-publication must not reset
+        // the already completed forward phase and command the rover back to phase zero.
+        const std::vector<TrackingSample> broken{
+            sample(0,0,0),sample(.5,0,0,.5),sample(1,0,0),
+            sample(.94,.10,.04,0,.8),sample(.94,.10,.3,0,.8)};
+        TrajectoryTracking tracker;tracker.setTrajectory(broken,changed);
+        const Pose2D rover{.85,-.10,0};
+        const auto first=tracker.step(rover,p);
+        check(first.failure==TrackingFailure::MissingCommand && first.phase_begin==2,
+              "phantom translation fixture reaches the same missing-command phase");
+        check(tracker.setTrajectory(broken,changed) && !changed,
+              "republished rejected geometry retains its identity after stopping");
+        const auto repeated=tracker.step(rover,p);
+        check(repeated.status==TrackingStatus::Invalid && repeated.phase_begin==2 &&
+              repeated.desired_v==0 && repeated.desired_w==0,
+              "republish after phase fault cannot restart completed motion");
+        const std::vector<TrackingSample> replacement{
+            sample(.85,-.10,0),sample(1.35,-.10,0,.5),sample(1.85,-.10,0)};
+        check(tracker.setTrajectory(replacement,changed) && changed &&
+              tracker.step(rover,p).status==TrackingStatus::Tracking,
+              "genuinely new safe geometry can replace the stopped faulted route");
+    }
     std::printf("trajectory_tracking_selfcheck: %d failure(s)\n",failures);
     return failures ? 1 : 0;
 }

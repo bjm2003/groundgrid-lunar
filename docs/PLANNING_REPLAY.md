@@ -126,6 +126,10 @@ pipeline 断言 XML，勿用裸 TEST_RC 或“0 tests”替代真实测试通过
 外层命令均错误返回0，也不能将实际失败或空结果记为成功。
 
 df032de 已通过五参数辨识和三轮独立 reachable_cost / arcs / mixed / n_trials=3，
-详情见[三轮弧线记录](validation/2026-09-06-arcs-smoke.md)。当前只需同一代码的
-dynamics同规格一次，增加 --capture-inputs --debug-control；无需重复
---identify-first。两模式审核后统一决定默认启用及复核包测试，再进入五场景基线。
+详情见[三轮弧线记录](validation/2026-09-06-arcs-smoke.md)。后续动力学回归暴露
+起步门槛和基元接缝故障，尚未通过；当前需更新并构建修复版，再跑 dynamics
+同规格一次，增加 --capture-inputs --debug-control；无需重复 --identify-first。
+动力学搜索现在从实际积分终点续接，不能将量化格心视作额外可执行动作。
+吸附结果记录实际导出终点，精确目标可在已有积分采样点结束；参数和预算不变。
+见[连续接缝记录](validation/2026-09-07-dynamics-continuity.md)。两模式审核后统一
+决定默认启用及复核包测试，再进入五场景基线；旧提交通过不自动认证新提交。
