@@ -58,6 +58,19 @@ class ArchiveTest(unittest.TestCase):
         write_json(self.metrics, self.report)
         self.assertIn("metrics identity mismatch", " ".join(self.validate()))
 
+    def test_zero_or_invalid_pipeline_test_counts_fail(self):
+        xml = self.root / "test_results" / "rosunit-lunar_pipeline_test.xml"
+        for count in ("0", "1", "-2", "nan"):
+            with self.subTest(count=count):
+                xml.write_text('<testsuite tests="%s" errors="0" failures="0"/>' % count)
+                self.assertTrue(self.validate())
+
+    def test_failure_element_cannot_hide_behind_zero_failure_count(self):
+        xml = self.root / "test_results" / "rosunit-lunar_pipeline_test.xml"
+        xml.write_text('<testsuite tests="2" errors="0" failures="0">'
+                       '<testcase name="metrics"><failure>aborted</failure></testcase></testsuite>')
+        self.assertIn("failed assertions", " ".join(self.validate()))
+
     def test_primitive_fallback_detected_from_actual_attempt(self):
         self.report["trials"][0]["planning_attempts"][0]["primitive_mode"] = "dynamics"
         write_json(self.metrics, self.report)
@@ -126,7 +139,7 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             identification_result({})
 
-    def run_fake_suite(self, fail=False, interrupt=False):
+    def run_fake_suite(self, fail=False, interrupt=False, failed_xml=False):
         output = Path(self.temp.name) / "suite"
         repo = Path(self.temp.name) / "repo"
         repo.mkdir()
@@ -150,7 +163,7 @@ class ArchiveTest(unittest.TestCase):
             metrics = next(c.split(":=", 1)[1] for c in command if c.startswith("metrics_out:="))
             write_json(metrics, report)
             Path(env["ROS_TEST_RESULTS_DIR"], "rosunit-lunar_pipeline_test.xml").write_text(
-                '<testsuite tests="2" errors="0" failures="0"/>', encoding="utf-8")
+                '<testsuite tests="2" errors="0" failures="%d"/>' % int(failed_xml), encoding="utf-8")
             return 2 if fail else 0
 
         argv = ["runner", "--scenarios", "mixed", "--repeat", "2", "--out-dir", str(output)]
@@ -174,6 +187,17 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(suite["passed"])
         self.assertFalse(suite["formal_baseline"])
+
+    def test_failed_xml_overrides_false_success_return_codes(self):
+        rc, _, suite = self.run_fake_suite(failed_xml=True)
+        self.assertEqual(rc, 1)
+        self.assertFalse(suite["passed"])
+        self.assertEqual(len(suite["runs"]), 2)
+        for run in suite["runs"]:
+            self.assertEqual(run["rostest_rc"], 0)
+            self.assertEqual(run["results_rc"], 0)
+            self.assertFalse(run["passed"])
+            self.assertIn("failed assertions", " ".join(run["archive_errors"]))
 
     def test_interrupted_run_still_archived(self):
         rc, output, suite = self.run_fake_suite(interrupt=True)

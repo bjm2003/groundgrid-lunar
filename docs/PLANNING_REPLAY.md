@@ -111,3 +111,16 @@ export_safety_ok=false 会使对照归档失败。检查时间不混入搜索时
 确定性审核，旧策略输出逐值复现原记录。见
 [Ubuntu 重放记录](validation/2026-09-06-ubuntu-replay.md)。当前应推进包测试、
 辨识及显式 reachable_cost 闭环，不重新采集或重放；默认策略暂不改变。
+
+随后旧策略包测试复现 (8,-5) Abort，47 项 Python 测试已通过。详见
+[包测试记录及执行顺序调整](validation/2026-09-06-package-test.md)。下一步先用
+上述 --identify-first、--repeat 3、--snap-strategy reachable_cost 入口，增加
+--capture-inputs --debug-control 保留新策略失败现场；这不是重复旧输入采集。
+完整包测试全绿仍是后续交付条件。
+
+注意：若手动设置 CATKIN_TEST_RESULTS_DIR 到默认构建树以外，catkin test 的
+内置无参数 catkin_test_results 可能只汇总到0项而返回0。必须再显式指定真实
+XML 目录，并确认预期文件/测试数量齐全。批量脚本已经显式指定每轮目录并检查
+pipeline 断言 XML，勿用裸 TEST_RC 或“0 tests”替代真实测试通过。
+归档验证器还会独立检查 XML 失败计数/元素和 pipeline 至少2项测试；即使两个
+外层命令均错误返回0，也不能将实际失败或空结果记为成功。

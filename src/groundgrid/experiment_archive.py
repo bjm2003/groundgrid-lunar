@@ -35,8 +35,31 @@ def load_json(path):
         return json.load(stream)
 
 
+def validate_test_xml(path, minimum_tests=0):
+    """An exit code (or a parseable empty XML) is not an assertion verdict."""
+    path = Path(path)
+    try:
+        root = ET.parse(str(path)).getroot()
+        if root.tag not in ("testsuite", "testsuites"):
+            raise ValueError("unexpected root element")
+        suites = list(root.iter("testsuite"))
+        counts = [{key: int(suite.get(key, "0")) for key in ("tests", "errors", "failures")}
+                  for suite in suites]
+        if not suites or any(value < 0 for count in counts for value in count.values()):
+            raise ValueError("missing suite or negative counts")
+        errors = []
+        if sum(count["tests"] for count in counts) < minimum_tests:
+            errors.append("insufficient tests in XML: " + path.name)
+        if (any(count["errors"] or count["failures"] for count in counts)
+                or any(node.tag in ("failure", "error") for node in root.iter())):
+            errors.append("failed assertions in XML: " + path.name)
+        return errors
+    except (OSError, ET.ParseError, ValueError) as exc:
+        return ["invalid XML %s: %s" % (path.name, exc)]
+
+
 def validate_run(directory, run_id, commit, scenario, strategy, primitive_mode, capture):
-    """Return missing/inconsistent evidence separately from ROS assertion failures."""
+    """Check evidence and XML verdict independently of subprocess return codes."""
     root = Path(directory)
     errors = []
     report = None
@@ -73,10 +96,8 @@ def validate_run(directory, run_id, commit, scenario, strategy, primitive_mode, 
     if not list((root / "test_results").rglob("rosunit-lunar_pipeline_test.xml")):
         errors.append("missing lunar pipeline assertion XML (launcher XML alone is insufficient)")
     for path in xml_paths:
-        try:
-            ET.parse(str(path))
-        except ET.ParseError:
-            errors.append("invalid XML: %s" % path.name)
+        minimum = 2 if path.name == "rosunit-lunar_pipeline_test.xml" else 0
+        errors.extend(validate_test_xml(path, minimum_tests=minimum))
     if capture:
         try:
             snapshots = root / "snapshots"
