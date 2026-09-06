@@ -174,6 +174,7 @@ std::string planningResultJson(const PlanningInput& input,const PlanningResult& 
        <<",\"snap_strategy\":"<<quote(input.config.reachable_snap_ ? "reachable_cost":"legacy_nearest")
        <<",\"primitive_mode\":"<<quote(input.config.use_dynamics_primitives_ ? "dynamics":"arcs")
        <<",\"candidates_checked\":"<<r.candidates_checked
+       <<",\"candidate_cache_hits\":"<<r.candidate_cache_hits
        <<",\"departure_end_index\":"<<r.departure_end_index
        <<",\"budget_exhausted\":"<<(r.budget_exhausted ? "true":"false");
     for(const auto& item:std::initializer_list<std::pair<const char*,double>>{

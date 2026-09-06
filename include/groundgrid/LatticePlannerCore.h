@@ -8,6 +8,7 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include "groundgrid/PlanningGrid.h"
 #include "groundgrid/MotionPrimitiveLibrary.h"
 #include "groundgrid/SweptFootprint.h"
@@ -132,6 +133,7 @@ struct PlanningResult {
     double path_length=0.0, reverse_length=0.0, route_cost=0.0;
     int expanded=0, root_successors=0;
     int candidates_checked=0;
+    int candidate_cache_hits=0;
     std::size_t departure_end_index=0;
     bool budget_exhausted=false;
     PlannerPath path;
@@ -631,11 +633,14 @@ public:
         return false;
     }
 
-    // Implicit multi-goal set. Only a visited state inside the authorised geometry
-    // pays for a full endpoint check; a cheap geometric heuristic is never a safety
-    // certificate. Known body and inflated-band rules are unchanged.
+    struct CandidateCheck { bool valid=false; float terrain=0.0f; };
+    using CandidateCache=std::unordered_map<int,CandidateCheck>;
+
+    // The cache belongs to ONE planImpl call, so no map/start/clearance change can
+    // reuse an old certificate. Store only safety/terrain; request-dependent penalties
+    // are always recomputed. A cheap geometric heuristic is never a safety certificate.
     bool snapCandidate(const State& candidate,const State& requested,
-                       double& penalty,double& distance) {
+                       double& penalty,double& distance,CandidateCache* cache=nullptr) {
         int db=std::abs(candidate.t-requested.t); db=std::min(db,bins_-db);
         if(db>goal_snap_heading_span_) return false;
         PlanningPosition p,r;
@@ -643,13 +648,63 @@ public:
            !core_map_.getPosition({requested.x,requested.y},r)) return false;
         distance=(p-r).norm();
         if(distance>max_snap_distance_) return false;
-        ++result_.candidates_checked;
-        float cost;
-        if(!footprintWithClearanceValid(p.x(),p.y(),yawForBin(candidate.t),cost,false,
-                                       goal_snap_clearance_)) return false;
+        CandidateCheck evaluation;
+        const int candidate_key=key(candidate,core_map_.cols);
+        const auto cached=cache ? cache->find(candidate_key) : CandidateCache::iterator{};
+        if(cache && cached!=cache->end()) {
+            ++result_.candidate_cache_hits;
+            evaluation=cached->second;
+        } else {
+            ++result_.candidates_checked;
+            evaluation.valid=footprintWithClearanceValid(p.x(),p.y(),yawForBin(candidate.t),
+                                                        evaluation.terrain,false,goal_snap_clearance_);
+            if(cache) cache->emplace(candidate_key,evaluation);
+        }
+        if(!evaluation.valid) return false;
         penalty=distance+goal_snap_heading_weight_*db*(2.0*kPlannerPi/bins_)*primitive_length_
-                        +goal_snap_cost_weight_*(cost/99.0);
+                        +goal_snap_cost_weight_*(evaluation.terrain/99.0);
         return std::isfinite(penalty);
+    }
+
+    bool hasSnapCandidate(const State& requested,CandidateCache& cache,
+                          const std::chrono::steady_clock::time_point& begin) {
+        const int rows=core_map_.rows,cols=core_map_.cols;
+        const int ur=(requested.x-core_map_.start_row+rows)%rows;
+        const int uc=(requested.y-core_map_.start_col+cols)%cols;
+        const int max_ring=static_cast<int>(std::min(double(std::max(rows,cols)),
+                              std::ceil(max_snap_distance_/core_map_.resolution)));
+        // Existence witness only, not a chosen endpoint. Stop at the first safe pose;
+        // the later shared search can still choose ANY safe candidate, reachable or not
+        // from this witness's side. Exhausting an empty goal set avoids an entire futile
+        // A* budget. Enumeration uses logical cells, not rounded world-to-buffer steps.
+        for(int ring=0;ring<=max_ring;++ring) {
+            for(int dr=-ring;dr<=ring;++dr) for(int dc=-ring;dc<=ring;++dc) {
+                // Include enumeration overhead in the one shared clock, including cells
+                // outside a rectangular map. No second per-candidate time allowance.
+                if(expansion_limit_==0 &&
+                   std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()
+                       >max_planning_time_) {
+                    result_.budget_exhausted=true;
+                    return false;
+                }
+                if(std::max(std::abs(dr),std::abs(dc))!=ring ||
+                   ur+dr<0 || ur+dr>=rows || uc+dc<0 || uc+dc>=cols) continue;
+                for(int db=-goal_snap_heading_span_;db<=goal_snap_heading_span_;++db) {
+                    if(expansion_limit_==0 &&
+                       std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()
+                           >max_planning_time_) {
+                        result_.budget_exhausted=true;
+                        return false;
+                    }
+                    State candidate{(ur+dr+core_map_.start_row)%rows,
+                                    (uc+dc+core_map_.start_col)%cols,
+                                    (requested.t+db+bins_)%bins_};
+                    double penalty=0.0,distance=0.0;
+                    if(snapCandidate(candidate,requested,penalty,distance,&cache)) return true;
+                }
+            }
+        }
+        return false;
     }
 
     float goalSetHeuristic(const State& state,const State& requested) const {
@@ -705,10 +760,17 @@ public:
         const State requested=goal;
         const bool invalid_goal=!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy);
         const bool multi_goal=reachable_snap_ && invalid_goal;
+        CandidateCache candidate_cache;
         if(invalid_goal) result_.selected_goal_valid=false;
         if(multi_goal) {
             // The entire snapped route holds the same larger margin as legacy snapping.
             snapped_goal_used_=true;
+            if(!hasSnapCandidate(requested,candidate_cache,begin)) {
+                result_.snap_ms=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-begin).count();
+                last_fail_reason_=result_.budget_exhausted ? "snap_timeout" : "goal_invalid";
+                return false;
+            }
         } else if(invalid_goal) {
             State snapped; double snap_dist;
             if(!snapGoal(goal, max_snap_distance_, max_planning_time_*0.2, begin, snapped, snap_dist)) {
@@ -755,7 +817,7 @@ public:
             const State cur=stateFromKey(ck,cols);
             if(multi_goal) {
                 double penalty=0.0,distance=0.0;
-                if(snapCandidate(cur,requested,penalty,distance) && g[ck]+penalty<best_goal_score) {
+                if(snapCandidate(cur,requested,penalty,distance,&candidate_cache) && g[ck]+penalty<best_goal_score) {
                     best_goal_score=g[ck]+penalty;
                     reached=ck; goal=cur; last_snap_dist_=distance;
                     PlanningPosition selected; core_map_.getPosition({cur.x,cur.y},selected);

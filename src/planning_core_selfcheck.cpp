@@ -144,9 +144,23 @@ int main() {
         auto tiny=wall; tiny.config.max_snap_distance_=0.15;
         const auto no_candidate=LatticePlannerCore(tiny).planCore(tiny.start,tiny.goal,100);
         check(!no_candidate.ok && !no_candidate.selected_goal_valid,"no valid endpoint is not a fake snap");
+        check(no_candidate.reason=="goal_invalid" && no_candidate.expanded==0 &&
+              !no_candidate.budget_exhausted,"empty safe goal set fails before allocating/searching states");
+        auto repeated_core=LatticePlannerCore(wall);
+        const auto repeated_a=repeated_core.planCore(wall.start,wall.goal,300);
+        repeated_core.goal_snap_clearance_=4.0;
+        const auto repeated_b=repeated_core.planCore(wall.start,wall.goal,300);
+        check(repeated_a.ok && !repeated_b.ok && repeated_b.expanded==0,
+              "candidate certificates cannot outlive a plan or clearance change");
+        auto one_candidate=wall;
+        one_candidate.config.goal_snap_heading_span_=0;
+        const auto one_heading=LatticePlannerCore(one_candidate).planCore(wall.start,wall.goal,300);
+        verifyPath(one_candidate,one_heading);
+        check(one_heading.selected_goal.yaw==0.0,"viability probe preserves exact candidate heading range");
         auto timed=wall; timed.config.max_planning_time_=1e-9;
         const auto time_limit=LatticePlannerCore(timed).planCore(timed.start,timed.goal);
         check(!time_limit.ok && time_limit.budget_exhausted && time_limit.expanded==0,"single shared wall-time budget");
+        check(time_limit.reason=="snap_timeout","incomplete viability scan is not proof of an empty goal set");
         float endpoint_cost;
         check(LatticePlannerCore(wall).footprintWithClearanceValid(reachable.selected_goal.x,
               reachable.selected_goal.y,reachable.selected_goal.yaw,endpoint_cost,false,
