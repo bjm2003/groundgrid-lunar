@@ -67,14 +67,16 @@ struct Binary {
 };
 
 void transfer(Binary& stream,PlanningInput& input) {
-    std::string magic="groundgrid.planning-input.v1";
+    std::string magic="groundgrid.planning-input.v2";
     stream.string(magic);
-    if(magic!="groundgrid.planning-input.v1") throw std::runtime_error("unsupported planning snapshot version");
+    if(magic!="groundgrid.planning-input.v1" && magic!="groundgrid.planning-input.v2")
+        throw std::runtime_error("unsupported planning snapshot version");
     stream.u64(input.attempt_id); stream.u64(input.goal_id); stream.u64(input.goal_stamp_ns);
     stream.u64(input.start_stamp_ns); stream.u64(input.map_stamp_ns);
     stream.string(input.frame); stream.string(input.source);
     stream.pose(input.start); stream.pose(input.goal);
     input.config.visit([&](const char* name,auto& value) {
+        if(magic=="groundgrid.planning-input.v1" && std::string(name)=="reachable_snap") return;
         std::string key=name; stream.string(key);
         if(key!=name) throw std::runtime_error("snapshot configuration mismatch");
         double d=static_cast<double>(value); stream.number(d);
@@ -163,12 +165,15 @@ PlanningInput loadPlanningSnapshot(const std::string& path) {
 }
 std::string planningResultJson(const PlanningInput& input,const PlanningResult& r) {
     std::ostringstream out;
-    out<<"{\"schema_version\":1,\"attempt_id\":"<<input.attempt_id<<",\"goal_id\":"<<input.goal_id
+    out<<"{\"schema_version\":2,\"attempt_id\":"<<input.attempt_id<<",\"goal_id\":"<<input.goal_id
        <<",\"goal_stamp_ns\":"<<input.goal_stamp_ns<<",\"start_stamp_ns\":"<<input.start_stamp_ns
        <<",\"map_stamp_ns\":"<<input.map_stamp_ns<<",\"frame\":"<<quote(input.frame)
        <<",\"source\":"<<quote(input.source)<<",\"ok\":"<<(r.ok ? "true":"false")
        <<",\"reason\":"<<quote(r.reason)<<",\"snapped\":"<<(r.snapped ? "true":"false")
-       <<",\"expanded\":"<<r.expanded<<",\"root_successors\":"<<r.root_successors;
+       <<",\"expanded\":"<<r.expanded<<",\"root_successors\":"<<r.root_successors
+       <<",\"snap_strategy\":"<<quote(input.config.reachable_snap_ ? "reachable_cost":"legacy_nearest")
+       <<",\"candidates_checked\":"<<r.candidates_checked
+       <<",\"budget_exhausted\":"<<(r.budget_exhausted ? "true":"false");
     for(const auto& item:std::initializer_list<std::pair<const char*,double>>{
         {"total_ms",r.total_ms},{"snap_ms",r.snap_ms},{"search_ms",r.search_ms},{"profile_ms",r.profile_ms},
         {"snap_distance_m",r.snap_distance},{"path_length_m",r.path_length},
@@ -177,7 +182,8 @@ std::string planningResultJson(const PlanningInput& input,const PlanningResult& 
     }
     out<<",\"start\":"; poseJson(out,input.start);
     out<<",\"requested_goal\":"; poseJson(out,input.goal);
-    out<<",\"selected_goal\":"; poseJson(out,r.selected_goal);
+    out<<",\"selected_goal\":";
+    if(r.selected_goal_valid) poseJson(out,r.selected_goal); else out<<"null";
     out<<",\"poses\":"<<r.path.poses.size()<<'}';
     return out.str();
 }
@@ -218,6 +224,18 @@ void PlanningSnapshotWriter::run() {
             const auto base=std::filesystem::path(directory_)/("attempt-"+std::to_string(item.input.attempt_id));
             savePlanningSnapshot(base.string()+".ggsnap",item.input);
             writeText(base.string()+".json",planningResultJson(item.input,item.result));
+            std::ostringstream trajectory;
+            trajectory<<"{\"attempt_id\":"<<item.input.attempt_id<<",\"trajectory\":[";
+            for(std::size_t i=0;i<item.result.path.poses.size();++i) {
+                if(i) trajectory<<',';
+                const auto& p=item.result.path.poses[i];
+                trajectory<<'['; numberJson(trajectory,p.x);trajectory<<',';
+                numberJson(trajectory,p.y);trajectory<<',';numberJson(trajectory,p.yaw);trajectory<<',';
+                numberJson(trajectory,item.result.profile.data.at(2*i));trajectory<<',';
+                numberJson(trajectory,item.result.profile.data.at(2*i+1));trajectory<<']';
+            }
+            trajectory<<"]}";
+            writeText(base.string()+"-trajectory.json",trajectory.str());
             std::lock_guard<std::mutex> lock(mutex_); ++stats_.written;
         } catch(const std::exception&) {
             std::lock_guard<std::mutex> lock(mutex_); ++stats_.failed;

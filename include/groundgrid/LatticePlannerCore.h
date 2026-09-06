@@ -40,6 +40,8 @@ struct PlannerConfig {
     double goal_snap_cost_weight_=0.5;
     double trajectory_clearance_=0.25;
     double goal_snap_clearance_=0.50;
+    // Rollout gate: legacy remains the ROS default until Ubuntu input parity/capture.
+    bool reachable_snap_=false;
     SkidSteerParams sp_;
     template<class Visitor> void visit(Visitor&& v) {
         v("bins",bins_);
@@ -73,6 +75,7 @@ struct PlannerConfig {
         v("a_max",sp_.a_max);
         v("alpha_max",sp_.alpha_max);
         v("kappa_max",sp_.kappa_max);
+        v("reachable_snap",reachable_snap_);
     }
     template<class Visitor> void visit(Visitor&& v) const {
         v("bins",bins_);
@@ -106,6 +109,7 @@ struct PlannerConfig {
         v("a_max",sp_.a_max);
         v("alpha_max",sp_.alpha_max);
         v("kappa_max",sp_.kappa_max);
+        v("reachable_snap",reachable_snap_);
     }
 };
 
@@ -121,11 +125,14 @@ struct PlanningInput {
 };
 struct PlanningResult {
     bool ok=false, snapped=false;
+    bool selected_goal_valid=false;
     std::string reason;
     Pose2D selected_goal;
     double snap_distance=0.0, total_ms=0.0, snap_ms=0.0, search_ms=0.0, profile_ms=0.0;
     double path_length=0.0, reverse_length=0.0, route_cost=0.0;
     int expanded=0, root_successors=0;
+    int candidates_checked=0;
+    bool budget_exhausted=false;
     PlannerPath path;
     PlannerProfile profile;
 };
@@ -160,7 +167,8 @@ public:
         result_.total_ms=std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-begin).count();
         result_.reason=last_fail_reason_;
-        result_.snapped=snapped_goal_used_;
+        result_.snapped=snapped_goal_used_ && result_.selected_goal_valid;
+        if(!result_.selected_goal_valid) snapped_goal_used_=false;
         result_.snap_distance=last_snap_dist_;
         if(!result_.ok) { result_.path.poses.clear(); result_.profile.data.clear(); }
         for(std::size_t i=1;i<result_.path.poses.size();++i) {
@@ -622,6 +630,37 @@ public:
         return false;
     }
 
+    // Implicit multi-goal set. Only a visited state inside the authorised geometry
+    // pays for a full endpoint check; a cheap geometric heuristic is never a safety
+    // certificate. Known body and inflated-band rules are unchanged.
+    bool snapCandidate(const State& candidate,const State& requested,
+                       double& penalty,double& distance) {
+        int db=std::abs(candidate.t-requested.t); db=std::min(db,bins_-db);
+        if(db>goal_snap_heading_span_) return false;
+        PlanningPosition p,r;
+        if(!core_map_.getPosition({candidate.x,candidate.y},p) ||
+           !core_map_.getPosition({requested.x,requested.y},r)) return false;
+        distance=(p-r).norm();
+        if(distance>max_snap_distance_) return false;
+        ++result_.candidates_checked;
+        float cost;
+        if(!footprintWithClearanceValid(p.x(),p.y(),yawForBin(candidate.t),cost,false,
+                                       goal_snap_clearance_)) return false;
+        penalty=distance+goal_snap_heading_weight_*db*(2.0*kPlannerPi/bins_)*primitive_length_
+                        +goal_snap_cost_weight_*(cost/99.0);
+        return std::isfinite(penalty);
+    }
+
+    float goalSetHeuristic(const State& state,const State& requested) const {
+        PlanningPosition p,r;
+        core_map_.getPosition({state.x,state.y},p); core_map_.getPosition({requested.x,requested.y},r);
+        // Route distance PLUS endpoint displacement has a geometric lower estimate
+        // given by distance to the request (triangle inequality). Subtracting the disc
+        // radius would omit that endpoint cost and flood the frontier inside the disc.
+        // This never chooses a single endpoint and never replaces the safety checker.
+        return static_cast<float>((p-r).norm());
+    }
+
     bool planImpl(const Pose2D& start_pose,
                   const Pose2D& goal_pose, PlannerPath& path,
                   PlannerProfile& vel_profile,
@@ -642,6 +681,7 @@ public:
         core_map_.getPosition(PlanningIndex(start.x,start.y),sp);
         core_map_.getPosition(PlanningIndex(goal.x,goal.y),gp);
         result_.selected_goal={gp.x(),gp.y(),yawForBin(goal.t)};
+        result_.selected_goal_valid=true;
         // The current body cannot be required to retroactively satisfy a clearance margin
         // that a refined map has just moved across it. Known lethal terrain under the
         // physical rectangle is still rejected. On the root's outgoing edge only, grow
@@ -661,7 +701,14 @@ public:
             last_fail_reason_ = "start_connector";
             return false;
         }
-        if(!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
+        const State requested=goal;
+        const bool invalid_goal=!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy);
+        const bool multi_goal=reachable_snap_ && invalid_goal;
+        if(invalid_goal) result_.selected_goal_valid=false;
+        if(multi_goal) {
+            // The entire snapped route holds the same larger margin as legacy snapping.
+            snapped_goal_used_=true;
+        } else if(invalid_goal) {
             State snapped; double snap_dist;
             if(!snapGoal(goal, max_snap_distance_, max_planning_time_*0.2, begin, snapped, snap_dist)) {
                 last_fail_reason_ = "goal_invalid";
@@ -671,6 +718,7 @@ public:
             core_map_.getPosition(PlanningIndex(goal.x,goal.y),gp);
             snapped_goal_used_ = true; last_snap_dist_ = snap_dist;
             result_.selected_goal={gp.x(),gp.y(),yawForBin(goal.t)};
+            result_.selected_goal_valid=true;
         }
 
         result_.snap_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
@@ -683,18 +731,38 @@ public:
         std::vector<uint8_t> closed(count,0);
         std::priority_queue<QueueNode> open;
         const int sk=key(start,cols);
-        g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
+        const auto estimate=[&](const State& s) {
+            return multi_goal ? goalSetHeuristic(s,requested) : heuristic(s,goal);
+        };
+        g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*estimate(start),sk});
         int reached=-1;
         float reached_error=std::numeric_limits<float>::infinity();
+        double best_goal_score=std::numeric_limits<double>::infinity();
         int expanded=0, root_successors=0;
         while(!open.empty()) {
             if(expansion_limit_ ? std::uint64_t(expanded)>=expansion_limit_ :
-               std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) break;
+               std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) {
+                result_.budget_exhausted=true; break;
+            }
             const int ck=open.top().key; open.pop();
+            // Virtual sink edges carry the existing endpoint penalty. Every candidate
+            // competes in ONE frontier/budget. This is bounded weighted A*, not a claim
+            // of globally optimal execution time or of an unreachable-world proof.
+            if(ck==-1) break;
             if(closed[ck]) continue;
             closed[ck]=1; ++expanded;
             const State cur=stateFromKey(ck,cols);
-            if(cur.t==goal.t) {
+            if(multi_goal) {
+                double penalty=0.0,distance=0.0;
+                if(snapCandidate(cur,requested,penalty,distance) && g[ck]+penalty<best_goal_score) {
+                    best_goal_score=g[ck]+penalty;
+                    reached=ck; goal=cur; last_snap_dist_=distance;
+                    PlanningPosition selected; core_map_.getPosition({cur.x,cur.y},selected);
+                    result_.selected_goal={selected.x(),selected.y(),yawForBin(cur.t)};
+                    result_.selected_goal_valid=true;
+                    open.push({static_cast<float>(best_goal_score),-1});
+                }
+            } else if(cur.t==goal.t) {
                 const float error = heuristic(cur,goal);
                 // A tolerance hit is a valid fallback, but publishing the first such
                 // state makes the endpoint jump by several cells between replans. Near
@@ -752,7 +820,7 @@ public:
                     const float ec=static_cast<float>(prim.base_cost*(1.0+0.01*terrain));
                     const float ng=g[ck]+ec;
                     if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; parent_prim[nk]=static_cast<int>(pi);
-                        open.push({ng+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
+                        open.push({ng+static_cast<float>(heuristic_weight_)*estimate(next),nk}); }
                 }
             } else {
                 for(int direction : {-1,1}) for(int turn=-1;turn<=1;++turn) {
@@ -761,13 +829,13 @@ public:
                     if(ck==sk) ++root_successors;
                     const int nk=key(next,cols); if(closed[nk]) continue;
                     const float ng=g[ck]+ec;
-                    if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; open.push({ng+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
+                    if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; open.push({ng+static_cast<float>(heuristic_weight_)*estimate(next),nk}); }
                 }
                 for(int turn : {-1,1}) {
                     State next; float ec;
                     if(!transition(cur,0,turn,next,ec,/*departure=*/ck==sk)) continue;
                     if(ck==sk) ++root_successors;
-                    const int nk=key(next,cols); if(g[ck]+ec<g[nk]) { g[nk]=g[ck]+ec; parent[nk]=ck; open.push({g[nk]+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
+                    const int nk=key(next,cols); if(g[ck]+ec<g[nk]) { g[nk]=g[ck]+ec; parent[nk]=ck; open.push({g[nk]+static_cast<float>(heuristic_weight_)*estimate(next),nk}); }
                 }
             }
         }

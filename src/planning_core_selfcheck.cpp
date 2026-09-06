@@ -20,6 +20,7 @@ static void verifyPath(const PlanningInput& input,const PlanningResult& result) 
     check(result.ok,"expected a route");
     check(result.path.poses.size()*2==result.profile.data.size(),"profile length");
     LatticePlannerCore core(input);
+    const double clearance=result.snapped ? input.config.goal_snap_clearance_ : input.config.trajectory_clearance_;
     for(std::size_t i=0;i<result.path.poses.size();++i) {
         const auto& p=result.path.poses[i];
         check(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.yaw),"finite pose");
@@ -30,7 +31,7 @@ static void verifyPath(const PlanningInput& input,const PlanningResult& result) 
         if(i) {
             float cost;
             check(core.sweptSegmentValid(result.path.poses[i-1],p,
-                input.config.trajectory_clearance_,input.config.trajectory_clearance_,false,cost),
+                clearance,clearance,false,cost),
                 "exported segment safety");
         }
     }
@@ -83,6 +84,47 @@ int main() {
         const auto shifted_result=LatticePlannerCore(shifted).planCore(shifted.start,shifted.goal,50000);
         verifyPath(shifted,shifted_result);
         check(shifted_result.profile.data==forward.profile.data,"buffer shift leaves straight route unchanged");
+        auto wall=flatInput();
+        wall.config.max_snap_distance_=3.0;
+        wall.start={-3.075,0.075,0}; wall.goal={0.075,0.075,0};
+        for(int r=0;r<wall.map.rows;++r) for(int c=0;c<wall.map.cols;++c) {
+            PlanningPosition p; wall.map.getPosition({r,c},p);
+            if(std::abs(p.x()+0.525)<0.01) wall.map.cost[r*wall.map.cols+c]=100.0f;
+        }
+        const auto legacy=LatticePlannerCore(wall).planCore(wall.start,wall.goal,300);
+        check(!legacy.ok && legacy.snapped && legacy.selected_goal.x>0.0,"nearest snap across impassable wall");
+        wall.config.reachable_snap_=true;
+        const auto reachable=LatticePlannerCore(wall).planCore(wall.start,wall.goal,300);
+        verifyPath(wall,reachable);
+        check(reachable.snapped && reachable.selected_goal.x< -1.9 &&
+              reachable.snap_distance<=wall.config.max_snap_distance_,"reachable near-side candidate");
+        check(reachable.expanded<legacy.expanded,"shared frontier does not exhaust blocked endpoint budget");
+        auto normal=flatInput(); normal.config.reachable_snap_=true;
+        const auto normal_result=LatticePlannerCore(normal).planCore(normal.start,normal.goal,50000);
+        check(normal_result.profile.data==forward.profile.data && normal_result.expanded==forward.expanded,
+              "valid requested goal retains legacy search");
+        auto backwards=wall; backwards.start.yaw=kPlannerPi; backwards.goal.yaw=kPlannerPi;
+        const auto backed=LatticePlannerCore(backwards).planCore(backwards.start,backwards.goal,300);
+        verifyPath(backwards,backed);
+        check(backed.reverse_length>0.4,"reachable goal set supports reversing");
+        double penalty=0.0,distance=0.0;
+        LatticePlannerCore probe(wall); LatticePlannerCore::State request,near_side;
+        check(probe.poseToState(wall.goal,request) && probe.poseToState(reachable.selected_goal,near_side),"candidate indices");
+        near_side.t=(request.t+8)%16;
+        check(!probe.snapCandidate(near_side,request,penalty,distance),"candidate heading range is not relaxed");
+        auto tiny=wall; tiny.config.max_snap_distance_=0.15;
+        const auto no_candidate=LatticePlannerCore(tiny).planCore(tiny.start,tiny.goal,100);
+        check(!no_candidate.ok && !no_candidate.selected_goal_valid,"no valid endpoint is not a fake snap");
+        auto timed=wall; timed.config.max_planning_time_=1e-9;
+        const auto time_limit=LatticePlannerCore(timed).planCore(timed.start,timed.goal);
+        check(!time_limit.ok && time_limit.budget_exhausted && time_limit.expanded==0,"single shared wall-time budget");
+        float endpoint_cost;
+        check(LatticePlannerCore(wall).footprintWithClearanceValid(reachable.selected_goal.x,
+              reachable.selected_goal.y,reachable.selected_goal.yaw,endpoint_cost,false,
+              wall.config.goal_snap_clearance_),"selected endpoint full clearance");
+        std::cout<<"wall fixture: legacy expanded="<<legacy.expanded<<" ok="<<legacy.ok
+                 <<" reachable expanded="<<reachable.expanded<<" ok="<<reachable.ok
+                 <<" endpoint_x="<<reachable.selected_goal.x<<'\n';
         std::cout<<"planning_core_selfcheck passed; forward poses="<<forward.path.poses.size()
                  <<" expanded="<<forward.expanded<<" reverse_m="<<reverse.reverse_length<<'\n';
         return EXIT_SUCCESS;

@@ -10,7 +10,7 @@
 
 namespace groundgrid {
 
-// Version 1: explicitly little-endian scalars; exact IEEE float payloads including
+// Version 2 (v1 readable as legacy snapping): little-endian scalars; exact IEEE float payloads including
 // NaNs; named configuration; full in-memory primitives. A rolling checksum rejects
 // damaged/truncated files. This is an integrity check, not an authenticity claim.
 void savePlanningSnapshot(const std::string& path,const PlanningInput& input);

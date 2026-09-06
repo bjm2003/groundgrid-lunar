@@ -5,6 +5,7 @@
     <arg name="odometry_topic" default="/localization/odometry/filtered_map" />
     <arg name="cmd_vel_topic" default="/cmd_vel" />
     <arg name="planning_snapshot_directory" default="" />
+    <arg name="snap_strategy" default="legacy_nearest" />
 
     <rosparam command="load" file="$(arg config)" />
 
@@ -18,6 +19,7 @@
           name="state_lattice_planner" output="screen">
         <param name="odometry_topic" value="$(arg odometry_topic)" />
         <param name="planning_snapshot_directory" value="$(arg planning_snapshot_directory)" />
+        <param name="snap_strategy" value="$(arg snap_strategy)" />
     </node>
     <node pkg="groundgrid" type="lunar_path_follower_node"
           name="lunar_path_follower" output="screen">

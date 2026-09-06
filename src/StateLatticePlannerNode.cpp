@@ -8,6 +8,7 @@
 #include <mutex>
 #include <queue>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,11 @@ public:
         pnh_.param("min_speed_scale", min_speed_scale_, 0.25);
         pnh_.param("reverse_speed_frac", reverse_speed_frac_, 0.5);
         pnh_.param("max_snap_distance", max_snap_distance_, 1.5);
+        std::string snap_strategy;
+        pnh_.param<std::string>("snap_strategy",snap_strategy,"legacy_nearest");
+        if(snap_strategy!="legacy_nearest" && snap_strategy!="reachable_cost")
+            throw std::runtime_error("snap_strategy must be legacy_nearest or reachable_cost");
+        reachable_snap_=snap_strategy=="reachable_cost";
         pnh_.param("goal_snap_heading_span", goal_snap_heading_span_, 2);
         pnh_.param("goal_snap_heading_weight", goal_snap_heading_weight_, 0.25);
         pnh_.param("goal_snap_cost_weight", goal_snap_cost_weight_, 0.5);
@@ -1241,7 +1247,7 @@ private:
         // map/cache and effective Relax parameters, not the latest asynchronous topics.
         PlanningInput input;
         if(snapshot_writer_.enabled() || query_only) input=captureInput(corePose(start),corePose(goal));
-        else { input.start=corePose(start); input.goal=corePose(goal); }
+        else { input.start=corePose(start); input.goal=corePose(goal); input.config=static_cast<const PlannerConfig&>(*this); }
         input.attempt_id=++attempt_id_;
         input.goal_id=query_only ? 0 : goal_id_;
         input.goal_stamp_ns=goal.header.stamp.toNSec();
