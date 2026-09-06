@@ -6,6 +6,8 @@ atomically. Follower snapshots and atomic trajectories refer to that execution i
 Callers provide locking; no callback arrival time is treated as message ownership.
 """
 
+import math
+
 COUNTERS = ("recovery_events", "recovery_successes", "recovery_aborts")
 
 
@@ -36,6 +38,8 @@ class TrialObservation:
         self._planner_seq = 0
         self._follower_seq = 0
         self._pending_follower = []
+        self.attempts = {}
+        self._pending_attempts = {}
 
     def owns(self, goal_id):
         return self.goal_id is not None and positive_int(goal_id) == self.goal_id
@@ -66,6 +70,33 @@ class TrialObservation:
         pending, self._pending_follower = self._pending_follower, []
         for follower in pending:
             self.follower(follower)
+        pending_attempts, self._pending_attempts = self._pending_attempts, {}
+        for attempt in pending_attempts.values():
+            self.attempt(attempt)
+        return True
+
+    def attempt(self, fields):
+        """One timed calculation, never a terminal event or a repeated status sample."""
+        if not isinstance(fields, dict) or fields.get("source") != "mission":
+            return False
+        attempt_id = positive_int(fields.get("attempt_id"))
+        goal_id = positive_int(fields.get("goal_id"))
+        if (self.goal_stamp_ns is None or
+                positive_int(fields.get("goal_stamp_ns")) != self.goal_stamp_ns or
+                attempt_id is None or goal_id is None):
+            return False
+        try:
+            duration = float(fields["total_ms"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not math.isfinite(duration) or duration < 0.0:
+            return False
+        if self.goal_id is None:
+            self._pending_attempts[attempt_id] = dict(fields)
+            return False
+        if not self.owns(goal_id) or attempt_id in self.attempts:
+            return False
+        self.attempts[attempt_id] = dict(fields, total_ms=duration)
         return True
 
     def follower(self, fields):

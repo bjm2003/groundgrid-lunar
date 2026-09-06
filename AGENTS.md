@@ -106,6 +106,13 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
 - Build and run `backout_recovery_selfcheck` for observed-history/retreat changes; it covers
   clearance scheduling, lifetime, discontinuities and production follower/stop-barrier
   interaction on synthetic maps. ROS callbacks and real braking still require runtime tests.
+- For planning-core changes, run `planning_core_selfcheck` and
+  `planning_snapshot_selfcheck` locally, plus `planning_grid_parity_selfcheck` against
+  Ubuntu's installed grid_map. Snapshot replay calls production search, not an imitation.
+  Fixed-expansion replay is for deterministic comparisons, not latency certification.
+- Count planning time from unique goal-correlated `planning_attempt` events. Repeated
+  diagnostic `plan_ms` values are not additional searches. Snapshot writer drops/failures
+  invalidate completeness of the recorded experiment and must remain visible.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.

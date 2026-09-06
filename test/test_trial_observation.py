@@ -3,6 +3,7 @@
 import pathlib
 import ast
 import math
+import json
 import sys
 import threading
 from types import SimpleNamespace as NS
@@ -24,6 +25,23 @@ def follower(goal=14, seq=1, status="tracking"):
 
 
 class TrialObservationTest(unittest.TestCase):
+    def test_attempt_deduplication_and_ack_race(self):
+        state = TrialObservation(1400)
+        attempt = dict(source="mission", goal_stamp_ns=1400, goal_id=14,
+                       attempt_id=92, total_ms=123.25, ok=True)
+        self.assertFalse(state.attempt(attempt))
+        self.assertEqual(state.attempts, {})
+        state.planner(planner())
+        self.assertEqual(len(state.attempts), 1)
+        self.assertFalse(state.attempt(attempt))
+        state.planner(planner(seq=2))
+        self.assertEqual(len(state.attempts), 1)
+        self.assertFalse(state.attempt(dict(attempt, source="service", attempt_id=93)))
+        self.assertFalse(state.attempt(dict(attempt, goal_id=13, attempt_id=93)))
+        self.assertFalse(state.attempt(dict(attempt, total_ms=float("nan"), attempt_id=93)))
+        self.assertTrue(state.attempt(dict(attempt, total_ms=0.125, attempt_id=93)))
+        self.assertFalse(state.planner_done)
+
     def test_unarmed_collection_ignores_latched_messages(self):
         state = TrialObservation()
         self.assertFalse(state.planner(planner()))
@@ -141,7 +159,7 @@ class PipelineCallbackTest(unittest.TestCase):
         source = pathlib.Path(__file__).with_name("test_lunar_pipeline.py")
         node = next(n for n in ast.parse(source.read_text(encoding="utf-8")).body
                     if isinstance(n, ast.ClassDef) and n.name == "LunarPipelineTest")
-        namespace = {"unittest": unittest, "math": math,
+        namespace = {"unittest": unittest, "math": math, "json": json,
                      "TrialObservation": TrialObservation, "fields_of": fields_of,
                      "mission_completed": mission_completed,
                      "STRICT_SCENARIOS": ("mixed", "flat"), "UNREACHABLE_GOALS": {(3.0, 0.0)},
@@ -176,6 +194,16 @@ class PipelineCallbackTest(unittest.TestCase):
         self.assertTrue(self.adapter.atomic_profile_ok)
         self.assertEqual(self.adapter.last_path.header.seq, 14)
         self.assertEqual(self.adapter.last_profile_size, 2)
+
+    def test_actual_attempt_callback_not_republished_plan_ms(self):
+        record = dict(source="mission", goal_stamp_ns=1400, goal_id=14,
+                      attempt_id=92, total_ms=12.5)
+        self.adapter._on_attempt(NS(data=json.dumps(record)))
+        self.diagnostic(planner())
+        self.adapter._on_attempt(NS(data=json.dumps(record)))
+        self.diagnostic(dict(planner(seq=2), plan_ms="12.5"))
+        self.assertEqual(len(self.adapter.observation.attempts), 1)
+        self.assertEqual(self.adapter.plan_ms, [])
 
     def test_late_old_stop_and_abort_do_not_clear_current_goal(self):
         self.diagnostic(planner())

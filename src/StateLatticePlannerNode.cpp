@@ -36,20 +36,12 @@
 #include "groundgrid/ReplanStopBarrier.h"
 #include "groundgrid/FootprintRaster.h"
 #include "groundgrid/BackoutRecovery.h"
+#include "groundgrid/LatticePlannerCore.h"
+#include "groundgrid/PlanningSnapshot.h"
 
 namespace groundgrid {
 
-class StateLatticePlannerNode {
-    struct State { int x, y, t; };
-    struct FootprintRejection {
-        const char* reason="none";
-        double sample_x=0.0, sample_y=0.0;
-        int row=-1, col=-1;
-    };
-    struct QueueNode {
-        float f; int key;
-        bool operator<(const QueueNode& other) const { return f > other.f; }
-    };
+class StateLatticePlannerNode : public LatticePlannerCore {
     enum class PlannerMode { Nominal, Recovery, Aborted };
     enum class RecoveryAction { None, Relax, Rotate, BackOut, Abort };
 
@@ -155,22 +147,15 @@ public:
         status_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/status", 1, true);
         snapped_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/lunar_planner/snapped_goal", 1, true);
         diag_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/diagnostics", 1, true);
+        attempt_pub_ = nh_.advertise<std_msgs::String>("/lunar_planner/planning_attempt", 100, false);
+        std::string snapshot_directory;
+        pnh_.param<std::string>("planning_snapshot_directory",snapshot_directory,"");
+        snapshot_writer_.start(snapshot_directory);
         service_ = nh_.advertiseService("/lunar_planner/make_plan", &StateLatticePlannerNode::serviceCallback, this);
         timer_ = nh_.createTimer(ros::Duration(0.5), &StateLatticePlannerNode::timerCallback, this);
     }
 
 private:
-    static double wrap(double a) { return std::atan2(std::sin(a), std::cos(a)); }
-    int key(const State& s, int cols) const { return (s.x * cols + s.y) * bins_ + s.t; }
-    State stateFromKey(int k, int cols) const {
-        State s; s.t = k % bins_; k /= bins_; s.y = k % cols; s.x = k / cols; return s;
-    }
-    double yawForBin(int t) const { return t * 2.0 * M_PI / bins_; }
-    int binForYaw(double yaw) const {
-        int b = static_cast<int>(std::lround(wrap(yaw) * bins_ / (2.0 * M_PI)));
-        b %= bins_; if(b < 0) b += bins_; return b;
-    }
-
     void publishStatus(const std::string& text) {
         const bool changed = text != last_status_;
         last_status_ = text;
@@ -320,6 +305,7 @@ private:
         snapshot << buf << " goal_id=" << goal_id_
                  << " goal_stamp_ns=" << goal_.header.stamp.toNSec()
                  << " snapshot_seq=" << ++diagnostic_seq_
+                 << " attempt_id=" << last_mission_attempt_id_
                  << " status=" << last_status_
                  << " goal_recovery_events=" << recovery_events_-goal_events_start_
                  << " goal_recovery_successes=" << recovery_successes_-goal_successes_start_
@@ -519,24 +505,28 @@ private:
     // matches grid_map: lin = idx(0)*cols + idx(1), where idx comes from map_.getIndex().
     void buildTraversabilityCache() {
         const int rows = map_.getSize()(0), cols = map_.getSize()(1);
-        cell_cols_ = cols;
+        core_map_.rows=rows; core_map_.cols=cols;
+        core_map_.start_row=map_.getStartIndex()(0); core_map_.start_col=map_.getStartIndex()(1);
+        core_map_.resolution=map_.getResolution();
+        core_map_.length_x=map_.getLength().x(); core_map_.length_y=map_.getLength().y();
+        core_map_.center_x=map_.getPosition().x(); core_map_.center_y=map_.getPosition().y();
         const size_t n = static_cast<size_t>(rows) * cols;
         const float nan = std::numeric_limits<float>::quiet_NaN();
-        cell_cost_.assign(n, nan);
-        cell_gx_.assign(n, nan);
-        cell_gy_.assign(n, nan);
-        cell_slopemag_.assign(n, nan);
+        core_map_.cost.assign(n, nan);
+        core_map_.gx.assign(n, nan);
+        core_map_.gy.assign(n, nan);
+        core_map_.slope.assign(n, nan);
         const auto& cost = map_["terrain_cost"];
         const auto& sx = map_["slope_x"];
         const auto& sy = map_["slope_y"];
         for(int i = 0; i < rows; ++i) {
             for(int j = 0; j < cols; ++j) {
                 const size_t lin = static_cast<size_t>(i) * cols + j;
-                cell_cost_[lin] = cost(i, j);
+                core_map_.cost[lin] = cost(i, j);
                 const float gx = sx(i, j), gy = sy(i, j);
-                cell_gx_[lin] = gx; cell_gy_[lin] = gy;
+                core_map_.gx[lin] = gx; core_map_.gy[lin] = gy;
                 if(std::isfinite(gx) && std::isfinite(gy))
-                    cell_slopemag_[lin] = static_cast<float>(std::atan(std::hypot(gx, gy)) * 180.0 / M_PI);
+                    core_map_.slope[lin] = static_cast<float>(std::atan(std::hypot(gx, gy)) * 180.0 / M_PI);
             }
         }
     }
@@ -556,6 +546,7 @@ private:
         // declared unreachable before it has been attempted even once.
         resetRecoveryState();
         last_fail_reason_.clear(); last_plan_ms_ = 0.0; last_snap_dist_ = 0.0;
+        last_mission_attempt_id_=0;
         last_status_.clear();
         publishStatus("goal_received");
     }
@@ -605,7 +596,7 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         if(!have_map_) return false;
         std_msgs::Float32MultiArray vel;
-        plan(req.start, req.goal, res.plan, vel);
+        plan(req.start, req.goal, res.plan, vel, /*query_only=*/true);
         return true;
     }
 
@@ -1119,76 +1110,12 @@ private:
 
     std::string recoveryStatus() const { return std::string("recovery_") + actionName(action_); }
 
-    bool poseToState(const geometry_msgs::PoseStamped& pose, State& state) const {
-        if(pose.header.frame_id != map_frame_ && !pose.header.frame_id.empty()) return false;
-        grid_map::Index idx;
-        if(!map_.getIndex(grid_map::Position(pose.pose.position.x, pose.pose.position.y), idx)) return false;
-        state.x = idx(0); state.y = idx(1);
-        state.t = binForYaw(tf2::getYaw(pose.pose.orientation));
-        return true;
-    }
-
-    // When allow_unknown is true, unobserved cells (NaN terrain_cost / slope, or off-map)
-    // are tolerated instead of failing the check. Used only for the start footprint: the
-    // vehicle is physically sitting on its current pose and its body occludes the ground
-    // directly beneath it, so those cells are never observed. Genuinely lethal cells
-    // (terrain_cost >= 100) and cells whose measured slope exceeds the limit are still rejected.
-    // Rasterise ALL intersected grid cells rather than a rotated body-coordinate point
-    // lattice. A larger clearance rectangle must include every smaller one's cells.
-    // Gentle cells still skip the direction-dependent slope trigonometry.
-    bool footprintValid(double x, double y, double yaw, float& cost, bool allow_unknown = false,
-                        double margin = 0.0, FootprintRejection* rejection = nullptr) const {
-        if(rejection) *rejection=FootprintRejection{};
-        const auto reject = [rejection](const char* reason,double wx,double wy,int row,int col) {
-            if(rejection) *rejection={reason,wx,wy,row,col};
-            return false;
-        };
-        cost = 0.0f; int samples = 0;
-        const double r = map_.getResolution();
-        const double cyaw = std::cos(yaw), syaw = std::sin(yaw);
-        const double origin_x=map_.getPosition().x()-0.5*map_.getLength().x();
-        const double origin_y=map_.getPosition().y()-0.5*map_.getLength().y();
-        const bool valid=visitFootprintCells({x,y,yaw},footprint_length_,footprint_width_,margin,
-            r,origin_x,origin_y,[&](double wx,double wy) {
-                grid_map::Index idx;
-                if(!map_.getIndex(grid_map::Position(wx, wy), idx)) {
-                    if(allow_unknown) return true;
-                    return reject("off_map",wx,wy,-1,-1);
-                }
-                const size_t lin = static_cast<size_t>(idx(0)) * cell_cols_ + idx(1);
-                const float c = cell_cost_[lin];
-                if(!std::isfinite(c)) {
-                    if(allow_unknown) return true;
-                    return reject("unknown_cost",wx,wy,idx(0),idx(1));
-                }
-                if(c >= 100.0f) return reject("lethal_cost",wx,wy,idx(0),idx(1));
-                const float sm = cell_slopemag_[lin];
-                if(!std::isfinite(sm)) {
-                    if(allow_unknown) return true;
-                    return reject("unknown_slope",wx,wy,idx(0),idx(1));
-                }
-                if(sm > max_lat_slope_) {  // steep cell: fall back to the directional check
-                    const float gx = cell_gx_[lin], gy = cell_gy_[lin];
-                    const double longitudinal = std::atan(std::abs(gx*cyaw + gy*syaw)) * 180.0/M_PI;
-                    const double lateral = std::atan(std::abs(-gx*syaw + gy*cyaw)) * 180.0/M_PI;
-                    if(longitudinal > max_long_slope_ || lateral > max_lat_slope_)
-                        return reject(longitudinal > max_long_slope_ ? "longitudinal_slope"
-                                                                     : "lateral_slope",
-                                      wx,wy,idx(0),idx(1));
-                }
-                cost += c; ++samples;
-                return true;
-            });
-        if(samples) cost /= samples;
-        return valid;
-    }
-
     // Observability only: report the exact rejected cell and original terrain layers.
     // Ground-truth clearance does not justify overriding a perceived lethal cell. These
     // fields distinguish obstacle/step/slope rejection before considering a map change.
     void logFootprintRejection(const Pose2D& pose,const char* context,
                                double margin=0.0,bool allow_body_unknown=true,
-                               bool force=false) const {
+                               bool force=false) const override {
         FootprintRejection rejection;
         float cost;
         double rejected_margin=0.0;
@@ -1240,134 +1167,6 @@ private:
                                   rejected.allow_unknown,/*force=*/true);
     }
 
-    // Validate the physical body strictly, then reserve a configurable band around it from
-    // every *known* hazard. Unknown cells are tolerated only in that extra band: requiring
-    // observed terrain beyond the body would make goals in a LiDAR occlusion shadow
-    // impossible, while allowing unknown cells under the body would weaken the normal
-    // planner invariant. The returned terrain cost remains the body's cost, so adding a
-    // safety band does not also apply terrain speed scaling a second time.
-    bool footprintWithClearanceValid(double x, double y, double yaw, float& cost,
-                                     bool allow_body_unknown,
-                                     double clearance) const {
-        if(!footprintValid(x, y, yaw, cost, allow_body_unknown)) return false;
-        if(clearance <= 0.0) return true;
-        float inflated_cost;
-        return footprintValid(x, y, yaw, inflated_cost,
-                              /*allow_unknown=*/true, clearance);
-    }
-
-    double trajectoryClearance() const {
-        // A route to a snapped goal is planned with an uncertainty reserve along its whole
-        // length, not only at the endpoint. Retained-path validation deliberately uses the
-        // ordinary trajectory_clearance_ explicitly: the difference is hysteresis that the
-        // far-to-near rolling-map refinement may consume without causing path churn.
-        return snapped_goal_used_ ? goal_snap_clearance_ : trajectory_clearance_;
-    }
-
-    bool trajectoryFootprintValid(double x, double y, double yaw, float& cost,
-                                  bool allow_body_unknown = false) const {
-        return footprintWithClearanceValid(x, y, yaw, cost, allow_body_unknown,
-                                           trajectoryClearance());
-    }
-
-    bool sweptSegmentValid(const Pose2D& from, const Pose2D& to,
-                            double clearance0, double clearance1,
-                            bool allow_start_unknown, float& cost,
-                            const char* rejection_context=nullptr,
-                            SweptFootprintRejection* rejection=nullptr) const {
-        if(allow_start_unknown && clearance0==0.0 && clearance1>0.0 &&
-           footprintWithClearanceValid(from.x,from.y,from.yaw,cost,true,clearance1))
-            clearance0=clearance1;
-        return sweptFootprintValid(from, to, cornerRadius(), map_.getResolution(),
-            clearance0, clearance1, allow_start_unknown,
-            [this,rejection_context](const Pose2D& pose, double clearance,
-                                     bool allow_unknown, float& terrain) {
-                const bool valid=footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
-                                                              terrain,allow_unknown,clearance);
-                if(!valid && rejection_context)
-                    logFootprintRejection(pose,rejection_context,clearance,allow_unknown);
-                return valid;
-            }, cost, rejection);
-    }
-
-    // Half the body diagonal: how far a corner stands from the centre, and therefore the
-    // radius its arc has when the body turns on the spot.
-    double cornerRadius() const {
-        return std::hypot(footprint_length_, footprint_width_) / 2.0;
-    }
-
-    // Validate a turn on the spot. Checking only the end yaw is not enough: a corner
-    // reaches 0.42 m further out than the broadside rectangle, so a pose that is clear at
-    // every axis-aligned heading can still graze an obstacle mid-turn. Measured on the
-    // mixed scenario -- the rover sat 0.12 m clear of the (0,-2) boulder, rotated during
-    // recovery, and its corner passed 0.15 m inside it. Arc primitives have always sampled
-    // their sweep; rotations, which sweep the most, did not. The step keeps corner travel
-    // under one cell, which is the spacing footprintValid samples the body at anyway.
-    bool rotationValid(double x, double y, double yaw0, double yaw1, float& cost,
-                       bool departure = false, SweptFootprintRejection* rejection=nullptr) const {
-        return sweptSegmentValid({x,y,yaw0}, {x,y,yaw1},
-                                 departure ? 0.0 : trajectoryClearance(),
-                                 trajectoryClearance(), departure, cost, nullptr, rejection);
-    }
-
-    // Transform primitive samples from the start-body frame into the world, validate the
-    // swept footprint along the primitive, accumulate terrain cost, and return the endpoint.
-    bool primitiveValid(double px, double py, double pyaw, const MotionPrimitive& prim,
-                        float& avg_cost, double& ex, double& ey, double& eyaw,
-                        bool departure = false) const {
-        if(prim.samples.empty()) return false;
-        const double c = std::cos(pyaw), s = std::sin(pyaw);
-        auto worldPose = [&](size_t i) {
-            const auto& smp = prim.samples[i];
-            return Pose2D{px+c*smp.x-s*smp.y,py+s*smp.x+c*smp.y,wrap(pyaw+smp.yaw)};
-        };
-        const auto last = worldPose(prim.samples.size()-1);
-        ex=last.x; ey=last.y; eyaw=last.yaw;
-        return sampledFootprintValid({px,py,pyaw},prim.samples.size(),worldPose,
-            cornerRadius(),map_.getResolution(),trajectoryClearance(),departure,
-            [this](const Pose2D& pose,double clearance,bool allow_unknown,float& cost) {
-                return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
-                                                    cost,allow_unknown,clearance);
-            },avg_cost);
-    }
-
-    bool transition(const State& from, int direction, int turn, State& to, float& edge_cost,
-                    bool departure = false, SweptFootprintRejection* rejection=nullptr) const {
-        if(rejection) *rejection=SweptFootprintRejection{};
-        grid_map::Position p;
-        if(!map_.getPosition(grid_map::Index(from.x, from.y), p)) return false;
-        const double yaw0 = yawForBin(from.t);
-        if(direction == 0) {
-            to = from; to.t = (from.t + turn + bins_) % bins_;
-            float terrain;
-            if(!rotationValid(p.x(), p.y(), yaw0, yawForBin(to.t), terrain, departure,rejection)) return false;
-            edge_cost = static_cast<float>(rotation_cost_ * primitive_length_ + terrain * 0.002);
-            return true;
-        }
-
-        const double dyaw = turn * 2.0 * M_PI / bins_;
-        const double yaw1 = yaw0 + dyaw;
-        const double x1 = p.x() + direction*primitive_length_*std::cos(yaw0 + dyaw*0.5);
-        const double y1 = p.y() + direction*primitive_length_*std::sin(yaw0 + dyaw*0.5);
-        grid_map::Index idx;
-        if(!map_.getIndex(grid_map::Position(x1,y1), idx)) return false;
-        to = {idx(0), idx(1), binForYaw(yaw1)};
-        grid_map::Position endpoint;
-        float terrain;
-        if(!map_.getPosition(idx, endpoint) ||
-           !latticeArcFootprintValid({p.x(),p.y(),yaw0},
-                {endpoint.x(),endpoint.y(),yawForBin(to.t)}, direction*primitive_length_,dyaw,
-                cornerRadius(),map_.getResolution(),trajectoryClearance(),departure,
-                [this](const Pose2D& pose, double clearance, bool allow_unknown, float& cost) {
-                    return footprintWithClearanceValid(pose.x,pose.y,pose.yaw,
-                                                        cost,allow_unknown,clearance);
-                },terrain,rejection)) return false;
-        const double motion_factor = direction < 0 ? reverse_cost_ : 1.0;
-        edge_cost = static_cast<float>(motion_factor * primitive_length_ *
-                    (1.0 + 0.01 * terrain));
-        return !(to.x == from.x && to.y == from.y && to.t == from.t);
-    }
-
     // Re-run only the eight root actions after an exhausted arc search. This uses the
     // same production checker on the same locked map, but cannot publish or select a
     // route. Batch throttling retains every action's reason instead of suppressing seven
@@ -1398,594 +1197,109 @@ private:
         }
     }
 
-    float heuristic(const State& a, const State& b) const {
-        grid_map::Position pa, pb;
-        map_.getPosition(grid_map::Index(a.x,a.y), pa);
-        map_.getPosition(grid_map::Index(b.x,b.y), pb);
-        const float distance = static_cast<float>((pa-pb).norm());
-        int dt = std::abs(a.t-b.t); dt = std::min(dt, bins_-dt);
-        return distance + static_cast<float>(dt * primitive_length_ * 0.25);
+    static Pose2D corePose(const geometry_msgs::PoseStamped& pose) {
+        const auto& q=pose.pose.orientation;
+        const double norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+        if(!std::isfinite(norm) || std::abs(norm-1.0)>1e-3 || !std::isfinite(pose.pose.position.z))
+            return {pose.pose.position.x,pose.pose.position.y,std::numeric_limits<double>::quiet_NaN()};
+        return {pose.pose.position.x,pose.pose.position.y,tf2::getYaw(pose.pose.orientation)};
     }
-
-    double terrainSpeedScaleAt(double x, double y) const {
-        grid_map::Index idx;
-        if(!map_.getIndex(grid_map::Position(x,y), idx)) return min_speed_scale_;
-        const size_t lin = static_cast<size_t>(idx(0))*cell_cols_ + idx(1);
-        double scale = 1.0;
-        const float c = cell_cost_[lin];
-        // Non-finite is legitimate at the vehicle-occluded start footprint. It must not
-        // poison the whole profile, but known terrain is always allowed to slow it down.
-        if(std::isfinite(c))
-            scale *= std::clamp(1.0 - terrain_speed_gain_*(c/99.0), min_speed_scale_, 1.0);
-        const float sm = cell_slopemag_[lin];
-        if(std::isfinite(sm) && max_long_slope_ > 1e-3)
-            scale *= std::clamp(1.0 - sm/max_long_slope_, min_speed_scale_, 1.0);
-        return std::clamp(scale, min_speed_scale_, 1.0);
+    static void rosProfile(const PlannerProfile& profile,std_msgs::Float32MultiArray& output) {
+        output.data=profile.data;
+        output.layout.dim.resize(2);
+        output.layout.dim[0].label="pairs";
+        output.layout.dim[0].size=profile.data.size()/2;
+        output.layout.dim[0].stride=profile.data.size();
+        output.layout.dim[1].label="vw";
+        output.layout.dim[1].size=2; output.layout.dim[1].stride=2;
     }
-
-    // A final mode-independent envelope. Dynamics primitives are individually feasible,
-    // but concatenating them can otherwise introduce an instantaneous command jump at an
-    // edge. Arc profiles already satisfy these passes; applying them again is idempotent.
-    void enforceVelocityEnvelope(const nav_msgs::Path& path,
-                                 std_msgs::Float32MultiArray& profile) const {
-        const size_t n = path.poses.size();
-        if(n < 2 || profile.data.size() != 2*n) return;
-        std::vector<double> ds(n-1), dyaw(n-1), raw_v(n), vmag(n), wmag(n);
-        std::vector<int> vsign(n,1), wsign(n,1);
-        for(size_t i=0; i+1<n; ++i) {
-            const auto& a = path.poses[i].pose;
-            const auto& b = path.poses[i+1].pose;
-            ds[i] = std::hypot(b.position.x-a.position.x, b.position.y-a.position.y);
-            dyaw[i] = std::abs(wrap(tf2::getYaw(b.orientation)-tf2::getYaw(a.orientation)));
-        }
-        for(size_t i=0; i<n; ++i) {
-            raw_v[i] = profile.data[2*i];
-            vsign[i] = std::signbit(raw_v[i]) ? -1 : 1;
-            wsign[i] = std::signbit(profile.data[2*i+1]) ? -1 : 1;
-            vmag[i] = std::min(std::abs(raw_v[i]), sp_.v_max);
-            wmag[i] = std::min(std::abs(static_cast<double>(profile.data[2*i+1])), sp_.w_max);
-        }
-        vmag.front() = 0.0;
-        vmag.back() = 0.0;
-        for(size_t i=1; i<n; ++i) {
-            if(std::abs(raw_v[i-1]) > 1e-6 && std::abs(raw_v[i]) > 1e-6 &&
-               vsign[i-1] != vsign[i]) {
-                vmag[i] = 0.0;
-            }
-        }
-        for(size_t i=1; i<n; ++i)
-            vmag[i] = std::min(vmag[i], std::sqrt(vmag[i-1]*vmag[i-1] + 2.0*sp_.a_max*ds[i-1]));
-        for(size_t i=n-1; i-->0;)
-            vmag[i] = std::min(vmag[i], std::sqrt(vmag[i+1]*vmag[i+1] + 2.0*sp_.a_max*ds[i]));
-
-        // When linear acceleration reduces a translating sample, scale yaw rate with it so
-        // the primitive curvature is retained before the angular envelope is applied.
-        for(size_t i=0; i<n; ++i) {
-            if(std::abs(raw_v[i]) > 1e-6)
-                wmag[i] *= vmag[i]/std::abs(raw_v[i]);
-        }
-        for(size_t i=1; i<n; ++i) {
-            const double previous_w = profile.data[2*(i-1)+1];
-            const double current_w = profile.data[2*i+1];
-            if(std::abs(previous_w) > 1e-6 && std::abs(current_w) > 1e-6 &&
-               wsign[i-1] != wsign[i]) {
-                wmag[i] = 0.0;
-            }
-        }
-        for(size_t i=1; i<n; ++i)
-            wmag[i] = std::min(wmag[i], std::sqrt(wmag[i-1]*wmag[i-1] + 2.0*sp_.alpha_max*dyaw[i-1]));
-        for(size_t i=n-1; i-->0;)
-            wmag[i] = std::min(wmag[i], std::sqrt(wmag[i+1]*wmag[i+1] + 2.0*sp_.alpha_max*dyaw[i]));
-
-        for(size_t i=0; i<n; ++i) {
-            profile.data[2*i] = static_cast<float>(vsign[i]*vmag[i]);
-            profile.data[2*i+1] = static_cast<float>(wsign[i]*wmag[i]);
+    static void rosPath(const PlannerPath& path,nav_msgs::Path& output) {
+        output.poses.clear();
+        for(const auto& p:path.poses) {
+            geometry_msgs::PoseStamped pose; pose.header=output.header;
+            pose.pose.position.x=p.x; pose.pose.position.y=p.y;
+            tf2::Quaternion q; q.setRPY(0,0,p.yaw); pose.pose.orientation=tf2::toMsg(q);
+            output.poses.push_back(pose);
         }
     }
-
-    // Arc mode has no offline (v, w) library, so the planner profiles its own path here.
-    // The atomic trajectory requires one desired effective body twist per pose. A classic
-    // forward/backward trapezoidal pass keeps those values within the shared dynamics
-    // envelope before the follower applies inverse slip compensation once.
-    void buildVelocityProfile(nav_msgs::Path& path,
-                              std_msgs::Float32MultiArray& vel_profile) const {
-        // Ideal lattice edges only contain their endpoints. Densify every already
-        // collision-checked edge once so the incoming-command convention has a usable
-        // non-zero sample between zero-speed boundaries. This is especially important for
-        // in-place rotations followed by translation: without an interior yaw sample the
-        // angular deceleration pass correctly reduces the shared endpoint to w=0, leaving
-        // no feed-forward sample with which to execute the rotation.
-        if(path.poses.size() >= 2) {
-            std::vector<geometry_msgs::PoseStamped> dense;
-            dense.reserve(path.poses.size()*2-1);
-            for(size_t i=0; i+1<path.poses.size(); ++i) {
-                const auto& first = path.poses[i];
-                const auto& last = path.poses[i+1];
-                dense.push_back(first);
-                const double dx = last.pose.position.x-first.pose.position.x;
-                const double dy = last.pose.position.y-first.pose.position.y;
-                const double first_yaw = tf2::getYaw(first.pose.orientation);
-                const double dyaw = wrap(tf2::getYaw(last.pose.orientation)-first_yaw);
-                if(std::hypot(dx,dy) > 1e-3 || std::abs(dyaw) > 1e-3) {
-                    geometry_msgs::PoseStamped middle = first;
-                    middle.pose.position.x = 0.5*(first.pose.position.x+last.pose.position.x);
-                    middle.pose.position.y = 0.5*(first.pose.position.y+last.pose.position.y);
-                    middle.pose.position.z = 0.5*(first.pose.position.z+last.pose.position.z);
-                    tf2::Quaternion q;
-                    q.setRPY(0.0,0.0,wrap(first_yaw+0.5*dyaw));
-                    middle.pose.orientation = tf2::toMsg(q);
-                    dense.push_back(middle);
-                }
-            }
-            dense.push_back(path.poses.back());
-            path.poses.swap(dense);
-        }
-        const size_t n = path.poses.size();
-        vel_profile.data.assign(2*n, 0.0f);
-        vel_profile.layout.dim.resize(2);
-        vel_profile.layout.dim[0].label = "pairs";
-        vel_profile.layout.dim[0].size = n;
-        vel_profile.layout.dim[0].stride = 2*n;
-        vel_profile.layout.dim[1].label = "vw";
-        vel_profile.layout.dim[1].size = 2;
-        vel_profile.layout.dim[1].stride = 2;
-        if(n < 2) return;
-
-        const size_t segs = n - 1;
-        prof_ds_.resize(segs); prof_dyaw_.resize(segs); prof_kappa_.resize(segs);
-        prof_dir_.resize(segs); prof_v_.resize(n); prof_w_.resize(n);
-        prof_yaw_.resize(n); prof_wmag_.resize(n);
-
-        for(size_t i=0;i<n;++i) prof_yaw_[i] = tf2::getYaw(path.poses[i].pose.orientation);
-        for(size_t i=0;i<segs;++i) {
-            const double dx = path.poses[i+1].pose.position.x - path.poses[i].pose.position.x;
-            const double dy = path.poses[i+1].pose.position.y - path.poses[i].pose.position.y;
-            prof_ds_[i] = static_cast<float>(std::hypot(dx,dy));
-            prof_dyaw_[i] = static_cast<float>(wrap(prof_yaw_[i+1]-prof_yaw_[i]));
-            if(prof_ds_[i] < 1e-3f) {          // in-place rotation step
-                prof_dir_[i] = 0;
-                prof_kappa_[i] = 0.0f;
-            } else {
-                prof_dir_[i] = std::cos(wrap(std::atan2(dy,dx)-prof_yaw_[i])) >= 0.0 ? 1 : -1;
-                prof_kappa_[i] = prof_dyaw_[i]/prof_ds_[i];
-            }
-        }
-
-        for(size_t i=0;i<n;++i) {
-            // Match dynamics-primitives semantics: sample i carries the command that
-            // arrives at pose i, so every pose after the first uses its incoming segment.
-            const size_t s = i == 0 ? 0 : i-1;
-            double lim = sp_.v_max;
-            const double k = std::abs(prof_kappa_[s]);
-            if(k > 1e-3) lim = std::min(lim, sp_.w_max/k);
-            lim *= terrainSpeedScaleAt(path.poses[i].pose.position.x,
-                                       path.poses[i].pose.position.y);
-            if(prof_dir_[s] < 0) lim = std::min(lim, reverse_speed_frac_*sp_.v_max);
-            const bool rotating = (i > 0 && prof_dir_[i-1] == 0) || (i < segs && prof_dir_[i] == 0);
-            const bool reversal = (i > 0 && i < segs && prof_dir_[i-1]*prof_dir_[i] < 0);
-            if(i == 0 || i == n-1 || rotating || reversal) lim = 0.0;
-            prof_v_[i] = static_cast<float>(std::max(lim, 0.0));
-        }
-
-        for(size_t i=1;i<n;++i)
-            prof_v_[i] = std::min(prof_v_[i], static_cast<float>(
-                std::sqrt(prof_v_[i-1]*prof_v_[i-1] + 2.0*sp_.a_max*prof_ds_[i-1])));
-        for(size_t i=n-1;i-->0;)
-            prof_v_[i] = std::min(prof_v_[i], static_cast<float>(
-                std::sqrt(prof_v_[i+1]*prof_v_[i+1] + 2.0*sp_.a_max*prof_ds_[i])));
-
-        // Angular: curvature-implied rate where the vehicle translates, and a dedicated
-        // in-place rate where it does not (otherwise the profile is a dead zero exactly
-        // where the rover is supposed to be turning on the spot).
-        for(size_t i=0;i<n;++i) {
-            const size_t s = i == 0 ? 0 : i-1;
-            double w = prof_v_[i]*prof_kappa_[s];
-            if(i == 0) {
-                w = 0.0;  // same zero-speed boundary as the dynamics branch
-            } else if(prof_dir_[s] == 0 && std::abs(prof_dyaw_[s]) > 1e-3) {
-                const double mag = std::min(sp_.w_max,
-                                            std::sqrt(2.0*sp_.alpha_max*std::abs(prof_dyaw_[s])));
-                w = std::copysign(mag, prof_dyaw_[s]);
-            }
-            prof_w_[i] = static_cast<float>(std::clamp(w, -sp_.w_max, sp_.w_max));
-        }
-        // Same trapezoidal pass on |w| over angular arc length, so alpha_max is honoured.
-        for(size_t i=0;i<n;++i) prof_wmag_[i] = std::abs(prof_w_[i]);
-        for(size_t i=1;i<n;++i)
-            prof_wmag_[i] = std::min(prof_wmag_[i], static_cast<float>(
-                std::sqrt(prof_wmag_[i-1]*prof_wmag_[i-1] + 2.0*sp_.alpha_max*std::abs(prof_dyaw_[i-1]))));
-        for(size_t i=n-1;i-->0;)
-            prof_wmag_[i] = std::min(prof_wmag_[i], static_cast<float>(
-                std::sqrt(prof_wmag_[i+1]*prof_wmag_[i+1] + 2.0*sp_.alpha_max*std::abs(prof_dyaw_[i]))));
-
-        float v_peak = 0.0f;
-        for(size_t i=0;i<n;++i) {
-            const size_t s = i == 0 ? 0 : i-1;
-            const float signed_v = prof_dir_[s] < 0 ? -prof_v_[i] : prof_v_[i];
-            vel_profile.data[2*i]   = signed_v;
-            vel_profile.data[2*i+1] = std::copysign(prof_wmag_[i], prof_w_[i]);
-            v_peak = std::max(v_peak, prof_v_[i]);
-        }
-        enforceVelocityEnvelope(path, vel_profile);
-        ROS_INFO_THROTTLE(2.0, "vprofile: n=%zu v_peak=%.2f", n, v_peak);
+    void buildVelocityProfile(nav_msgs::Path& path,std_msgs::Float32MultiArray& profile) const {
+        PlannerPath plain; PlannerProfile velocities;
+        for(const auto& p:path.poses) plain.poses.push_back(corePose(p));
+        LatticePlannerCore::buildVelocityProfile(plain,velocities);
+        rosPath(plain,path); rosProfile(velocities,profile);
     }
-
-    // Nudge an unreachable goal onto the nearest pose whose footprint actually validates.
-    // 要点13 is about planning close to obstacles: the strict footprint test rejects a goal
-    // whose 1.8x1.5m box clips a single unobserved or lethal cell, which happens whenever the
-    // operator clicks within about one body half-diagonal (hypot(0.9,0.75)=1.17m) of the edge
-    // of the observed region -- even though a pose a few decimetres away is perfectly drivable.
-    // This moves the goal; it does NOT relax the collision test. Rings are ordered by distance,
-    // so the first ring containing any valid candidate is the best one and the search stops there.
-    //
-    // Candidates are checked with the footprint inflated by goal_snap_clearance_, because
-    // "nearest pose that validates" is by construction a pose on the lethal boundary, and
-    // parking there leaves nothing to absorb the two errors that are always present: the
-    // hazard map is quantised to one cell (a corner can sit 0.106 m past the last cell centre
-    // the check looked at), and the follower stops within goal_yaw_tolerance of the commanded
-    // heading (10 deg of yaw slews a corner 0.12 m further out than the yaw that was checked).
-    // Measured without the margin: the rover parked 0.13 m inside the (0,-2) boulder having
-    // passed its own footprint test. The ordinary 0.25 m trajectory band covers those two
-    // terms; the snapped endpoint adds the measured far-to-near map-boundary change, for a
-    // 0.50 m default. The margin band tolerates unobserved cells -- see the call site.
-    bool snapGoal(const State& requested, double max_distance, double budget_s,
-                  const std::chrono::steady_clock::time_point& begin,
-                  State& snapped, double& snap_dist) const {
-        grid_map::Position rp;
-        if(!map_.getPosition(grid_map::Index(requested.x, requested.y), rp)) return false;
-        const double res = map_.getResolution();
-        const int max_ring = std::max(1, static_cast<int>(std::ceil(max_distance/res)));
-        const double heading_step = 2.0*M_PI/bins_;
-
-        for(int r = 1; r <= max_ring; ++r) {
-            if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count() > budget_s)
-                return false;
-            double best_score = std::numeric_limits<double>::infinity();
-            bool found = false;
-            for(int dx = -r; dx <= r; ++dx) {
-                for(int dy = -r; dy <= r; ++dy) {
-                    if(std::max(std::abs(dx), std::abs(dy)) != r) continue;   // perimeter only
-                    // Stepped in world space, not index space: grid_map is a circular buffer,
-                    // so index arithmetic wraps to the wrong cell at the buffer seam.
-                    grid_map::Index idx;
-                    if(!map_.getIndex(grid_map::Position(rp.x()+dx*res, rp.y()+dy*res), idx)) continue;
-                    grid_map::Position cp;
-                    if(!map_.getPosition(idx, cp)) continue;
-                    const double dist = (cp - rp).norm();
-                    if(dist > max_distance) continue;
-                    for(int db = -goal_snap_heading_span_; db <= goal_snap_heading_span_; ++db) {
-                        const int t = ((requested.t + db) % bins_ + bins_) % bins_;
-                        float cost;
-                        // The body itself must stand on known drivable ground, strictly;
-                        // only the clearance band may contain unknown cells.
-                        if(!footprintWithClearanceValid(cp.x(), cp.y(), yawForBin(t), cost,
-                                                       /*allow_body_unknown=*/false,
-                                                       goal_snap_clearance_)) continue;
-                        const double score = dist
-                            + goal_snap_heading_weight_*std::abs(db)*heading_step*primitive_length_
-                            + goal_snap_cost_weight_*(cost/99.0);
-                        if(score < best_score) {
-                            best_score = score; found = true;
-                            snapped = {idx(0), idx(1), t}; snap_dist = dist;
-                        }
-                    }
-                }
-            }
-            if(found) return true;
-        }
-        return false;
-    }
-
-    // Timed wrapper: goal snapping has to come out of max_planning_time rather than be
-    // charged on top of it, and plan_ms is the 规划耗时 metric the harness reads back.
-    bool plan(const geometry_msgs::PoseStamped& start_pose,
-              const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
-              std_msgs::Float32MultiArray& vel_profile) {
-        const auto begin = std::chrono::steady_clock::now();
-        last_fail_reason_.clear();
-        const bool ok = planImpl(start_pose, goal_pose, path, vel_profile, begin);
-        last_plan_ms_ = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - begin).count();
-        return ok;
-    }
-
-    bool planImpl(const geometry_msgs::PoseStamped& start_pose,
-                  const geometry_msgs::PoseStamped& goal_pose, nav_msgs::Path& path,
-                  std_msgs::Float32MultiArray& vel_profile,
-                  const std::chrono::steady_clock::time_point& begin) {
-        path.poses.clear(); vel_profile.data.clear();
-        snapped_goal_used_ = false; last_snap_dist_ = 0.0;
-        State start, goal;
-        if(!poseToState(start_pose,start)) {
-            ROS_WARN_THROTTLE(1.0, "plan: start pose not in map (frame='%s', x=%.2f y=%.2f)",
-                              start_pose.header.frame_id.c_str(),
-                              start_pose.pose.position.x, start_pose.pose.position.y);
-            last_fail_reason_ = "start_off_map";
+    bool plan(const geometry_msgs::PoseStamped& start,const geometry_msgs::PoseStamped& goal,
+              nav_msgs::Path& path,std_msgs::Float32MultiArray& profile,bool query_only=false) {
+        const auto attempt_begin=std::chrono::steady_clock::now();
+        path.poses.clear(); profile.data.clear();
+        if((!start.header.frame_id.empty() && start.header.frame_id!=map_frame_) ||
+           (!goal.header.frame_id.empty() && goal.header.frame_id!=map_frame_)) {
+            if(!query_only) last_fail_reason_="invalid_frame";
             return false;
         }
-        if(!poseToState(goal_pose,goal)) {
-            ROS_WARN_THROTTLE(1.0, "plan: goal pose not in map (frame='%s', x=%.2f y=%.2f)",
-                              goal_pose.header.frame_id.c_str(),
-                              goal_pose.pose.position.x, goal_pose.pose.position.y);
-            last_fail_reason_ = "goal_off_map";
-            return false;
-        }
-        float dummy;
-        grid_map::Position sp, gp;
-        map_.getPosition(grid_map::Index(start.x,start.y),sp);
-        map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-        // The current body cannot be required to retroactively satisfy a clearance margin
-        // that a refined map has just moved across it. Known lethal terrain under the
-        // physical rectangle is still rejected. On the root's outgoing edge only, grow
-        // the extra band to full clearance at its endpoint; requiring the full band at
-        // the very first swept sample could leave a safe departure with zero successors.
-        if(!footprintValid(sp.x(),sp.y(),yawForBin(start.t),dummy,
-                           /*allow_unknown=*/true)) {
-            float actual_cost;
-            const auto& actual = start_pose.pose;
-            const bool actual_valid = footprintValid(actual.position.x, actual.position.y,
-                tf2::getYaw(actual.orientation), actual_cost, /*allow_unknown=*/true);
-            ROS_WARN_THROTTLE(1.0, "plan: START footprint invalid at (%.2f,%.2f) yaw=%.2f "
-                              "(a LETHAL cell or over-limit slope lies under the vehicle; "
-                              "unobserved cells are tolerated at the start); goal_id=%u "
-                              "actual=(%.3f,%.3f,%.3f) actual_body_valid=%s map_stamp=%.6f",
-                              sp.x(), sp.y(), yawForBin(start.t), goal_id_,
-                              actual.position.x, actual.position.y, tf2::getYaw(actual.orientation),
-                              actual_valid ? "true" : "false", map_stamp_.toSec());
-            logFootprintRejection({actual.position.x,actual.position.y,
-                                   tf2::getYaw(actual.orientation)},"start_body");
-            last_fail_reason_ = "start_footprint";
-            return false;
-        }
-        const auto& actual_start = start_pose.pose;
-        if(!sweptSegmentValid(
-                {actual_start.position.x, actual_start.position.y,
-                 tf2::getYaw(actual_start.orientation)},
-                {sp.x(), sp.y(), yawForBin(start.t)},
-                0.0, 0.0, /*allow_start_unknown=*/true, dummy)) {
-            ROS_WARN_THROTTLE(1.0, "plan: START lattice connector invalid: goal_id=%u "
-                              "actual=(%.3f,%.3f,%.3f) lattice=(%.3f,%.3f,%.3f)",
-                              goal_id_, actual_start.position.x, actual_start.position.y,
-                              tf2::getYaw(actual_start.orientation),
-                              sp.x(), sp.y(), yawForBin(start.t));
-            last_fail_reason_ = "start_connector";
-            return false;
-        }
-        if(!trajectoryFootprintValid(gp.x(),gp.y(),yawForBin(goal.t),dummy)) {
-            State snapped; double snap_dist;
-            if(!snapGoal(goal, max_snap_distance_, max_planning_time_*0.2, begin, snapped, snap_dist)) {
-                ROS_WARN_THROTTLE(1.0, "plan: GOAL footprint invalid at (%.2f,%.2f) yaw=%.2f and no "
-                                  "valid pose within %.2fm (pick a goal on clear, observed terrain)",
-                                  gp.x(), gp.y(), yawForBin(goal.t), max_snap_distance_);
-                last_fail_reason_ = "goal_invalid";
-                return false;
+        // Called under the ROS adapter's existing mutex: capture exactly the consumed
+        // map/cache and effective Relax parameters, not the latest asynchronous topics.
+        PlanningInput input;
+        if(snapshot_writer_.enabled() || query_only) input=captureInput(corePose(start),corePose(goal));
+        else { input.start=corePose(start); input.goal=corePose(goal); }
+        input.attempt_id=++attempt_id_;
+        input.goal_id=query_only ? 0 : goal_id_;
+        input.goal_stamp_ns=goal.header.stamp.toNSec();
+        input.start_stamp_ns=start.header.stamp.toNSec(); input.map_stamp_ns=map_stamp_.toNSec();
+        input.frame=map_frame_; input.source=query_only ? "service" : "mission";
+        PlanningResult result;
+        if(query_only) {
+            // A service calculation must not change active-goal snapping, failure or
+            // recovery state. The same production algorithm runs in an isolated context.
+            LatticePlannerCore query(input);
+            result=query.planCore(corePose(start),corePose(goal));
+        } else {
+            result=planCore(corePose(start),corePose(goal));
+            if(!result.ok && result.reason=="start_no_successor") {
+                State root;
+                if(LatticePlannerCore::poseToState(corePose(start),root)) diagnoseRootActions(root);
             }
-            goal = snapped;
-            map_.getPosition(grid_map::Index(goal.x,goal.y),gp);
-            snapped_goal_used_ = true; last_snap_dist_ = snap_dist;
-            geometry_msgs::PoseStamped snapped_msg;
-            snapped_msg.header.frame_id = map_frame_;
-            snapped_msg.header.stamp = ros::Time::now();
-            snapped_msg.pose.position.x = gp.x(); snapped_msg.pose.position.y = gp.y();
-            tf2::Quaternion sq; sq.setRPY(0,0,yawForBin(goal.t));
-            snapped_msg.pose.orientation = tf2::toMsg(sq);
-            snapped_goal_pub_.publish(snapped_msg);
-            ROS_WARN_THROTTLE(1.0, "plan: goal snapped %.2fm to (%.2f,%.2f) yaw=%.2f",
-                              snap_dist, gp.x(), gp.y(), yawForBin(goal.t));
-        }
-
-        const bool use_dynamics = use_dynamics_primitives_ && !primitive_lib_.empty();
-        const int rows=map_.getSize()(0), cols=map_.getSize()(1), count=rows*cols*bins_;
-        std::vector<float> g(count,std::numeric_limits<float>::infinity());
-        std::vector<int> parent(count,-1);
-        std::vector<int> parent_prim(count,-1);
-        std::vector<uint8_t> closed(count,0);
-        std::priority_queue<QueueNode> open;
-        const int sk=key(start,cols);
-        g[sk]=0.0f; open.push({static_cast<float>(heuristic_weight_)*heuristic(start,goal),sk});
-        int reached=-1;
-        float reached_error=std::numeric_limits<float>::infinity();
-        int expanded=0, root_successors=0;
-        while(!open.empty()) {
-            if(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()>max_planning_time_) break;
-            const int ck=open.top().key; open.pop();
-            if(closed[ck]) continue;
-            closed[ck]=1; ++expanded;
-            const State cur=stateFromKey(ck,cols);
-            if(cur.t==goal.t) {
-                const float error = heuristic(cur,goal);
-                // A tolerance hit is a valid fallback, but publishing the first such
-                // state makes the endpoint jump by several cells between replans. Near
-                // the goal that changed the first segment from forward to reverse on
-                // alternate maps and produced a persistent limit cycle. Prefer the exact
-                // lattice goal whenever it is reachable; if the time budget expires,
-                // retain the closest safe tolerance candidate found so recovery/goal
-                // snapping still have their intended escape hatch.
-                if(error <= goal_tolerance_ && error < reached_error) {
-                    bool endpoint_safe = true;
-                    if(snapped_goal_used_) {
-                        grid_map::Position candidate;
-                        float endpoint_cost;
-                        endpoint_safe = map_.getPosition(grid_map::Index(cur.x, cur.y), candidate) &&
-                            footprintWithClearanceValid(candidate.x(), candidate.y(),
-                                                        yawForBin(cur.t), endpoint_cost,
-                                                        /*allow_body_unknown=*/false,
-                                                        goal_snap_clearance_);
-                    }
-                    if(endpoint_safe) {
-                        reached=ck;
-                        reached_error=error;
-                    }
-                }
-                if(cur.x==goal.x && cur.y==goal.y) {
-                    reached=ck;
-                    reached_error=0.0f;
-                    break;
-                }
+            if(result.snapped) {
+                geometry_msgs::PoseStamped snap; snap.header.frame_id=map_frame_;
+                snap.header.stamp=ros::Time::now(); snap.header.seq=goal_id_;
+                snap.pose.position.x=result.selected_goal.x; snap.pose.position.y=result.selected_goal.y;
+                tf2::Quaternion q; q.setRPY(0,0,result.selected_goal.yaw); snap.pose.orientation=tf2::toMsg(q);
+                snapped_goal_pub_.publish(snap);
+                ROS_WARN_THROTTLE(1.0,"plan: goal snapped %.2fm to (%.2f,%.2f) yaw=%.2f",
+                    result.snap_distance,result.selected_goal.x,result.selected_goal.y,result.selected_goal.yaw);
             }
-            if(use_dynamics) {
-                grid_map::Position cp;
-                if(!map_.getPosition(grid_map::Index(cur.x,cur.y),cp)) continue;
-                const double cyaw=yawForBin(cur.t);
-                const auto& prims=primitive_lib_.primitivesFor(cur.t);
-                for(size_t pi=0; pi<prims.size(); ++pi) {
-                    const MotionPrimitive& prim=prims[pi];
-                    float terrain; double ex,ey,eyaw;
-                    if(!primitiveValid(cp.x(),cp.y(),cyaw,prim,terrain,ex,ey,eyaw,
-                                       /*departure=*/ck==sk)) continue;
-                    grid_map::Index idx;
-                    if(!map_.getIndex(grid_map::Position(ex,ey),idx)) continue;
-                    State next{idx(0),idx(1),prim.end_bin};
-                    if(next.x==cur.x && next.y==cur.y && next.t==cur.t) continue;
-                    // The next primitive starts at the lattice centre/bin, not at the
-                    // previous primitive's unquantised last sample. Validate that join.
-                    grid_map::Position next_position;
-                    float join_cost;
-                    if(!map_.getPosition(idx,next_position) ||
-                       !sweptSegmentValid({ex,ey,eyaw},
-                            {next_position.x(),next_position.y(),yawForBin(next.t)},
-                            trajectoryClearance(), trajectoryClearance(), false, join_cost)) continue;
-                    if(ck==sk) ++root_successors;
-                    const int nk=key(next,cols); if(closed[nk]) continue;
-                    const float ec=static_cast<float>(prim.base_cost*(1.0+0.01*terrain));
-                    const float ng=g[ck]+ec;
-                    if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; parent_prim[nk]=static_cast<int>(pi);
-                        open.push({ng+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
-                }
-            } else {
-                for(int direction : {-1,1}) for(int turn=-1;turn<=1;++turn) {
-                    State next; float ec;
-                    if(!transition(cur,direction,turn,next,ec,/*departure=*/ck==sk)) continue;
-                    if(ck==sk) ++root_successors;
-                    const int nk=key(next,cols); if(closed[nk]) continue;
-                    const float ng=g[ck]+ec;
-                    if(ng<g[nk]) { g[nk]=ng; parent[nk]=ck; open.push({ng+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
-                }
-                for(int turn : {-1,1}) {
-                    State next; float ec;
-                    if(!transition(cur,0,turn,next,ec,/*departure=*/ck==sk)) continue;
-                    if(ck==sk) ++root_successors;
-                    const int nk=key(next,cols); if(g[ck]+ec<g[nk]) { g[nk]=g[ck]+ec; parent[nk]=ck; open.push({g[nk]+static_cast<float>(heuristic_weight_)*heuristic(next,goal),nk}); }
-                }
-            }
-        }
-        if(reached<0) {
-            const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
-            const bool start_has_band = footprintWithClearanceValid(
-                sp.x(),sp.y(),yawForBin(start.t),dummy,true,trajectoryClearance());
-            ROS_WARN_THROTTLE(1.0, "plan: search exhausted without reaching goal "
-                              "(goal_id=%u mode=%s expanded=%d nodes root_successors=%d "
-                              "elapsed=%.3fs goal_bin=%d goal_tol=%.2f "
-                              "start_clearance_valid=%s clearance=%.2fm budget_exhausted=%s).",
-                              goal_id_, use_dynamics?"dynamics":"arcs", expanded, root_successors,
-                              elapsed, goal.t, goal_tolerance_, start_has_band ? "true" : "false",
-                              trajectoryClearance(), elapsed >= max_planning_time_ ? "true" : "false");
-            last_fail_reason_ = expanded==1 && root_successors==0 ? "start_no_successor"
-                                 : (elapsed >= max_planning_time_ ? "search_timeout" : "search_exhausted");
-            if(expanded==1 && root_successors==0) {
-                logFootprintRejection({sp.x(),sp.y(),yawForBin(start.t)},
-                                       "start_clearance",trajectoryClearance());
-                if(!use_dynamics) diagnoseRootActions(start);
-            }
-            return false;
-        }
-        if(reached_error > 1e-4f) {
-            ROS_WARN_THROTTLE(1.0,
-                              "plan: exact goal state unavailable within budget; "
-                              "using closest tolerance endpoint %.3fm away",
-                              reached_error);
         }
         path.header.frame_id=map_frame_; path.header.stamp=ros::Time::now();
-
-        if(use_dynamics) {
-            const SkidSteerModel nominal_model(sp_);
-            std::vector<int> node_keys;
-            for(int k=reached;k>=0;k=parent[k]) { node_keys.push_back(k); if(k==sk) break; }
-            std::reverse(node_keys.begin(),node_keys.end());
-            const State s0=stateFromKey(sk,cols);
-            grid_map::Position p0; map_.getPosition(grid_map::Index(s0.x,s0.y),p0);
-            geometry_msgs::PoseStamped pose0; pose0.header=path.header;
-            pose0.pose.position.x=p0.x(); pose0.pose.position.y=p0.y();
-            tf2::Quaternion q0; q0.setRPY(0,0,yawForBin(s0.t)); pose0.pose.orientation=tf2::toMsg(q0);
-            path.poses.push_back(pose0);
-            vel_profile.data.push_back(0.0f); vel_profile.data.push_back(0.0f);
-            for(size_t e=1;e<node_keys.size();++e) {
-                const int childK=node_keys[e], parentK=node_keys[e-1];
-                const State ps=stateFromKey(parentK,cols);
-                grid_map::Position pp; map_.getPosition(grid_map::Index(ps.x,ps.y),pp);
-                const double pyaw=yawForBin(ps.t);
-                const auto& prims=primitive_lib_.primitivesFor(ps.t);
-                const int pi=parent_prim[childK];
-                if(pi<0 || pi>=static_cast<int>(prims.size())) continue;
-                const MotionPrimitive& prim=prims[pi];
-                const double c=std::cos(pyaw), s=std::sin(pyaw);
-                for(size_t i=0;i<prim.samples.size();++i) {
-                    const auto& smp=prim.samples[i];
-                    const double wx=pp.x()+c*smp.x - s*smp.y;
-                    const double wy=pp.y()+s*smp.x + c*smp.y;
-                    const double wyaw=wrap(pyaw+smp.yaw);
-                    geometry_msgs::PoseStamped pose; pose.header=path.header;
-                    pose.pose.position.x=wx; pose.pose.position.y=wy;
-                    tf2::Quaternion q; q.setRPY(0,0,wyaw); pose.pose.orientation=tf2::toMsg(q);
-                    path.poses.push_back(pose);
-                    // Primitive files store wheel-command inputs because those commands are
-                    // what generated the samples. The public trajectory instead carries the
-                    // desired effective body twist, so the follower can apply inverse slip
-                    // exactly once. Scale both components together on translating samples to
-                    // preserve curvature while applying the same terrain policy as arc mode.
-                    BodyTwist desired = nominal_model.effectiveTwist(
-                        prim.v_profile[i], prim.w_profile[i]);
-                    if(prim.direction != 0) {
-                        const double terrain_scale = terrainSpeedScaleAt(wx, wy);
-                        desired.vx *= terrain_scale;
-                        desired.omega *= terrain_scale;
-                    }
-                    vel_profile.data.push_back(static_cast<float>(desired.vx));
-                    vel_profile.data.push_back(static_cast<float>(desired.omega));
-                }
-            }
-            vel_profile.layout.dim.resize(2);
-            vel_profile.layout.dim[0].label="pairs"; vel_profile.layout.dim[0].size=path.poses.size(); vel_profile.layout.dim[0].stride=path.poses.size()*2;
-            vel_profile.layout.dim[1].label="vw"; vel_profile.layout.dim[1].size=2; vel_profile.layout.dim[1].stride=2;
-            enforceVelocityEnvelope(path, vel_profile);
-            return !path.poses.empty();
+        rosPath(result.path,path); rosProfile(result.profile,profile);
+        result.total_ms=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-attempt_begin).count();
+        if(!query_only) { last_plan_ms_=result.total_ms; last_mission_attempt_id_=input.attempt_id; }
+        std_msgs::String attempt; attempt.data=planningResultJson(input,result); attempt_pub_.publish(attempt);
+        ROS_INFO("planning_attempt %s",attempt.data.c_str());
+        if(snapshot_writer_.enabled()) {
+            if(!snapshot_writer_.submit(std::move(input),std::move(result)))
+                ROS_ERROR("planning snapshot dropped: writer queue full");
+            const auto stats=snapshot_writer_.stats();
+            if(stats.failed || stats.dropped)
+                ROS_ERROR_THROTTLE(1.0,"planning snapshot incomplete: failed=%llu dropped=%llu",
+                    static_cast<unsigned long long>(stats.failed),static_cast<unsigned long long>(stats.dropped));
         }
-
-        std::vector<State> states;
-        for(int k=reached;k>=0;k=parent[k]) { states.push_back(stateFromKey(k,cols)); if(k==sk) break; }
-        std::reverse(states.begin(),states.end());
-        for(const auto& s:states) {
-            grid_map::Position p; map_.getPosition(grid_map::Index(s.x,s.y),p);
-            geometry_msgs::PoseStamped pose; pose.header=path.header;
-            pose.pose.position.x=p.x(); pose.pose.position.y=p.y();
-            tf2::Quaternion q; q.setRPY(0,0,yawForBin(s.t)); pose.pose.orientation=tf2::toMsg(q);
-            path.poses.push_back(pose);
-        }
-        if(path.poses.empty()) return false;
-        buildVelocityProfile(path, vel_profile);
-        return true;
+        return !path.poses.empty();
     }
 
     ros::NodeHandle nh_,pnh_; ros::Subscriber map_sub_,goal_sub_,follower_diag_sub_,odom_sub_;
-    ros::Publisher path_pub_,vel_pub_,trajectory_pub_,status_pub_,snapped_goal_pub_,diag_pub_;
+    ros::Publisher path_pub_,vel_pub_,trajectory_pub_,status_pub_,snapped_goal_pub_,diag_pub_,attempt_pub_;
+    PlanningSnapshotWriter snapshot_writer_;
+    std::uint64_t attempt_id_=0,last_mission_attempt_id_=0;
     ros::ServiceServer service_; ros::Timer timer_; tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
     std::mutex mutex_; grid_map::GridMap map_; ros::Time map_stamp_; geometry_msgs::PoseStamped goal_; nav_msgs::Path last_path_;
     bool have_map_=false,have_goal_=false,replan_requested_=false;
-    int bins_; double primitive_length_,heuristic_weight_,reverse_cost_,rotation_cost_,max_planning_time_,max_map_age_,goal_tolerance_;
-    double footprint_length_,footprint_width_,max_long_slope_,max_lat_slope_;
+    double max_map_age_;
     std::string map_frame_,base_frame_,odometry_topic_;
-    bool use_dynamics_primitives_=false; std::string motion_primitive_file_;
+    std::string motion_primitive_file_;
     bool debug_start_rejections_=false;
     uint32_t last_root_debug_goal_=0;
     ros::Time last_root_debug_time_;
-    MotionPrimitiveLibrary primitive_lib_;
-    std::vector<float> cell_cost_, cell_gx_, cell_gy_, cell_slopemag_; int cell_cols_=0;
-    SkidSteerParams sp_;
-    double terrain_speed_gain_, min_speed_scale_, reverse_speed_frac_;
-    double max_snap_distance_, goal_snap_heading_weight_, goal_snap_cost_weight_;
-    double trajectory_clearance_, goal_snap_clearance_;
-    int goal_snap_heading_span_;
-    bool snapped_goal_used_=false; double last_snap_dist_=0.0;
 
     PlannerMode mode_ = PlannerMode::Nominal;
     RecoveryAction action_ = RecoveryAction::None;
@@ -2017,10 +1331,6 @@ private:
     PostBackoutReplanWindow post_backout_replan_;
     std_msgs::Float32MultiArray backout_profile_;
     ros::Time active_trajectory_map_stamp_;
-    std::string last_fail_reason_;
-    mutable std::vector<float> prof_ds_, prof_dyaw_, prof_kappa_, prof_v_, prof_w_, prof_wmag_;
-    mutable std::vector<double> prof_yaw_;
-    mutable std::vector<int> prof_dir_;
 };
 
 } // namespace groundgrid

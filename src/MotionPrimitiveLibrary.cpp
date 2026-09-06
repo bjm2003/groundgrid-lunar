@@ -112,6 +112,29 @@ const std::vector<MotionPrimitive>& MotionPrimitiveLibrary::primitivesFor(int bi
     return by_bin_[bin];
 }
 
+bool MotionPrimitiveLibrary::restore(int bins, const std::vector<MotionPrimitive>& primitives) {
+    if(bins<0 || bins>128 || (bins==0 && !primitives.empty()) || primitives.size()>32768) return false;
+    std::vector<std::vector<MotionPrimitive>> restored(static_cast<std::size_t>(bins));
+    std::size_t sample_count=0;
+    for(const auto& p:primitives) {
+        sample_count+=p.samples.size();
+        if(p.start_bin<0 || p.start_bin>=bins || p.end_bin<0 || p.end_bin>=bins ||
+           p.direction < -1 || p.direction > 1 || p.samples.empty() || sample_count>2000000 ||
+           p.samples.size()!=p.v_profile.size() || p.samples.size()!=p.w_profile.size() ||
+           !std::isfinite(p.dx) || !std::isfinite(p.dy) || !std::isfinite(p.dyaw) ||
+           !std::isfinite(p.length) || p.length<0 || !std::isfinite(p.base_cost) || p.base_cost<=0)
+            return false;
+        for(std::size_t i=0;i<p.samples.size();++i)
+            if(!std::isfinite(p.samples[i].x) || !std::isfinite(p.samples[i].y) ||
+               !std::isfinite(p.samples[i].yaw) || !std::isfinite(p.v_profile[i]) ||
+               !std::isfinite(p.w_profile[i])) return false;
+        restored[p.start_bin].push_back(p);
+    }
+    bins_=bins;
+    by_bin_=std::move(restored);
+    return true;
+}
+
 bool MotionPrimitiveLibrary::save(const std::string& path) const {
     std::ofstream out(path);
     if (!out) return false;

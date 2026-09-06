@@ -40,6 +40,7 @@ catkin_python_setup()
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common)
 find_package(Eigen3 REQUIRED)
+find_package(Threads REQUIRED)
 
 if(CATKIN_ENABLE_TESTING)
     find_package(rostest REQUIRED)
@@ -160,6 +161,9 @@ set_target_properties(${PROJECT_NAME}_skidsteer_lib PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
+add_library(${PROJECT_NAME}_planning_lib src/PlanningSnapshot.cpp)
+target_link_libraries(${PROJECT_NAME}_planning_lib ${PROJECT_NAME}_skidsteer_lib ${CMAKE_THREAD_LIBS_INIT})
+
 ## determines target name as lib[name].so, here: libfub_dummy_nodelet.so
 ## the library path in nodelet_plugins.xml refers to this file
 add_library(${PROJECT_NAME}_nodelet
@@ -202,7 +206,7 @@ add_dependencies(state_lattice_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} 
 add_dependencies(lunar_path_follower_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 target_link_libraries(lunar_traversability_node ${catkin_LIBRARIES})
-target_link_libraries(state_lattice_planner_node ${catkin_LIBRARIES} ${PROJECT_NAME}_skidsteer_lib)
+target_link_libraries(state_lattice_planner_node ${catkin_LIBRARIES} ${PROJECT_NAME}_planning_lib)
 target_link_libraries(lunar_path_follower_node ${catkin_LIBRARIES} ${PROJECT_NAME}_skidsteer_lib)
 
 ## Offline tools built on the pure C++ library (no ROS runtime needed).
@@ -218,12 +222,23 @@ target_link_libraries(planner_safety_selfcheck ${PROJECT_NAME}_skidsteer_lib)
 add_executable(backout_recovery_selfcheck src/backout_recovery_selfcheck.cpp)
 target_link_libraries(backout_recovery_selfcheck ${PROJECT_NAME}_skidsteer_lib)
 add_executable(blind_zone_ground_selfcheck src/blind_zone_ground_selfcheck.cpp)
+add_executable(planning_core_selfcheck src/planning_core_selfcheck.cpp)
+target_link_libraries(planning_core_selfcheck ${PROJECT_NAME}_planning_lib)
+add_executable(planning_snapshot_selfcheck src/planning_snapshot_selfcheck.cpp)
+target_link_libraries(planning_snapshot_selfcheck ${PROJECT_NAME}_planning_lib)
+add_executable(planning_grid_parity_selfcheck src/planning_grid_parity_selfcheck.cpp)
+target_link_libraries(planning_grid_parity_selfcheck ${catkin_LIBRARIES})
+add_executable(replay_planning_snapshot src/replay_planning_snapshot.cpp)
+target_link_libraries(replay_planning_snapshot ${PROJECT_NAME}_planning_lib)
 if(CATKIN_ENABLE_TESTING)
     add_test(NAME skidsteer_selfcheck COMMAND skidsteer_selfcheck)
     add_test(NAME trajectory_tracking_selfcheck COMMAND trajectory_tracking_selfcheck)
     add_test(NAME planner_safety_selfcheck COMMAND planner_safety_selfcheck)
     add_test(NAME backout_recovery_selfcheck COMMAND backout_recovery_selfcheck)
     add_test(NAME blind_zone_ground_selfcheck COMMAND blind_zone_ground_selfcheck)
+    add_test(NAME planning_core_selfcheck COMMAND planning_core_selfcheck)
+    add_test(NAME planning_snapshot_selfcheck COMMAND planning_snapshot_selfcheck)
+    add_test(NAME planning_grid_parity_selfcheck COMMAND planning_grid_parity_selfcheck)
 endif()
 
 #############
@@ -236,6 +251,7 @@ install(
         ${PROJECT_NAME}_lib
         ${PROJECT_NAME}_groundsegmentation_lib
         ${PROJECT_NAME}_skidsteer_lib
+        ${PROJECT_NAME}_planning_lib
         ${PROJECT_NAME}_node
         ${PROJECT_NAME}_nodelet
         lunar_traversability_node
@@ -247,6 +263,10 @@ install(
         planner_safety_selfcheck
         backout_recovery_selfcheck
         blind_zone_ground_selfcheck
+        planning_core_selfcheck
+        planning_snapshot_selfcheck
+        planning_grid_parity_selfcheck
+        replay_planning_snapshot
     ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

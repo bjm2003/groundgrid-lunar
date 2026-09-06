@@ -200,6 +200,7 @@ class LunarPipelineTest(unittest.TestCase):
         rospy.Subscriber("/lunar_path_follower/diagnostics", String,
                          self._on_follower_status, queue_size=10)
         rospy.Subscriber("/lunar_planner/diagnostics", String, self._on_diag, queue_size=10)
+        rospy.Subscriber("/lunar_planner/planning_attempt", String, self._on_attempt, queue_size=100)
         self.goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped,
                                         queue_size=1, latch=True)
         try:
@@ -294,12 +295,6 @@ class LunarPipelineTest(unittest.TestCase):
                 self._observe_trajectory_locked(pending)
             if self.status.startswith("success") and self.first_success_time is None:
                 self.first_success_time = rospy.Time.now()
-            try:
-                ms = float(fields.get("plan_ms", "0"))
-            except ValueError:
-                ms = 0.0
-            if ms > 0.0:
-                self.plan_ms.append(ms)
             # The planner reports -1 when /proc is unreadable and on its first sample,
             # where there is no interval to divide by. Dropping those is the point: a
             # fabricated zero would silently satisfy the budget assertion.
@@ -310,6 +305,14 @@ class LunarPipelineTest(unittest.TestCase):
                     continue
                 if value >= 0.0:
                     sink.append(value)
+
+    def _on_attempt(self, msg):
+        try:
+            record = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        with self.lock:
+            self.observation.attempt(record)
 
     def _cross_track(self, x, y):
         with self.lock:
@@ -452,7 +455,9 @@ class LunarPipelineTest(unittest.TestCase):
             latency = ((self.first_success_time - goal_time).to_sec()
                        if self.first_success_time else float("nan"))
             statuses = set(self.statuses)
-            plan_ms = list(self.plan_ms)
+            planning_attempts = [dict(self.observation.attempts[key])
+                                 for key in sorted(self.observation.attempts)]
+            plan_ms = [attempt["total_ms"] for attempt in planning_attempts]
             path_len = self.plan_path_len
             chord = self.plan_chord
             path_seen = self.path_seen
@@ -501,6 +506,7 @@ class LunarPipelineTest(unittest.TestCase):
             "diagnostics": diagnostics,
             "latency": latency,
             "plan_ms": plan_ms,
+            "planning_attempts": planning_attempts,
             "path_len": path_len if path_len is not None else float("nan"),
             "chord": chord if chord is not None else float("nan"),
             "detour": detour,
@@ -804,7 +810,7 @@ class LunarPipelineTest(unittest.TestCase):
              "chord_m": t["chord"], "detour_ratio": t["detour"],
              "driven_m": t["driven"], "rmse_m": t["rmse"],
              "clearance_mean_m": t["clearance_mean"], "clearance_min_m": t["clearance_min"],
-             "plan_ms": t["plan_ms"]}
+             "plan_ms": t["plan_ms"], "planning_attempts": t["planning_attempts"]}
             for t in every]
         try:
             directory = os.path.dirname(path)
@@ -874,7 +880,7 @@ class LunarPipelineTest(unittest.TestCase):
                           rates["plan_success_tour"])
 
         self.assertGreater(metrics["plan_ms"]["n"], 0,
-                           "no plan_ms samples: /lunar_planner/diagnostics is silent")
+                           "no unique planning attempts: /lunar_planner/planning_attempt is silent")
         self.assertLess(metrics["plan_ms"]["mean"], 1000.0, "规划耗时 mean exceeds the budget")
         self.assertLess(metrics["plan_ms"]["max"], 1200.0, "规划耗时 worst case exceeds the budget")
 

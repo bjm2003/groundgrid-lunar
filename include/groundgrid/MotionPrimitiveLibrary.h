@@ -34,6 +34,10 @@ public:
     bool save(const std::string& path) const;
     bool load(const std::string& path);
 
+    // Lossless in-memory restore for planning snapshots (no text rounding or IO).
+    // Validate before replacing the existing library; a failed restore leaves it intact.
+    bool restore(int bins, const std::vector<MotionPrimitive>& primitives);
+
     int headingBins() const { return bins_; }
     bool empty() const { return by_bin_.empty(); }
 
