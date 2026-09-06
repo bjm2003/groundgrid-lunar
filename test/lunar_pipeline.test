@@ -11,6 +11,8 @@
     <arg name="metrics_out" default=""/>
     <arg name="planning_snapshot_directory" default=""/>
     <arg name="snap_strategy" default="legacy_nearest"/>
+    <arg name="use_dynamics_primitives" default=""/>
+    <arg name="motion_primitive_file" default=""/>
     <!-- Trace the full multi-goal run without enabling a short diagnostic (which skips
          metrics_over_trials). Use only for investigating a reproducible regression. -->
     <arg name="debug_control" default="false"/>
@@ -37,6 +39,8 @@
     <include file="$(find groundgrid)/launch/LunarSystem.launch">
         <arg name="planning_snapshot_directory" value="$(arg planning_snapshot_directory)"/>
         <arg name="snap_strategy" value="$(arg snap_strategy)"/>
+        <arg name="use_dynamics_primitives" value="$(arg use_dynamics_primitives)"/>
+        <arg name="motion_primitive_file" value="$(arg motion_primitive_file)"/>
     </include>
     <test pkg="groundgrid" type="test_lunar_pipeline.py" test-name="lunar_pipeline_test"
           time-limit="3600">

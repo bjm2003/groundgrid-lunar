@@ -3,6 +3,7 @@
 #include <limits>
 #include <stdexcept>
 #include "groundgrid/LatticePlannerCore.h"
+#include "groundgrid/PlanningReplayAudit.h"
 
 using namespace groundgrid;
 static void check(bool ok,const char* message) {
@@ -18,6 +19,7 @@ static PlanningInput flatInput() {
 }
 static void verifyPath(const PlanningInput& input,const PlanningResult& result) {
     check(result.ok,"expected a route");
+    check(auditPlanningOutput(input,result),"independent exported-output audit");
     check(result.path.poses.size()*2==result.profile.data.size(),"profile length");
     LatticePlannerCore core(input);
     const double clearance=result.snapped ? input.config.goal_snap_clearance_ : input.config.trajectory_clearance_;
@@ -52,6 +54,12 @@ int main() {
         LatticePlannerCore core(input);
         const auto forward=core.planCore(input.start,input.goal,50000);
         verifyPath(input,forward);
+        auto unsafe=forward; unsafe.path.poses[3].y=std::numeric_limits<double>::quiet_NaN();
+        check(!auditPlanningOutput(input,unsafe),"audit rejects non-finite exported pose");
+        auto hazard=flatInput();
+        PlanningIndex blocked; hazard.map.getIndex({forward.path.poses[3].x,forward.path.poses[3].y},blocked);
+        hazard.map.cost[blocked.a*hazard.map.cols+blocked.b]=100.0f;
+        check(!auditPlanningOutput(hazard,forward),"audit rejects hazardous exported sweep");
         const auto again=core.planCore(input.start,input.goal,50000);
         check(forward.profile.data==again.profile.data && forward.expanded==again.expanded,
               "deterministic repeated query");
@@ -80,6 +88,14 @@ int main() {
         const auto dynamic_result=LatticePlannerCore(dynamics).planCore(dynamics.start,dynamics.goal,10000);
         verifyPath(dynamics,dynamic_result);
         check(dynamic_result.path.poses.size()>2,"dynamics samples preserved");
+        dynamics.goal={-4.125,-1.575,0};
+        const auto dynamic_reverse=LatticePlannerCore(dynamics).planCore(dynamics.start,dynamics.goal,10000);
+        verifyPath(dynamics,dynamic_reverse);
+        check(dynamic_reverse.reverse_length>0.5,"dynamics reverse remains supported");
+        dynamics.goal={dynamics.start.x,dynamics.start.y,kPlannerPi/4.0};
+        const auto dynamic_rotate=LatticePlannerCore(dynamics).planCore(dynamics.start,dynamics.goal,10000);
+        verifyPath(dynamics,dynamic_rotate);
+        check(dynamic_rotate.path_length<1e-6,"dynamics in-place rotation remains supported");
         auto shifted=flatInput(); shifted.map.start_row=37;shifted.map.start_col=13;
         const auto shifted_result=LatticePlannerCore(shifted).planCore(shifted.start,shifted.goal,50000);
         verifyPath(shifted,shifted_result);
@@ -96,6 +112,19 @@ int main() {
         wall.config.reachable_snap_=true;
         const auto reachable=LatticePlannerCore(wall).planCore(wall.start,wall.goal,300);
         verifyPath(wall,reachable);
+        auto rolled_wall=wall;
+        rolled_wall.map.start_row=57; rolled_wall.map.start_col=41;
+        for(int r=0;r<80;++r) for(int c=0;c<80;++c) {
+            PlanningPosition p; PlanningIndex original;
+            rolled_wall.map.getPosition({r,c},p);
+            check(wall.map.getIndex(p,original),"rolled non-uniform cache coordinate");
+            rolled_wall.map.cost[r*80+c]=wall.map.cost[original.a*80+original.b];
+        }
+        const auto rolled_reachable=LatticePlannerCore(rolled_wall).planCore(wall.start,wall.goal,300);
+        verifyPath(rolled_wall,rolled_reachable);
+        check(rolled_reachable.selected_goal.x==reachable.selected_goal.x &&
+              rolled_reachable.profile.data==reachable.profile.data,
+              "non-uniform rolling cache retains world hazards and selected route");
         check(reachable.snapped && reachable.selected_goal.x< -1.9 &&
               reachable.snap_distance<=wall.config.max_snap_distance_,"reachable near-side candidate");
         check(reachable.expanded<legacy.expanded,"shared frontier does not exhaust blocked endpoint budget");

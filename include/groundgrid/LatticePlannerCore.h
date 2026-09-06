@@ -132,6 +132,7 @@ struct PlanningResult {
     double path_length=0.0, reverse_length=0.0, route_cost=0.0;
     int expanded=0, root_successors=0;
     int candidates_checked=0;
+    std::size_t departure_end_index=0;
     bool budget_exhausted=false;
     PlannerPath path;
     PlannerProfile profile;
@@ -871,6 +872,7 @@ public:
                 const int pi=parent_prim[childK];
                 if(pi<0 || pi>=static_cast<int>(prims.size())) continue;
                 const MotionPrimitive& prim=prims[pi];
+                if(e==1) result_.departure_end_index=prim.samples.size();
                 const double c=std::cos(pyaw), s=std::sin(pyaw);
                 for(size_t i=0;i<prim.samples.size();++i) {
                     const auto& smp=prim.samples[i];
@@ -914,6 +916,7 @@ public:
         }
         if(path.poses.empty()) return false;
         buildVelocityProfile(path, vel_profile);
+        result_.departure_end_index=path.poses.size()>2 ? 2 : path.poses.size()-1;
         result_.profile_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-profile_begin).count();
         return true;
     }

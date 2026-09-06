@@ -760,6 +760,11 @@ roslaunch groundgrid LunarDemo.launch rviz:=false cloud_radius:=20.0
 
 ## 16. 最短验证流程
 
+下面是手工观察演示，不是正式验收。当前稳定化开发的**一终端自动采集、同输入重放、
+三次混合场景回归和五场景基线**请使用 [规划重放与归档流程](docs/PLANNING_REPLAY.md)。
+新版脚本每次必须指定新结果目录，自动保留 JSON/XML/完整日志/参数/commit/快照，
+并生成 .tar.gz。success 仅表示产出路径，任务完成仍需双方 goal_reached 确认。
+
 依赖已经安装、项目已经编译时，只需要三个终端。
 
 终端 1：

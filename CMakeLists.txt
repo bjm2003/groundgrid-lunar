@@ -49,6 +49,7 @@ if(CATKIN_ENABLE_TESTING)
     catkin_add_nosetests(test/test_lunar_sim_timing.py)
     catkin_add_nosetests(test/test_trial_metrics.py)
     catkin_add_nosetests(test/test_trial_observation.py)
+    catkin_add_nosetests(test/test_experiment_archive.py)
 endif()
 
 #######################################
@@ -294,6 +295,7 @@ catkin_install_python(PROGRAMS
     scripts/lunar_surface_sim.py
     scripts/identify_skidsteer.py
     scripts/run_planner_experiments.py
+    scripts/compare_planning_snapshots.py
     scripts/summarize_planner_metrics.py
     DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

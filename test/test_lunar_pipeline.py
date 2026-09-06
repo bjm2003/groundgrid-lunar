@@ -787,6 +787,14 @@ class LunarPipelineTest(unittest.TestCase):
         if not path:
             path = os.path.expanduser("~/.ros/planner_metrics_%s.json" % self.scenario)
         report = dict(report)
+        report["run_id"] = os.environ.get("GROUNDGRID_RUN_ID", "")
+        report["commit"] = os.environ.get("GROUNDGRID_RUN_COMMIT", "")
+        # Captured while this test's isolated master is still alive. Effective per-attempt
+        # Relax values and the actual primitive mode are also present in snapshot inputs.
+        report["effective_parameters"] = {
+            name: rospy.get_param(name, {}) for name in (
+                "/state_lattice_planner", "/lunar_path_follower", "/lunar_traversability",
+                "/lunar_surface_sim", "/skid_steer_model", "/groundgrid")}
         report["trials"] = [
             {"goal": list(t["goal"]), "start": list(t["start"]),
              "goal_id": t["goal_id"], "goal_stamp_ns": t["goal_stamp_ns"],

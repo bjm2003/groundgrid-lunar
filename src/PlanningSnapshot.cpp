@@ -172,7 +172,9 @@ std::string planningResultJson(const PlanningInput& input,const PlanningResult& 
        <<",\"reason\":"<<quote(r.reason)<<",\"snapped\":"<<(r.snapped ? "true":"false")
        <<",\"expanded\":"<<r.expanded<<",\"root_successors\":"<<r.root_successors
        <<",\"snap_strategy\":"<<quote(input.config.reachable_snap_ ? "reachable_cost":"legacy_nearest")
+       <<",\"primitive_mode\":"<<quote(input.config.use_dynamics_primitives_ ? "dynamics":"arcs")
        <<",\"candidates_checked\":"<<r.candidates_checked
+       <<",\"departure_end_index\":"<<r.departure_end_index
        <<",\"budget_exhausted\":"<<(r.budget_exhausted ? "true":"false");
     for(const auto& item:std::initializer_list<std::pair<const char*,double>>{
         {"total_ms",r.total_ms},{"snap_ms",r.snap_ms},{"search_ms",r.search_ms},{"profile_ms",r.profile_ms},

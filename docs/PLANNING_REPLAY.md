@@ -55,3 +55,48 @@ Windows 运行纯 C++ 核心、快照和现有安全自检。Ubuntu 另运行
 `planning_grid_parity_selfcheck`，对照安装的 grid_map 在地图边界、分辨率和循环
 索引上的行为。映射语义已核对 [grid_map 原实现](https://github.com/ANYbotics/grid_map/blob/master/grid_map_core/src/GridMapMath.cpp)，运行机器上的对照测试仍是必要条件。
 对 ROS 接口、停车/恢复行为及实际任务完成率的验证必须跑原闭环测试。
+
+## 一终端运行与归档
+
+新版批量脚本必须指定**尚不存在**的 --out-dir。每轮独立 ROS 进程、ROS_HOME、
+ROS_LOG_DIR、ROS_TEST_RESULTS_DIR 和 run_id；目录中保存完整日志、参数、JSON、
+断言 XML、源配置、commit、SHA-256 清单。结束自动生成同名 .tar.gz，失败也归档。
+原始日志不删除。控制日志较多时直接回传结果包，无需复制终端长输出。
+
+首轮只采集旧策略真实输入（不是新策略验收；剩余困难目标仍可能失败）：
+
+    rosrun groundgrid run_planner_experiments.py --scenarios mixed --n-trials 3 --repeat 1 --snap-strategy legacy_nearest --capture-inputs --debug-control --out-dir "$HOME/p0-capture-$(date +%Y%m%d-%H%M%S)"
+
+此命令先运行 8 个自检，包括 Ubuntu grid_map 对照；自检失败便停止启动闭环并归档。
+SUITE_RC=0 要求 rostest、catkin_test_results 和归档检查均通过；旧策略首轮
+SUITE_RC=1 时仍应回传归档，不要自行重跑。注意使用普通 rostest，不加 --text：
+[ROS Noetic 的实现](https://github.com/ros/ros_comm/blob/noetic-devel/tools/rostest/src/rostest/runner.py)
+在 text 模式下不按正常流程汇总子测试 XML，不能用它采集正式断言结果。
+
+收到首轮快照后，选择归档目录进行同输入对照；以下 CAPTURE_DIR 须设为实际目录：
+
+    rosrun groundgrid compare_planning_snapshots.py --inputs "$CAPTURE_DIR" --out-dir "$HOME/p0-replay-$(date +%Y%m%d-%H%M%S)" --expansions 5000 --repeat 3
+
+默认包含所有输入与所有重复，保存旧/新策略的固定扩展预算和真实时钟两组输出。
+需要仅诊断某项时显式传 --goal-id 16，报告保留该筛选条件，不能把子集当全量结果。
+重放另外调用生产扫掠检查器审核实际导出折线（含起步间距恢复），
+export_safety_ok=false 会使对照归档失败。检查时间不混入搜索时长；
+此离线审核不替代 ROS 动态重检，更不是物理制动证明。
+
+新策略获得同输入审核通过后，才执行以下后续组次（每行一个独立结果包）：
+
+    rosrun groundgrid run_planner_experiments.py --scenarios mixed --n-trials 3 --repeat 3 --snap-strategy reachable_cost --identify-first --out-dir "$HOME/p0-smoke-arcs-$(date +%Y%m%d-%H%M%S)"
+
+    rosrun groundgrid run_planner_experiments.py --scenarios mixed --n-trials 3 --repeat 1 --snap-strategy reachable_cost --primitive-mode dynamics --out-dir "$HOME/p0-smoke-dynamics-$(date +%Y%m%d-%H%M%S)"
+
+    rosrun groundgrid run_planner_experiments.py --scenarios mixed flat dense slope negative --n-trials 10 --snap-strategy reachable_cost --out-dir "$HOME/p0-baseline-$(date +%Y%m%d-%H%M%S)"
+
+--identify-first 使用独立 master 启动已知参数仿真，参数文件写入该结果目录，
+不覆盖源配置；五参数最大误差必须 ≤0.02。动力学组显式指定已跟踪的基元文件；
+每次尝试中的实际模式与所请求模式必须相同，不能接受静默回退。
+构建日志和包测试仍需单独归档；批量脚本不会替用户编译或伪造 catkin 包测试通过。
+
+各结果包的 suite.json / 每轮 run.json 列出阶段返回码、唯一规划尝试统计、
+任务总耗时和任务书缺口。任何成功包都不自动标记完整验收，需同时审阅三次弧线
+冒烟、一次动力学冒烟、五场景 n=10、辨识和构建/包测试。所有安全阈值及测试时限不变。
+实际地图重放前不根据合成墙体案例进行状态缓存或经验参数调优。

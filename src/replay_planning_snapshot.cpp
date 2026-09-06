@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include "groundgrid/PlanningSnapshot.h"
+#include "groundgrid/PlanningReplayAudit.h"
 
 int main(int argc,char** argv) {
     try {
@@ -32,7 +33,8 @@ int main(int argc,char** argv) {
         for(int i=0;i<repeats;++i) {
             const auto result=core.planCore(input.start,input.goal,expansions);
             std::cout<<"{\"replay\":"<<i<<",\"budget_mode\":\""<<(expansions ? "expansions":"wall_time")
-                     <<"\",\"result\":"<<groundgrid::planningResultJson(input,result)<<"}\n";
+                     <<"\",\"export_safety_ok\":"<<(groundgrid::auditPlanningOutput(input,result) ? "true":"false")
+                     <<",\"result\":"<<groundgrid::planningResultJson(input,result)<<"}\n";
             if(trajectory) {
                 std::cout<<std::setprecision(17)<<"{\"trajectory\":[";
                 for(std::size_t j=0;j<result.path.poses.size();++j) {

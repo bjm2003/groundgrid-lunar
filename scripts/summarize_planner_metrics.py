@@ -79,14 +79,18 @@ LIMITATIONS = """\
 
 def load(in_dir):
     runs = {}
-    for path in sorted(glob.glob(os.path.join(in_dir, "planner_metrics_*.json"))):
+    for path in sorted(glob.glob(os.path.join(in_dir, "**", "planner_metrics_*.json"), recursive=True)):
         try:
             with open(path) as handle:
                 report = json.load(handle)
         except (OSError, ValueError) as exc:
             print("skipping %s: %s" % (path, exc), file=sys.stderr)
             continue
-        runs[report.get("scenario", os.path.basename(path))] = report
+        scenario = report.get("scenario", os.path.basename(path))
+        parent = os.path.relpath(os.path.dirname(path), in_dir)
+        # Do not silently keep only the last successful repeat of a terrain class.
+        label = scenario if parent == "." else scenario + " / " + parent
+        runs[label] = report
     return runs
 
 

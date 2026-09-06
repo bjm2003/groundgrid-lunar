@@ -6,6 +6,9 @@
     <arg name="cmd_vel_topic" default="/cmd_vel" />
     <arg name="planning_snapshot_directory" default="" />
     <arg name="snap_strategy" default="legacy_nearest" />
+    <!-- Empty preserves a caller's YAML value; explicit A/B runs set both arguments. -->
+    <arg name="use_dynamics_primitives" default="" />
+    <arg name="motion_primitive_file" default="" />
 
     <rosparam command="load" file="$(arg config)" />
 
@@ -20,6 +23,8 @@
         <param name="odometry_topic" value="$(arg odometry_topic)" />
         <param name="planning_snapshot_directory" value="$(arg planning_snapshot_directory)" />
         <param name="snap_strategy" value="$(arg snap_strategy)" />
+        <param if="$(eval arg('use_dynamics_primitives') != '')" name="use_dynamics_primitives" value="$(arg use_dynamics_primitives)" type="bool" />
+        <param if="$(eval arg('motion_primitive_file') != '')" name="motion_primitive_file" value="$(arg motion_primitive_file)" />
     </node>
     <node pkg="groundgrid" type="lunar_path_follower_node"
           name="lunar_path_follower" output="screen">
