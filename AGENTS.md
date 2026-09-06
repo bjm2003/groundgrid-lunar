@@ -46,6 +46,12 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - Normal search/rotation start-clearance ramps remain limited to the occupied start's
   first edge, with full clearance restored at its endpoint. Search must check the
   quantised/exported segment as well as the ideal primitive geometry.
+- Dynamics root primitives additionally obey the execution gate's exported-sample
+  rule: ordinary clearance is restored at the FIRST exported sample and held thereafter,
+  while the original ideal-primitive/snap-clearance checks also remain mandatory. A long
+  integration primitive is not permission to delay that existing execution requirement.
+  If no compatible successor exists, report failure and let the bounded recovery ladder
+  act; do not repeatedly publish a route that execution must immediately withdraw.
 - The user-authorised BackOut exception may restore clearance over ONE bounded retreat
   built from actual stamped localisation history, never from an old planned route. Its
   cumulative corner-motion budget is `recovery_backout_distance` (currently 1 m); its

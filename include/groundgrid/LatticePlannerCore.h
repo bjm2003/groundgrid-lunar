@@ -337,6 +337,25 @@ public:
                                  trajectoryClearance(), departure, cost, nullptr, rejection);
     }
 
+    // The ROS execution gate restores ordinary clearance at the FIRST exported pose,
+    // not at the last integration sample of a dynamics primitive. Check the same
+    // suffix here in addition to the ideal primitive's (possibly larger snap) margin.
+    // This is a conservative planning filter, never an extension of the escape ramp.
+    template<class PoseAt>
+    bool executionDepartureValid(const Pose2D& start, std::size_t count,
+                                 PoseAt pose_at) const {
+        if(count==0 || count>1000000) return false;
+        Pose2D previous=start;
+        for(std::size_t i=0;i<count;++i) {
+            const Pose2D current=pose_at(i);
+            float cost;
+            if(!sweptSegmentValid(previous,current,i==0 ? 0.0 : trajectory_clearance_,
+                                  trajectory_clearance_,false,cost)) return false;
+            previous=current;
+        }
+        return true;
+    }
+
     bool primitiveValid(double px, double py, double pyaw, const MotionPrimitive& prim,
                         float& avg_cost, double& ex, double& ey, double& eyaw,
                         bool departure = false) const {
@@ -348,6 +367,8 @@ public:
         };
         const auto last = worldPose(prim.samples.size()-1);
         ex=last.x; ey=last.y; eyaw=last.yaw;
+        if(departure && !executionDepartureValid({px,py,pyaw},prim.samples.size(),worldPose))
+            return false;
         return sampledFootprintValid({px,py,pyaw},prim.samples.size(),worldPose,
             cornerRadius(),core_map_.getResolution(),trajectoryClearance(),departure,
             [this](const Pose2D& pose,double clearance,bool allow_unknown,float& cost) {

@@ -23,6 +23,9 @@ inline bool auditPlanningOutput(const PlanningInput& input,const PlanningResult&
             return false;
     }
     if(result.departure_end_index) {
+        if(input.config.use_dynamics_primitives_ && !input.primitives.empty() &&
+           !checker.executionDepartureValid(path.front(),result.departure_end_index,
+                [&](std::size_t i){ return path[i+1]; })) return false;
         if(!sampledFootprintValid(path.front(),result.departure_end_index,
             [&](std::size_t i){ return path[i+1]; },checker.cornerRadius(),
             input.map.resolution,clearance,true,

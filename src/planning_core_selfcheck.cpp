@@ -96,6 +96,57 @@ int main() {
         const auto dynamic_rotate=LatticePlannerCore(dynamics).planCore(dynamics.start,dynamics.goal,10000);
         verifyPath(dynamics,dynamic_rotate);
         check(dynamic_rotate.path_length<1e-6,"dynamics in-place rotation remains supported");
+        // Reproduce the real dynamics failure: a slope cell is outside the body but
+        // inside its first exported sample's clearance band. Ramping across all 18
+        // integration samples used to approve a rotation that execution immediately
+        // withdrew. The safe response is no successor/recovery, not a weaker gate.
+        auto departure=dynamics;
+        departure.start={0.075,0.075,kPlannerPi/4};
+        departure.goal={0.075,0.075,kPlannerPi/2};
+        PlanningIndex slope_cell;
+        check(departure.map.getIndex({1.575,0.075},slope_cell),"departure slope index");
+        const auto cell=slope_cell.a*departure.map.cols+slope_cell.b;
+        departure.map.cost[cell]=61.4f;
+        departure.map.gx[cell]=-0.2778f; departure.map.gy[cell]=0.1187f;
+        departure.map.slope[cell]=16.811f;
+        LatticePlannerCore departure_core(departure);
+        const auto& turn_primitive=departure.primitives.primitivesFor(2).at(14);
+        auto world_sample=[&](std::size_t i) {
+            const auto& s=turn_primitive.samples[i];
+            return Pose2D{departure.start.x+s.x,departure.start.y+s.y,
+                          departure.start.yaw+s.yaw}; // in-place: x=y=0
+        };
+        float departure_cost; double ex,ey,eyaw;
+        check(sampledFootprintValid(departure.start,turn_primitive.samples.size(),world_sample,
+            departure_core.cornerRadius(),departure.map.resolution,
+            departure.config.goal_snap_clearance_,true,
+            [&](const Pose2D& p,double margin,bool unknown,float& terrain) {
+                return departure_core.footprintWithClearanceValid(p.x,p.y,p.yaw,terrain,unknown,margin);
+            },departure_cost),"old whole-primitive departure passed");
+        check(!departure_core.executionDepartureValid(departure.start,
+              turn_primitive.samples.size(),world_sample),"execution rejects first sample full margin");
+        PlanningResult formerly_accepted;
+        formerly_accepted.ok=true; formerly_accepted.snapped=true;
+        formerly_accepted.path.poses.push_back(departure.start);
+        for(std::size_t i=0;i<turn_primitive.samples.size();++i)
+            formerly_accepted.path.poses.push_back(world_sample(i));
+        formerly_accepted.departure_end_index=turn_primitive.samples.size();
+        formerly_accepted.profile.data.assign(formerly_accepted.path.poses.size()*2,0.0f);
+        check(!auditPlanningOutput(departure,formerly_accepted),
+              "offline audit must catch the recorded planning/execution disagreement");
+        check(!departure_core.primitiveValid(departure.start.x,departure.start.y,
+              departure.start.yaw,turn_primitive,departure_cost,ex,ey,eyaw,true),
+              "search must reject the same unexecutable departure");
+        auto rejected_departure=departure_core.planCore(departure.start,departure.goal,100);
+        check(!rejected_departure.ok && rejected_departure.reason=="start_no_successor" &&
+              rejected_departure.expanded==1,"unexecutable root triggers recovery without false success");
+        const auto nonroot=departure_core.primitiveValid(departure.start.x,departure.start.y,
+              departure.start.yaw,turn_primitive,departure_cost,ex,ey,eyaw,false);
+        check(!nonroot,"later primitives cannot restart the departure exception");
+        auto clear_departure=departure; clear_departure.map.gx[cell]=clear_departure.map.gy[cell]=0;
+        auto clear_result=LatticePlannerCore(clear_departure).planCore(
+            clear_departure.start,clear_departure.goal,1000);
+        verifyPath(clear_departure,clear_result);
         auto shifted=flatInput(); shifted.map.start_row=37;shifted.map.start_col=13;
         const auto shifted_result=LatticePlannerCore(shifted).planCore(shifted.start,shifted.goal,50000);
         verifyPath(shifted,shifted_result);
