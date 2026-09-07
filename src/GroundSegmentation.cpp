@@ -166,7 +166,8 @@ pcl::PointCloud<GroundSegmentation::PCLPoint>::Ptr GroundSegmentation::filter_cl
     ++time_vals;
 
     start = std::chrono::steady_clock::now();
-    spiral_ground_interpolation(map, mapToBase, cloudOrigin);
+    std::vector<grid_map::Index> measured_support;
+    spiral_ground_interpolation(map, mapToBase, cloudOrigin, measured_support);
     end = std::chrono::steady_clock::now();
     ROS_DEBUG_STREAM("ground interpolation took " << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count() << "ms");
 
@@ -176,7 +177,7 @@ pcl::PointCloud<GroundSegmentation::PCLPoint>::Ptr GroundSegmentation::filter_cl
     if(mConfig.slope_enable){
         start = std::chrono::steady_clock::now();
         if(mConfig.height_correction_enable && mConfig.height_correction_iterations > 0)
-            compute_height_correction(map);
+            compute_height_correction(map, measured_support);
         else
             map["ground_corrected"] = map["ground"];
         compute_slope_map(map);
@@ -456,7 +457,7 @@ template <int S> void GroundSegmentation::detect_ground_patch(grid_map::GridMap&
 
 void GroundSegmentation::spiral_ground_interpolation(
     grid_map::GridMap &map, const geometry_msgs::TransformStamped &toBase,
-    const PCLPoint& cloudOrigin) const
+    const PCLPoint& cloudOrigin, std::vector<grid_map::Index>& measured_support) const
 {
     static grid_map::Matrix& ggl = map["ground"];
     static grid_map::Matrix& gvl = map["groundpatch"];
@@ -495,7 +496,7 @@ void GroundSegmentation::spiral_ground_interpolation(
             std::abs(x-mask_index(0))<=support_cells &&
             std::abs(y-mask_index(1))<=support_cells;
         interpolate_cell(map,static_cast<size_t>(x),static_cast<size_t>(y),
-                         support,cloudOrigin.x,cloudOrigin.y,near_support);
+                         support,cloudOrigin.x,cloudOrigin.y,near_support,measured_support);
     };
 
     for(int i=center_idx-1; i>=1; --i){
@@ -533,7 +534,8 @@ void GroundSegmentation::spiral_ground_interpolation(
 void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y,
                                            const BlindZoneSupportPlane& support,
                                            double mask_x, double mask_y,
-                                           bool may_be_in_support_mask) const
+                                           bool may_be_in_support_mask,
+                                           std::vector<grid_map::Index>& measured_support) const
 {
     static const auto& center_idx = map.getSize()(0)/2-1;
     static const size_t blocksize = 3;
@@ -558,6 +560,10 @@ void GroundSegmentation::interpolate_cell(grid_map::GridMap &map, const size_t x
             mask_x,mask_y,static_cast<double>(groundSupportRadius),
            gpl(x,y),raw(x,y),support_height)) {
         ggl(x,y)=static_cast<float>(support_height);
+        // Preserve this same direct historical evidence through height correction.
+        // Plane-only fill is NOT a measurement and is not locked by this list.
+        if(std::isfinite(raw(x,y)))
+            measured_support.emplace_back(static_cast<int>(x),static_cast<int>(y));
         return;
     }
     const auto& gvlblock = gvl.block<blocksize,blocksize>(x-blocksize/2,y-blocksize/2);
@@ -588,7 +594,8 @@ void GroundSegmentation::setConfig(const groundgrid::GroundGridConfig &config)
 // Slope-aware extensions (TS-SatMVSNet inspired, arXiv:2501.01049)
 // ============================================================================
 
-void GroundSegmentation::compute_height_correction(grid_map::GridMap &map) const
+void GroundSegmentation::compute_height_correction(
+    grid_map::GridMap &map,const std::vector<grid_map::Index>& measured_support) const
 {
     // Paper Eq. 7: 3x3 Gaussian-shaped height correction kernel.
     //   K = [[1/16, 1/8, 1/16],
@@ -630,6 +637,9 @@ void GroundSegmentation::compute_height_correction(grid_map::GridMap &map) const
                 corrected(i, j) = c * work(i, j) + (1.0f - c) * smoothed;
             }
         }
+        restoreMeasuredSupport(measured_support,
+            [&](const grid_map::Index& index) { return ground(index(0),index(1)); },
+            [&](const grid_map::Index& index) -> float& { return corrected(index(0),index(1)); });
     }
 }
 

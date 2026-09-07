@@ -64,11 +64,13 @@ class GroundSegmentation {
     template<int S> void detect_ground_patch(grid_map::GridMap &map, size_t i, size_t j) const;
     void spiral_ground_interpolation(grid_map::GridMap &map,
                                      const geometry_msgs::TransformStamped &toBase,
-                                     const PCLPoint& cloudOrigin) const;
+                                     const PCLPoint& cloudOrigin,
+                                     std::vector<grid_map::Index>& measured_support) const;
     void interpolate_cell(grid_map::GridMap &map, const size_t x, const size_t y,
                           const BlindZoneSupportPlane& support,
                           double mask_x, double mask_y,
-                          bool may_be_in_support_mask) const;
+                          bool may_be_in_support_mask,
+                          std::vector<grid_map::Index>& measured_support) const;
 
     // ------------------------------------------------------------------
     // Slope-aware extensions (TS-SatMVSNet inspired, arXiv:2501.01049)
@@ -76,7 +78,8 @@ class GroundSegmentation {
     // Apply the 3x3 learnable Gaussian smoothing operator from Eq. 7 of the
     // paper (here as a fixed-weight kernel) onto the "ground" layer and write
     // the smoothed result into the "ground_corrected" layer.
-    void compute_height_correction(grid_map::GridMap &map) const;
+    void compute_height_correction(grid_map::GridMap &map,
+                                  const std::vector<grid_map::Index>& measured_support) const;
 
     // Compute the slope raster from the (optionally corrected) ground height
     // layer using the height-based slope calculation strategy of Eq. 1 of the

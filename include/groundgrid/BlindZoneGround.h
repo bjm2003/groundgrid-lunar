@@ -4,6 +4,14 @@
 
 namespace groundgrid {
 
+// Apply after EACH smoothing pass, so later passes cannot diffuse a changed
+// estimate back into measured support. Only cells selected by the existing
+// blind-disc/current-return/history policy are supplied here; no new safe region.
+template<class Cells,class GroundAt,class CorrectedAt>
+void restoreMeasuredSupport(const Cells& cells,GroundAt ground_at,CorrectedAt corrected_at) {
+    for(const auto& cell:cells) corrected_at(cell)=ground_at(cell);
+}
+
 // Terrain directly under the rover cannot be re-observed by a roof-mounted LiDAR.  The
 // rover pose nevertheless supplies a physical support plane there: the base xy plane in
 // map coordinates.  Keeping this small calculation ROS-free makes the safety assumption

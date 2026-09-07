@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <array>
+#include <vector>
 
 using groundgrid::BlindZoneSupportPlane;
 
@@ -63,6 +65,37 @@ int main() {
           !flat.heightForUnmeasuredCell(0,0,0,0,1.2,nan,nan,height),
           "invalid cell inputs are never anchored");
 
+    // Real bf17ff5 rejection patch at (-5.325,-5.875), stamp
+    // 1788795371148578643: a retained direct height was overwritten by smoothing.
+    const std::array<double,9> measured_ground={.23663191497325897,.21908679604530334,
+        .2216925024986267,.5796235203742981,.1866529881954193,.5538346171379089,
+        .42218077182769775,.474795937538147,.32975509762763977};
+    const std::array<double,9> kernel={1./16,1./8,1./16,1./8,1./4,1./8,1./16,1./8,1./16};
+    double smooth=0;
+    for(size_t i=0;i<9;++i) smooth+=kernel[i]*measured_ground[i];
+    const double confidence=std::pow(.010844792239367962,2.0); // recorded blend exponent
+    auto corrected=measured_ground;
+    corrected[4]=confidence*measured_ground[4]+(1-confidence)*smooth;
+    check(near(corrected[4],.3507028818130493,1e-6),
+          "recorded low-confidence smoothing reproduces 0.164m historical-height corruption");
+    const std::vector<int> protected_cells={4};
+    groundgrid::restoreMeasuredSupport(protected_cells,
+        [&](int i) { return measured_ground[i]; },[&](int i) -> double& { return corrected[i]; });
+    check(corrected==measured_ground,"protected historical support survives correction exactly");
+    corrected[0]=.9; corrected[4]=1.2;
+    groundgrid::restoreMeasuredSupport(protected_cells,
+        [&](int i) { return measured_ground[i]; },[&](int i) -> double& { return corrected[i]; });
+    check(corrected[0]==.9 && corrected[4]==measured_ground[4],
+          "later correction passes preserve selected history without locking unmeasured neighbours");
+    const auto saved=corrected;
+    groundgrid::restoreMeasuredSupport(std::vector<int>{},
+        [&](int i) { return measured_ground[i]; },[&](int i) -> double& { return corrected[i]; });
+    check(corrected==saved,"empty selection leaves ordinary smoothing unchanged");
+    groundgrid::restoreMeasuredSupport(protected_cells,
+        [&](int i) { return i==4 ? 1.6 : measured_ground[i]; },
+        [&](int i) -> double& { return corrected[i]; });
+    check(corrected[4]==1.6 && corrected[0]==saved[0],
+          "elevated historical evidence is preserved rather than flattened");
     std::printf("blind_zone_ground_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }

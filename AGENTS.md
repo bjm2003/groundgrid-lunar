@@ -42,6 +42,9 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - Enumerate every grid square touched by the oriented footprint; do not substitute a
   rotated point lattice. On one map, increasing clearance must include all cells from
   the smaller footprint. Search and execution revalidation share this rasterisation.
+- Direct historical heights selected by the blind-zone support policy must survive
+  every subsequent height-correction pass. Plane-only fill is not measured evidence;
+  this preservation must not expand the support disc or override usable current returns.
 - Collision checking must include the swept body during in-place rotations and transitions, not only endpoint poses.
 - Normal search/rotation start-clearance ramps remain limited to the occupied start's
   first edge, with full clearance restored at its endpoint. Search must check the
