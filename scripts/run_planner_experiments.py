@@ -14,7 +14,7 @@ import time
 import uuid
 
 from groundgrid.experiment_archive import (
-    acceptance_gaps, attempt_statistics, isolated_environment, seal_archive,
+    acceptance_gaps, outcome_summary, attempt_statistics, isolated_environment, seal_archive,
     validate_run, write_json, IDENTIFICATION_TRUTH, identification_result)
 
 SCENARIOS = ["mixed", "flat", "dense", "slope", "negative"]
@@ -176,6 +176,7 @@ def main():
                 print("%s repeat=%d ROS=%d XML=%d archive_errors=%d (%.1fs)" %
                       (scenario, repetition, record["rostest_rc"], record["results_rc"],
                        len(errors), record["wall_duration_s"]), flush=True)
+                print("  " + outcome_summary(report), flush=True)
     except KeyboardInterrupt:
         interrupted = True
     except Exception as exc:

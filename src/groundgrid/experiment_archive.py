@@ -127,6 +127,20 @@ def validate_run(directory, run_id, commit, scenario, strategy, primitive_mode, 
     return sorted(set(errors)), report
 
 
+def outcome_summary(report):
+    """Keep task outcomes visible even when a scenario's ROS assertions pass."""
+    if not isinstance(report, dict):
+        return "outcomes unavailable (not acceptance)"
+    rates = report.get("rates", {})
+    def percent(key):
+        value = rates.get(key)
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return "unavailable"
+        return "%.2f%%" % (100.0 * value)
+    return "tour reached=%s completed=%s; ROS/XML pass is not task-book acceptance" % (
+        percent("reach_tour"), percent("completion_tour"))
+
+
 def acceptance_gaps(report):
     """Task-book gaps are not hidden by looser scenario-specific rostest gates."""
     gaps = ["target-platform perception+planning CPU <40% not established",

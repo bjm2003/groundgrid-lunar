@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from groundgrid.experiment_archive import (
-    acceptance_gaps, attempt_statistics, isolated_environment, load_json,
+    acceptance_gaps, outcome_summary, attempt_statistics, isolated_environment, load_json,
     seal_archive, validate_run, write_json, identification_result, IDENTIFICATION_TRUTH)
 
 SPEC = importlib.util.spec_from_file_location(
@@ -55,6 +55,14 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             isolated_environment({}, self.root, "again", "sha")
         self.assertEqual(self.validate(), [])
+
+    def test_console_outcomes_do_not_equate_xml_success_with_arrival(self):
+        report = {"rates": {"reach_tour": 0.0, "completion_tour": 0.75}}
+        text = outcome_summary(report)
+        self.assertIn("reached=0.00% completed=75.00%", text)
+        self.assertIn("not task-book acceptance", text)
+        self.assertIn("unavailable", outcome_summary(None))
+        self.assertIn("unavailable", outcome_summary({"rates": {"reach_tour": float("nan")}}))
 
     def test_stale_json_is_not_a_result(self):
         self.report["run_id"] = "old"

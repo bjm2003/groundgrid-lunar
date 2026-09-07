@@ -39,6 +39,7 @@
 #include "groundgrid/BackoutRecovery.h"
 #include "groundgrid/LatticePlannerCore.h"
 #include "groundgrid/PlanningSnapshot.h"
+#include "groundgrid/TerrainDiagnosticPatch.h"
 
 namespace groundgrid {
 
@@ -1160,7 +1161,24 @@ private:
                           map_stamp_.toSec());
         if(force) { ROS_WARN("%s",message); }
         else { ROS_WARN_THROTTLE(1.0,"%s",message); }
+        // The center's height alone cannot explain a finite-difference slope. Capture
+        // its measured/interpolated neighbourhood before this callback releases the map.
+        // Throttle BEFORE serialisation; identical cells on newer maps remain observable.
+        const auto now=ros::WallTime::now();
+        if(debug_start_rejections_ && indexed &&
+           (last_terrain_patch_log_.isZero() || (now-last_terrain_patch_log_).toSec()>=1.0)) {
+            last_terrain_patch_log_=now;
+            const auto patch=terrainDiagnosticPatchJson(core_map_,
+                {rejection.row,rejection.col},goal_id_,map_stamp_.toNSec(),
+                [&](const char* name,const PlanningIndex& sample) {
+                    return map_.exists(name) ? double(map_.at(name,grid_map::Index(sample.a,sample.b)))
+                                             : nan;
+                });
+            ROS_WARN("terrain_reject_patch %s",patch.c_str());
+        }
     }
+
+    mutable ros::WallTime last_terrain_patch_log_;
 
     void logSweptRejection(const char* context,const SweptFootprintRejection& rejected) const {
         ROS_WARN("sweep_reject goal_id=%u context=%s sample=%s "
