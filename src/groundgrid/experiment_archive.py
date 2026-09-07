@@ -19,6 +19,10 @@ def write_json(path, value):
 
 def isolated_environment(base, directory, run_id, commit):
     env = dict(base)
+    # Do not inherit a package run's destinations into a later independent experiment.
+    for key in ("GROUNDGRID_METRICS_OUT", "GROUNDGRID_PLANNING_SNAPSHOT_DIRECTORY",
+                "GROUNDGRID_DEBUG_CONTROL"):
+        env.pop(key, None)
     root = Path(directory).resolve()
     for key, folder in (("ROS_HOME", "ros-home"), ("ROS_LOG_DIR", "roslog"),
                         ("ROS_TEST_RESULTS_DIR", "test_results")):

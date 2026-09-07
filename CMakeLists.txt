@@ -50,6 +50,7 @@ if(CATKIN_ENABLE_TESTING)
     catkin_add_nosetests(test/test_trial_metrics.py)
     catkin_add_nosetests(test/test_trial_observation.py)
     catkin_add_nosetests(test/test_experiment_archive.py)
+    catkin_add_nosetests(test/test_package_validation.py)
 endif()
 
 #######################################
@@ -240,6 +241,12 @@ if(CATKIN_ENABLE_TESTING)
     add_test(NAME planning_core_selfcheck COMMAND planning_core_selfcheck)
     add_test(NAME planning_snapshot_selfcheck COMMAND planning_snapshot_selfcheck)
     add_test(NAME planning_grid_parity_selfcheck COMMAND planning_grid_parity_selfcheck)
+    # catkin also registers its ROS/Python suites in CTest. Select this label when
+    # running ONLY the eight C++ checks; bare ctest reruns/overwrites pipeline evidence.
+    set_tests_properties(skidsteer_selfcheck trajectory_tracking_selfcheck
+        planner_safety_selfcheck backout_recovery_selfcheck blind_zone_ground_selfcheck
+        planning_core_selfcheck planning_snapshot_selfcheck planning_grid_parity_selfcheck
+        PROPERTIES LABELS "groundgrid_selfcheck")
 endif()
 
 #############

@@ -28,12 +28,12 @@ def command_output(command, cwd=None):
     return subprocess.check_output(command, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
 
 
-def run_logged(command, log_path, env):
+def run_logged(command, log_path, env, cwd=None):
     """Keep console short; complete output lives in the archive. Ctrl-C stops this group."""
     print("$ " + shlex.join(command), flush=True)
     with Path(log_path).open("x", encoding="utf-8") as stream:
         process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT,
-                                   env=env, start_new_session=True)
+                                   env=env, cwd=cwd, start_new_session=True)
         try:
             return process.wait()
         except KeyboardInterrupt:
@@ -63,9 +63,15 @@ def main():
     parser.add_argument("--debug-control", action="store_true")
     parser.add_argument("--identify-first", action="store_true",
                         help="run the five-parameter simulator identification in an isolated master")
+    parser.add_argument("--package-only", action="store_true",
+                        help="Release build, labelled C++ checks, one catkin package test; always capture inputs")
     args = parser.parse_args()
     if args.n_trials < 1 or args.repeat < 1:
         parser.error("n-trials and repeat must be positive")
+    if args.package_only and (args.n_trials != 3 or args.repeat != 1 or args.scenarios != SCENARIOS
+                              or args.snap_strategy != "reachable_cost"
+                              or args.primitive_mode != "arcs" or args.identify_first):
+        parser.error("--package-only tests configured package defaults; omit scenario/mode/repeat overrides")
     if os.environ.get("CONDA_PREFIX"):
         parser.error("exit Conda and source ROS Noetic before running")
     if os.environ.get("ROS_DISTRO") != "noetic" or sys.platform != "linux":
@@ -95,6 +101,9 @@ def main():
         target = source_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
+    if args.package_only:
+        from groundgrid.package_validation import run_package_suite
+        return run_package_suite(repo, root, commit, run_logged, SELFCHECKS)
     results = []
     checks = []
     interrupted = False

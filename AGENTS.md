@@ -134,6 +134,12 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
   not a dynamics-mode pass. Runtime defaults are reachable_cost after the Ubuntu replay,
   three arcs smoke runs and one dynamics smoke run were verified. Keep legacy_nearest
   explicitly selectable and preserve historical snapshot defaults for reproducible A/B.
+- Use run_planner_experiments.py --package-only for the full package gate. Bare CTest
+  also reruns catkin's ROS/Python tests and overwrites their XML: C++ preflight must use
+  the groundgrid_selfcheck label and verify exactly eight executed tests. Run the ROS
+  package suite once per fresh run_id/output directory; archive its metrics, XML and
+  planning snapshots directly there. Never copy ~/.ros metrics as if they were fresh,
+  or accept catkin's empty internal summary instead of explicit XML validation.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.

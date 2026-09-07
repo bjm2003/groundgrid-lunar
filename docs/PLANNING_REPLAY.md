@@ -135,11 +135,38 @@ df032de 已通过五参数辨识和三轮独立 reachable_cost / arcs / mixed / 
 见[连续接缝记录](validation/2026-09-07-dynamics-continuity.md)。两模式审核后已统一
 默认启用新策略，下一步复核完整包测试，再进入五场景基线；旧提交通过不自动认证新提交。
 
-包测试需使用新的独立目录，并显式设置CATKIN_TEST_RESULTS_DIR和
-ROS_TEST_RESULTS_DIR到同一目录。收集catkin test、显式catkin_test_results、
-ctest --output-on-failure三者的日志及返回码；CTest应实际运行八个纯C++目标。
-当前包断言XML应含51项Python测试和2项pipeline测试，另有1个rostest启动器项。
-仍需直接审核所有XML，不接受“0 tests”或裸TEST_RC=0作为通过。
-指标JSON必须匹配本次GROUNDGRID_RUN_ID及GROUNDGRID_RUN_COMMIT；若流程提前
-失败而只找到旧的~/.ros JSON，它不能充当本次结果。构建日志、CMakeCache、commit、
-环境信息和参数随包归档，不删除先前失败证据。
+## 完整包验证：只运行一次闭环
+
+禁止用裸ctest补跑C++：catkin把ROS和Python也注册为CTest，裸命令会再跑一次
+pipeline并覆盖原XML/JSON。c72eb41实际出现了首遍通过、次遍失败，见
+[包验证问题记录](validation/2026-09-07-package-isolation.md)；不是八个C++检查失败。
+
+更新分支并加载已有devel环境后，一行执行自动构建和完整验证（新输出目录）：
+
+```bash
+rosrun groundgrid run_planner_experiments.py --package-only --out-dir "$HOME/p0-package-$(date +%Y%m%d-%H%M%S)"
+```
+
+此入口限定当前支持的WORKSPACE/src/groundgrid、Noetic、非Conda环境和默认
+mixed/n_trials=3/arcs/reachable_cost，不接受场景/模式/重复次数覆盖。
+在同一工作区Release构建，显式指定系统Python、启用测试、专用结果目录；随后：
+
+- ctest -N -L '^groundgrid_selfcheck$'核对仅选中八项C++目标。
+- ctest --output-on-failure -L '^groundgrid_selfcheck$'仅执行这些目标，核验八项
+  实际Passed并归档完整输出；不会再次执行ROS/Python。
+- catkin test groundgrid --no-deps只执行一次包测试，再用显式目录运行
+  catkin_test_results，并独立检查每份XML及源码定义的最低测试数量。
+
+CATKIN_TEST_RESULTS_DIR和ROS_TEST_RESULTS_DIR对齐到package/test_results。
+JSON直接写到package/planner_metrics_mixed.json，不再复制~/.ros。自动打开调试和
+精确输入快照；测试launch通过可选环境变量提供输出位置，未设置仍保留原默认，
+显式参数优先。此行为核对了[ROS Noetic的optenv实现](https://raw.githubusercontent.com/ros/ros_comm/noetic-devel/tools/roslaunch/src/roslaunch/substitution_args.py)。
+后续独立实验清除继承的包输出变量，防止写入旧目录。
+
+当前应包含63项Python断言、2项pipeline断言和1个rostest启动器项；八个C++检查
+另由带标签的CTest计数，不把启动器项当独立功能覆盖。SUITE_RC=0须所有阶段、
+非空完整XML、身份与快照完整性同时通过。失败/中断也尽可能封存，不覆盖旧目录，
+不将首遍成功、次遍失败合成一个通过结论。root/suite.json的kind为package，
+package/run.json记录阶段命令和返回码、完整尝试耗时及任务书缺口。
+构建CMake缓存将指向此次独立结果目录；后续再次包验证使用另一个新目录重新配置，
+不手动复用该结果目录。新流程实际Ubuntu结果仍待验证。

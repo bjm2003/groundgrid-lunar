@@ -8,14 +8,16 @@
          One rostest invocation exercises one scenario; scripts/run_planner_experiments.py
          loops over all of them. -->
     <arg name="scenario" default="mixed"/>
-    <arg name="metrics_out" default=""/>
-    <arg name="planning_snapshot_directory" default=""/>
+    <!-- Package validation supplies isolated outputs without changing the tested defaults.
+         Explicit rostest/runner arguments still take precedence over these fallbacks. -->
+    <arg name="metrics_out" default="$(optenv GROUNDGRID_METRICS_OUT)"/>
+    <arg name="planning_snapshot_directory" default="$(optenv GROUNDGRID_PLANNING_SNAPSHOT_DIRECTORY)"/>
     <arg name="snap_strategy" default="reachable_cost"/>
     <arg name="use_dynamics_primitives" default=""/>
     <arg name="motion_primitive_file" default=""/>
     <!-- Trace the full multi-goal run without enabling a short diagnostic (which skips
          metrics_over_trials). Use only for investigating a reproducible regression. -->
-    <arg name="debug_control" default="false"/>
+    <arg name="debug_control" default="$(optenv GROUNDGRID_DEBUG_CONTROL false)"/>
     <!-- Short one-turn controller diagnosis. Skips the multi-trial sweep and enables
          throttled follower command traces; normal package/formal tests leave it false. -->
     <arg name="diagnostic_turn" default="false"/>
