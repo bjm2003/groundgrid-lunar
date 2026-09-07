@@ -97,6 +97,13 @@ The Claude notes are historical evidence, not live instructions. Some performanc
 - The simulator must capture a cloud's pose and timestamp together under the dynamics
   lock. Ray-cast computation does not advance the measurement time; stamping old geometry
   with the latest TF time corrupts the perceived map while moving.
+- The simulator's base roll/pitch must follow its analytic terrain support normal while
+  preserving planar yaw. TF, odometry, the rigid sensor offset and ray directions must
+  use that same capture-time attitude. A yaw-only pose on sloping ground contradicts the
+  blind-zone support plane; changing TF without rotating the rays is also invalid.
+  This is a 2.5-D simulation convention, not a suspension model or permission to give the
+  planner ground-truth terrain. Terrain coefficients, planar slip dynamics and hazard
+  checks remain independent of this geometry correction.
 - Withdraw a known-invalid active trajectory before any blocking replacement search.
   Require the follower's `empty_trajectory` acknowledgement for the exact `goal_id` and
   `trajectory_stamp_ns`, then a TF newer than acknowledgement receipt. A new goal cannot

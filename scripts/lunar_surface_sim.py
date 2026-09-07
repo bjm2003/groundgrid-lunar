@@ -27,6 +27,7 @@ from sensor_msgs import point_cloud2
 from std_msgs.msg import Float32MultiArray, Header, MultiArrayDimension
 
 from groundgrid.lunar_terrain import AnalyticLunarTerrain, SCENARIOS
+from groundgrid.lunar_sensor_geometry import terrain_attitude
 
 
 class LunarSurfaceSim:
@@ -184,7 +185,10 @@ class LunarSurfaceSim:
             self.last = now
             x, y, yaw = self.x, self.y, self.yaw
         z = self.height_at(x, y)
-        q = tf.transformations.quaternion_from_euler(0.0, 0.0, yaw)
+        # The blind-zone support plane is derived from this pose. Publishing yaw-only
+        # on a slope would fill missing ground with a horizontal plane and manufacture
+        # a step at its junction with actual returns. Keep planar integration unchanged.
+        q, _rotation = terrain_attitude(*self.terrain_gradient(x, y), yaw)
         self.br.sendTransform((x, y, z), q, now, "base_link", "map")
         self.br.sendTransform((0.0, 0.0, self.sensor_height), (0, 0, 0, 1),
                               now, "velodyne", "base_link")
@@ -211,19 +215,24 @@ class LunarSurfaceSim:
         """
         with self.lock:
             x0, y0, yaw, capture_stamp = self.x, self.y, self.yaw, self.last
-        z_sensor = self.height_at(x0, y0) + self.sensor_height
-        caz, saz = np.cos(self.ray_az + yaw), np.sin(self.ray_az + yaw)
+        _quaternion, rotation = terrain_attitude(*self.terrain_gradient(x0, y0), yaw)
+        # Capture-time base attitude applies to BOTH the sensor offset and its beams.
+        # Changing only TF would misregister the old level-sensor ray intersections.
+        origin = np.array([x0, y0, self.height_at(x0, y0)]) + rotation[:, 2]*self.sensor_height
+        directions = rotation @ np.vstack((np.cos(self.ray_az),
+                                           np.sin(self.ray_az), self.ray_tan))
+        dx, dy, dz = directions
 
         hit = np.full(self.ray_az.size, np.nan)
         rh = rh_prev = self.min_range
-        gap = (z_sensor + rh*self.ray_tan) - self.ground_height(x0 + rh*caz, y0 + rh*saz)
+        gap = (origin[2] + rh*dz) - self.ground_height(origin[0] + rh*dx, origin[1] + rh*dy)
         idx = np.flatnonzero(gap > 0.0)
         gap_prev = gap[idx]
 
         while idx.size and rh + self.march_step <= self.cloud_radius:
             rh += self.march_step
-            gap = ((z_sensor + rh*self.ray_tan[idx]) -
-                   self.ground_height(x0 + rh*caz[idx], y0 + rh*saz[idx]))
+            gap = ((origin[2] + rh*dz[idx]) -
+                   self.ground_height(origin[0] + rh*dx[idx], origin[1] + rh*dy[idx]))
             below = gap <= 0.0
             if below.any():
                 # gap_prev > 0 >= gap holds by construction, so the bracket has a root.
