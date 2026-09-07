@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from unittest import mock
 import importlib.util
+import ast
+import re
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from groundgrid.experiment_archive import (
@@ -166,7 +169,9 @@ class ArchiveTest(unittest.TestCase):
                 '<testsuite tests="2" errors="0" failures="%d"/>' % int(failed_xml), encoding="utf-8")
             return 2 if fail else 0
 
-        argv = ["runner", "--scenarios", "mixed", "--repeat", "2", "--out-dir", str(output)]
+        # Historical-mode fixtures remain explicit after the runtime default promotion.
+        argv = ["runner", "--scenarios", "mixed", "--repeat", "2", "--snap-strategy",
+                "legacy_nearest", "--out-dir", str(output)]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(RUNNER.sys, "platform", "linux"), \
              mock.patch.dict(RUNNER.os.environ, {"ROS_DISTRO": "noetic", "CONDA_PREFIX": ""}), \
              mock.patch.object(RUNNER, "command_output", side_effect=query), \
@@ -205,6 +210,26 @@ class ArchiveTest(unittest.TestCase):
         self.assertTrue(suite["interrupted"])
         self.assertEqual(len(suite["runs"]), 0)
         self.assertTrue((output / "mixed-arcs-01" / "run.json").is_file())
+
+    def test_runtime_strategy_defaults_agree_and_legacy_replay_is_preserved(self):
+        repo = Path(__file__).resolve().parents[1]
+        for name in ("launch/LunarSystem.launch", "test/lunar_pipeline.test"):
+            arg = ET.parse(str(repo / name)).getroot().find("arg[@name='snap_strategy']")
+            self.assertEqual(arg.get("default"), "reachable_cost")
+        yaml = (repo / "config/lunar_system.yaml").read_text(encoding="utf-8")
+        self.assertEqual(re.search(r"^  snap_strategy: (\w+)$", yaml, re.M).group(1),
+                         "reachable_cost")
+        node = (repo / "src/StateLatticePlannerNode.cpp").read_text(encoding="utf-8")
+        self.assertIn('("snap_strategy",snap_strategy,"reachable_cost")', node)
+        tree = ast.parse((repo / "scripts/run_planner_experiments.py").read_text(encoding="utf-8"))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and n.args and
+                 isinstance(n.args[0], ast.Constant) and n.args[0].value == "--snap-strategy"]
+        self.assertEqual(len(calls), 1)
+        keywords = {k.arg: ast.literal_eval(k.value) for k in calls[0].keywords}
+        self.assertEqual(keywords["default"], "reachable_cost")
+        self.assertEqual(keywords["choices"], ["legacy_nearest", "reachable_cost"])
+        core = (repo / "include/groundgrid/LatticePlannerCore.h").read_text(encoding="utf-8")
+        self.assertIn("bool reachable_snap_=false;", core)
 
 
 if __name__ == "__main__":

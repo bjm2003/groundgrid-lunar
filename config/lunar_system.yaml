@@ -78,13 +78,13 @@ state_lattice_planner:
   min_speed_scale: 0.25      # floor on the terrain factor, so the rover never crawls
   reverse_speed_frac: 0.5    # reversing is blind; cap it well under v_max
   # 要点13 (planning near obstacles): a goal whose footprint clips an unobserved or lethal
-  # cell is nudged onto the nearest valid pose instead of failing outright. The bound is one
-  # body half-diagonal (hypot(0.9,0.75)=1.17m) plus margin -- past that the goal really was
-  # unreachable and failing is the honest answer.
+  # cell uses a reachable safe endpoint within the existing bounded goal set. Nominal
+  # radius is one body half-diagonal plus margin; the existing Relax stage doubles it.
+  # Completing that endpoint is not raw-goal arrival.
   max_snap_distance: 1.5
-  # Rollout gate: retain legacy behaviour for first Ubuntu parity/input capture.
-  # Explicit launch snap_strategy:=reachable_cost enables the shared-frontier goal set.
-  snap_strategy: legacy_nearest
+  # Promoted after Ubuntu input parity, three arcs runs and one dynamics run passed.
+  # Explicit snap_strategy:=legacy_nearest retains the historical comparison mode.
+  snap_strategy: reachable_cost
   # Exact planning-input recording is disabled by default. Use the launch argument
   # planning_snapshot_directory with a NEW directory under the run's result folder.
   # Includes effective Relax parameters and lossless map/primitive data; disk IO is

@@ -131,8 +131,9 @@ For relevant changes, use the smallest applicable checks first, then the ROS pip
 - Use isolated run_planner_experiments.py archives with a new output directory for ROS
   baselines. Never reuse JSON from another run/commit or use rostest --text as a formal
   XML verdict. Keep every repeated run, including failures; a primitive-mode fallback is
-  not a dynamics-mode pass. Keep legacy_nearest as the capture default until the real
-  snapshot parity/replay gate has passed.
+  not a dynamics-mode pass. Runtime defaults are reachable_cost after the Ubuntu replay,
+  three arcs smoke runs and one dynamics smoke run were verified. Keep legacy_nearest
+  explicitly selectable and preserve historical snapshot defaults for reproducible A/B.
 - Regenerate motion primitives when their model or generator changes and verify the tracked file intentionally changed.
 - Build the catkin workspace on Ubuntu for ROS/C++ changes.
 - Run the five scenarios (`mixed`, `flat`, `dense`, `slope`, `negative`) with at least `n_trials=10` for a formal baseline.

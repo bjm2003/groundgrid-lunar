@@ -10,7 +10,7 @@
     <arg name="scenario" default="mixed"/>
     <arg name="metrics_out" default=""/>
     <arg name="planning_snapshot_directory" default=""/>
-    <arg name="snap_strategy" default="legacy_nearest"/>
+    <arg name="snap_strategy" default="reachable_cost"/>
     <arg name="use_dynamics_primitives" default=""/>
     <arg name="motion_primitive_file" default=""/>
     <!-- Trace the full multi-goal run without enabling a short diagnostic (which skips

@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--repeat", type=int, default=1, help="independent processes per scenario")
     parser.add_argument("--out-dir", required=True, help="NEW result directory (must not exist)")
     parser.add_argument("--snap-strategy", choices=["legacy_nearest", "reachable_cost"],
-                        default="legacy_nearest")
+                        default="reachable_cost")
     parser.add_argument("--primitive-mode", choices=["arcs", "dynamics"], default="arcs")
     parser.add_argument("--capture-inputs", action="store_true")
     parser.add_argument("--debug-control", action="store_true")

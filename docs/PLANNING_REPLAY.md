@@ -14,7 +14,7 @@
 每个 `attempt-N.ggsnap` 是显式小端、带版本和校验和的完整输入，`attempt-N.json`
 是原运行输出摘要。浮点未知值及纳秒时间戳无损；基元不经旧文本格式舍入。
 v2 另保存 `attempt-N-trajectory.json` 的完整原输出，新增策略字段；读取器仍接受
-v1 输入并将其解释为旧吸附策略。默认旧策略保留为 Ubuntu 等价采集的对照入口。
+v1 输入并将其解释为旧吸附策略。历史快照不会因运行默认策略升级而被重新解释。
 计算过程只负责捕获和入队，独立线程写盘。`writer-summary.json` 中必须满足
 `submitted == written`、`dropped == 0`、`failed == 0`，否则记录不完整。
 归档工具另算各文件 SHA-256；二进制自身校验和仅用于检测损坏，不用于认证来源。
@@ -39,8 +39,9 @@ rosrun groundgrid replay_planning_snapshot /绝对路径/attempt-42.ggsnap --exp
 rosrun groundgrid replay_planning_snapshot /绝对路径/attempt-42.ggsnap --strategy reachable_cost --repeat 5
 ```
 
-运行时通过 launch 参数 `snap_strategy:=reachable_cost` 显式选择新策略。
-在首轮真实快照采集及对照完成前，默认仍为 `legacy_nearest`。
+运行时默认策略现为 `reachable_cost`（2026-09-07完成两模式冒烟审核后推广）。
+可用 launch 参数 `snap_strategy:=legacy_nearest` 显式对照旧策略；历史快照按原
+保存参数重放，除非明确传入 --strategy，不能用运行默认值覆盖记录参数。
 新策略把范围内安全终点作为一个目标集合，使用共享加权 A* 队列，路线代价加
 原吸附偏移/朝向/地形代价作为目标代价。候选按需检查，不把几何启发式当安全证明。
 它不保证全局最优执行时间；状态格量化、加权启发式和统一时间预算仍存在。
@@ -63,7 +64,7 @@ ROS_LOG_DIR、ROS_TEST_RESULTS_DIR 和 run_id；目录中保存完整日志、�
 断言 XML、源配置、commit、SHA-256 清单。结束自动生成同名 .tar.gz，失败也归档。
 原始日志不删除。控制日志较多时直接回传结果包，无需复制终端长输出。
 
-首轮只采集旧策略真实输入（不是新策略验收；剩余困难目标仍可能失败）：
+历史首轮采集命令（该阶段已完成，保留供旧策略对照，不要求重新采集）：
 
     rosrun groundgrid run_planner_experiments.py --scenarios mixed --n-trials 3 --repeat 1 --snap-strategy legacy_nearest --capture-inputs --debug-control --out-dir "$HOME/p0-capture-$(date +%Y%m%d-%H%M%S)"
 
@@ -127,9 +128,18 @@ pipeline 断言 XML，勿用裸 TEST_RC 或“0 tests”替代真实测试通过
 
 df032de 已通过五参数辨识和三轮独立 reachable_cost / arcs / mixed / n_trials=3，
 详情见[三轮弧线记录](validation/2026-09-06-arcs-smoke.md)。后续动力学回归暴露
-起步门槛和基元接缝故障，尚未通过；当前需更新并构建修复版，再跑 dynamics
-同规格一次，增加 --capture-inputs --debug-control；无需重复 --identify-first。
+起步门槛和基元接缝故障，经修复后425205a的一轮同规格动力学冒烟已核验通过，
+见[动力学结果](validation/2026-09-07-dynamics-smoke.md)。无需重复 --identify-first。
 动力学搜索现在从实际积分终点续接，不能将量化格心视作额外可执行动作。
 吸附结果记录实际导出终点，精确目标可在已有积分采样点结束；参数和预算不变。
-见[连续接缝记录](validation/2026-09-07-dynamics-continuity.md)。两模式审核后统一
-决定默认启用及复核包测试，再进入五场景基线；旧提交通过不自动认证新提交。
+见[连续接缝记录](validation/2026-09-07-dynamics-continuity.md)。两模式审核后已统一
+默认启用新策略，下一步复核完整包测试，再进入五场景基线；旧提交通过不自动认证新提交。
+
+包测试需使用新的独立目录，并显式设置CATKIN_TEST_RESULTS_DIR和
+ROS_TEST_RESULTS_DIR到同一目录。收集catkin test、显式catkin_test_results、
+ctest --output-on-failure三者的日志及返回码；CTest应实际运行八个纯C++目标。
+当前包断言XML应含51项Python测试和2项pipeline测试，另有1个rostest启动器项。
+仍需直接审核所有XML，不接受“0 tests”或裸TEST_RC=0作为通过。
+指标JSON必须匹配本次GROUNDGRID_RUN_ID及GROUNDGRID_RUN_COMMIT；若流程提前
+失败而只找到旧的~/.ros JSON，它不能充当本次结果。构建日志、CMakeCache、commit、
+环境信息和参数随包归档，不删除先前失败证据。

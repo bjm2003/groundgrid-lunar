@@ -41,7 +41,8 @@ struct PlannerConfig {
     double goal_snap_cost_weight_=0.5;
     double trajectory_clearance_=0.25;
     double goal_snap_clearance_=0.50;
-    // Rollout gate: legacy remains the ROS default until Ubuntu input parity/capture.
+    // Historical snapshot fallback (v1 did not store this flag). ROS runtime defaults
+    // are chosen explicitly by its adapter; do not silently reinterpret old inputs.
     bool reachable_snap_=false;
     SkidSteerParams sp_;
     template<class Visitor> void visit(Visitor&& v) {

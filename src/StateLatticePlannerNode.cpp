@@ -71,7 +71,7 @@ public:
         pnh_.param("reverse_speed_frac", reverse_speed_frac_, 0.5);
         pnh_.param("max_snap_distance", max_snap_distance_, 1.5);
         std::string snap_strategy;
-        pnh_.param<std::string>("snap_strategy",snap_strategy,"legacy_nearest");
+        pnh_.param<std::string>("snap_strategy",snap_strategy,"reachable_cost");
         if(snap_strategy!="legacy_nearest" && snap_strategy!="reachable_cost")
             throw std::runtime_error("snap_strategy must be legacy_nearest or reachable_cost");
         reachable_snap_=snap_strategy=="reachable_cost";
