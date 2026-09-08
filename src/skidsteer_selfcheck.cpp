@@ -231,6 +231,23 @@ int main() {
               !missionGoalReached(true, true, false, 0.60, 0.50) &&
               !missionGoalReached(false, true, true, 1.20, 0.50),
               "recovery and intermediate endpoints cannot complete the mission");
+        bool recovering=true;
+        int successes=0;
+        check(!groundgrid::closeRecoveryOnMissionCompletion(
+                  missionGoalReached(true,false,false,.1,.5),recovering,successes) &&
+              recovering && successes==0,
+              "recovery manoeuvre completion does not confirm recovery");
+        check(!groundgrid::closeRecoveryOnMissionCompletion(
+                  missionGoalReached(false,true,true,2.4,.5),recovering,successes) &&
+              recovering && successes==0,
+              "published snapped plan alone does not confirm recovery");
+        check(groundgrid::closeRecoveryOnMissionCompletion(
+                  missionGoalReached(true,true,true,2.4,.5),recovering,successes) &&
+              !recovering && successes==1,
+              "actual snapped mission completion resolves an open recovery episode");
+        check(!groundgrid::closeRecoveryOnMissionCompletion(true,recovering,successes) &&
+              successes==1,
+              "terminal duplicates and previously confirmed recovery do not double count");
     }
 
     // 15) Trajectory control keeps planned v authoritative and actually consumes planned w.

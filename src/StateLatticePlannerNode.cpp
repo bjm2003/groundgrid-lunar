@@ -882,6 +882,17 @@ private:
                          "retiring goal",
                          endpoint_dist, std::abs(endpoint_yaw_error), requested_goal_dist,
                          active_trajectory_was_snapped_ ? "true" : "false");
+                bool recovering = mode_ == PlannerMode::Recovery;
+                if(closeRecoveryOnMissionCompletion(true,recovering,recovery_successes_)) {
+                    mode_ = PlannerMode::Nominal;
+                    action_ = RecoveryAction::None;
+                    consecutive_failures_ = 0;
+                    recovery_escalation_ = 0;
+                    confirm_count_ = 0;
+                    post_backout_replan_.clear();
+                    last_recovery_end_ = ros::Time::now();
+                    ROS_INFO("plan: recovery resolved by actual mission completion goal_id=%u",goal_id_);
+                }
                 publishStatus("goal_reached");
                 have_goal_ = false;
                 replan_requested_ = false;

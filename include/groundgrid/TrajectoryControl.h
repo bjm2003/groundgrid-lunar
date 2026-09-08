@@ -110,6 +110,17 @@ inline bool missionGoalReached(bool endpoint_reached,
     return trajectory_was_snapped || requested_goal_error < requested_goal_tolerance;
 }
 
+// Actual mission completion resolves an open recovery episode even if a short route
+// finishes before the repeated-plan confirmation. Not for recovery manoeuvre endpoints
+// or a mere plan publication. Closing the episode makes repeated terminal checks inert.
+inline bool closeRecoveryOnMissionCompletion(bool mission_completed,
+                                            bool& recovering, int& successes) {
+    if(!mission_completed || !recovering) return false;
+    recovering=false;
+    ++successes;
+    return true;
+}
+
 // A zero linear speed at a pose is a boundary condition, not a command to apply while
 // that pose is still spatially ahead of the rover. This matters at internal
 // translation/rotation junctions as well as at the final goal: lookahead can legitimately
