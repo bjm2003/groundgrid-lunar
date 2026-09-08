@@ -19,7 +19,7 @@ std::string terrainDiagnosticPatchJson(const PlanningGrid& map, PlanningIndex ce
                                       LayerAt layer_at) {
     if(!map.valid() || center.a<0 || center.b<0 ||
        center.a>=map.rows || center.b>=map.cols) return {};
-    constexpr const char* layers[]={"ground","ground_corrected","elevation_raw",
+    constexpr const char* layers[]={"ground","ground_corrected","elevation_raw","elevation_sample_x","elevation_sample_y",
         "groundpatch","observed","observation_age","pointsRaw","points",
         "slope_x","slope_y","terrain_cost","step_height","roughness"};
     std::ostringstream out;

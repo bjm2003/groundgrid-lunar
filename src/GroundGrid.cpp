@@ -69,7 +69,7 @@ void GroundGrid::initGroundGrid(const nav_msgs::OdometryConstPtr &inOdom)
         // Slope-aware extensions (TS-SatMVSNet inspired, arXiv:2501.01049)
         "ground_corrected", "slope", "slope_max_diff", "slope_x", "slope_y",
         "slope_direction", "traversability", "observed", "observation_age",
-        "elevation_raw", "elevation_filtered", "elevation_residual",
+        "elevation_raw", "elevation_sample_x", "elevation_sample_y", "elevation_filtered", "elevation_residual",
         "roughness", "step_height", "obstacle_height", "obstacle_confidence"
     });
     grid_map::GridMap& map = *mMap_ptr;
@@ -105,6 +105,8 @@ void GroundGrid::initGroundGrid(const nav_msgs::OdometryConstPtr &inOdom)
     map["observed"].setZero();
     map["observation_age"].setConstant(std::numeric_limits<float>::infinity());
     map["elevation_raw"].setConstant(std::numeric_limits<float>::quiet_NaN());
+    map["elevation_sample_x"].setConstant(std::numeric_limits<float>::quiet_NaN());
+    map["elevation_sample_y"].setConstant(std::numeric_limits<float>::quiet_NaN());
     map["elevation_filtered"].setConstant(inOdom->pose.pose.position.z);
     map["elevation_residual"].setConstant(std::numeric_limits<float>::quiet_NaN());
     map["roughness"].setConstant(std::numeric_limits<float>::quiet_NaN());
@@ -178,6 +180,8 @@ std::shared_ptr<grid_map::GridMap> GroundGrid::update(const nav_msgs::OdometryCo
             map.at("observed", idx) = 0.0f;
             map.at("observation_age", idx) = std::numeric_limits<float>::infinity();
             map.at("elevation_raw", idx) = std::numeric_limits<float>::quiet_NaN();
+            map.at("elevation_sample_x", idx) = std::numeric_limits<float>::quiet_NaN();
+            map.at("elevation_sample_y", idx) = std::numeric_limits<float>::quiet_NaN();
             map.at("elevation_filtered", idx) = -ps.point.z;
             map.at("elevation_residual", idx) = std::numeric_limits<float>::quiet_NaN();
             map.at("roughness", idx) = std::numeric_limits<float>::quiet_NaN();

@@ -369,7 +369,13 @@ void GroundSegmentation::insert_cloud(const pcl::PointCloud<PCLPoint>::Ptr cloud
         }
 
         maxHeight = std::max(maxHeight, point.z);
-        minHeight =std::min(minHeight, point.z-0.0001f); // to make sure maxHeight > minHeight
+        if(point.z-0.0001f < minHeight) {
+            minHeight=point.z-0.0001f; // preserve existing min/max separation
+            // Under the same cell lock as minHeight. Retained coordinates must
+            // describe the SAME minimum return, not the latest return or cell centre.
+            map.at("elevation_sample_x",gi)=point.x;
+            map.at("elevation_sample_y",gi)=point.y;
+        }
         points += 1.0;
     }
 }
@@ -664,6 +670,8 @@ void GroundSegmentation::compute_slope_map(grid_map::GridMap &map) const
     grid_map::Matrix& obstacle_h    = map["obstacle_height"];
     grid_map::Matrix& obstacle_c    = map["obstacle_confidence"];
     const grid_map::Matrix& raw     = map["elevation_raw"];
+    const grid_map::Matrix& sample_x = map["elevation_sample_x"];
+    const grid_map::Matrix& sample_y = map["elevation_sample_y"];
     const grid_map::Matrix& observed = map["observed"];
     const grid_map::Matrix& max_h   = map["maxGroundHeight"];
     const grid_map::Matrix& raw_count = map["pointsRaw"];
@@ -739,13 +747,20 @@ void GroundSegmentation::compute_slope_map(grid_map::GridMap &map) const
             // A plane fit uses neighbouring samples instead of amplifying
             // one cell's sampling offset. Step/roughness/max-diff and obstacle
             // layers above remain computed from the unmodified heights.
-            // The wider fit reduces within-cell sampling bias on curved terrain.
-            // Only use a complete finite window; never fill unknown cells. Keep
-            // the narrow estimate at borders or missing outer samples, and keep
-            // ALL original 3x3 discontinuity/hazard channels above unchanged.
-            const auto gradient=estimateSupportedTerrainGradient(resolution,
-                [&](int di,int dj) { return ground(i+di,j+dj); },
-                i>=2 && j>=2 && i<size(0)-2 && j<size(1)-2);
+            // Measured heights belong to return coordinates, NOT grid centres.
+            // Use all nine matching measurements when available; otherwise keep
+            // the original narrow height-grid fit. No unknown cells are filled.
+            auto gradient=estimateTerrainGradient(resolution,
+                [&](int di,int dj) { return ground(i+di,j+dj); });
+            if(std::isfinite(gradient.x) && std::isfinite(gradient.y)) {
+                const auto measured=estimateMeasuredTerrainGradient([&](int di,int dj) {
+                    return TerrainHeightSample{sample_x(i+di,j+dj),sample_y(i+di,j+dj),raw(i+di,j+dj)};
+                });
+                // grid_map matrix axes run opposite map x/y. Retain the existing
+                // slope-layer convention; changing consumer signs is separate work.
+                if(std::isfinite(measured.x) && std::isfinite(measured.y))
+                    gradient={-measured.x,-measured.y};
+            }
             const float dzdx = gradient.x;
             const float dzdy = gradient.y;
             slope_x(i, j) = dzdx;

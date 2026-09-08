@@ -10,6 +10,32 @@ struct TerrainGradient {
     float y = std::numeric_limits<float>::quiet_NaN();
 };
 
+struct TerrainHeightSample { double x,y,z; };
+
+// Least-squares plane at actual return coordinates. Centre the coordinates before
+// solving so large world positions do not degrade conditioning. Missing/degenerate
+// measurements are not evidence for a horizontal surface.
+template<class SampleAt>
+TerrainGradient estimateMeasuredTerrainGradient(SampleAt sample) {
+    TerrainHeightSample points[9];
+    double mx=0,my=0,mz=0; int n=0;
+    for(int i=-1;i<=1;++i) for(int j=-1;j<=1;++j) {
+        const auto p=sample(i,j);
+        if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return {};
+        points[n++]=p; mx+=p.x; my+=p.y; mz+=p.z;
+    }
+    mx/=9; my/=9; mz/=9;
+    double xx=0,xy=0,yy=0,xz=0,yz=0;
+    for(const auto& p:points) {
+        const double x=p.x-mx,y=p.y-my,z=p.z-mz;
+        xx+=x*x; xy+=x*y; yy+=y*y; xz+=x*z; yz+=y*z;
+    }
+    const double det=xx*yy-xy*xy;
+    if(!std::isfinite(det) || xx<=0 || yy<=0 || det<=1e-9*xx*yy) return {};
+    return {static_cast<float>((xz*yy-yz*xy)/det),
+            static_cast<float>((yz*xx-xz*xy)/det)};
+}
+
 // Least-squares plane on a complete 3x3 or 5x5 neighbourhood. Coordinates here are
 // matrix axes, matching the previous derivative convention. Do not modify height,
 // step range, roughness or obstacle evidence: a discontinuity is not a safe ramp.

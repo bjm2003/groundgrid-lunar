@@ -66,7 +66,7 @@ int main() {
                                "patch indices remain in buffer");
                 return double(m.cost[idx.a*m.cols+idx.b]);
             });
-        check(reads==25*13,"all 25 neighbouring cells across buffer seam are read");
+        check(reads==25*15,"all 25 neighbouring cells across buffer seam are read");
         check(patch.find("\"index\":[39,39]")!=std::string::npos &&
               patch.find("\"index\":[1,1]")!=std::string::npos,"wrapped neighbours present");
         check(patch.find("\"values\":[null,null")!=std::string::npos,"unknown encoded as null");
@@ -75,7 +75,7 @@ int main() {
         reads=0;
         const auto edge=terrainDiagnosticPatchJson(m,{m.start_row,m.start_col},16,100,
             [&](const char*,const PlanningIndex&) { ++reads; return 1.0; });
-        check(reads==9*13 && edge.find("\"cells\":[null,null")!=std::string::npos,
+        check(reads==9*15 && edge.find("\"cells\":[null,null")!=std::string::npos,
               "physical edges are absent, not wrapped to opposite terrain");
         check(terrainDiagnosticPatchJson(m,{-1,0},16,100,
             [](const char*,const PlanningIndex&) { return 0.0; }).empty(),"invalid patch rejected");

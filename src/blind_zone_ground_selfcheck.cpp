@@ -162,6 +162,36 @@ int main() {
         [&](int i,int j){return wide_patch[(i+2)*5+j+2];},true);
     check(near(wide.x,.24212551,1e-6) && near(wide.y,-.03807823,1e-6),
           "recorded a995462 stopping patch reduces single-cell sampling bias");
+    for(double offset : {0.0,10000.0}) {
+        auto measured=[&](int i,int j) {
+            const double x=.15*i+.06*i, y=.15*j-.04*j;
+            return groundgrid::TerrainHeightSample{x+offset,y+offset,2+.3*x-.2*y};
+        };
+        const auto actual=groundgrid::estimateMeasuredTerrainGradient(measured);
+        const auto centred=groundgrid::estimateTerrainGradient(.15,
+            [&](int i,int j){return measured(i,j).z;});
+        check(near(actual.x,.3,1e-6) && near(actual.y,-.2,1e-6),
+              "irregular return coordinates recover the true plane including large world offset");
+        check(std::abs(centred.x-.3)>.1,
+              "cell-centre assumption reproduces sampling-induced slope overestimate");
+    }
+    for(int missing=0;missing<9;++missing) {
+        const auto g=groundgrid::estimateMeasuredTerrainGradient([&](int i,int j) {
+            return groundgrid::TerrainHeightSample{(i+1)*3+j+1==missing ? NAN : .15*i,
+                                                   .15*j,.1*i};
+        });
+        check(!std::isfinite(g.x),"missing measured coordinate rejects measured fit");
+    }
+    const auto line=groundgrid::estimateMeasuredTerrainGradient([](int i,int j) {
+        return groundgrid::TerrainHeightSample{double(i*3+j),double(i*3+j),1.0};
+    });
+    check(!std::isfinite(line.x),"collinear measured samples cannot invent a plane");
+    for(double sign : {-1.0,1.0}) {
+        const auto g=groundgrid::estimateMeasuredTerrainGradient([&](int i,int j) {
+            return groundgrid::TerrainHeightSample{.15*i,.15*j,i>=0 ? sign*.5 : 0};
+        });
+        check(std::abs(g.x)>1.0,"measured fit preserves positive and negative steep steps");
+    }
     std::printf("blind_zone_ground_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }
