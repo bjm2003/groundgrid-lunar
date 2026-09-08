@@ -736,11 +736,16 @@ void GroundSegmentation::compute_slope_map(grid_map::GridMap &map) const
             slope_maxdiff(i, j) = max_val - center;          // always >= 0
             slope_dir(i, j)     = DIR_CODE[max_di+1][max_dj+1];
 
-            // A plane fit uses all nine existing samples instead of amplifying
+            // A plane fit uses neighbouring samples instead of amplifying
             // one cell's sampling offset. Step/roughness/max-diff and obstacle
             // layers above remain computed from the unmodified heights.
-            const auto gradient = estimateTerrainGradient(resolution,
-                [&](int di,int dj) { return ground(i+di,j+dj); });
+            // The wider fit reduces within-cell sampling bias on curved terrain.
+            // Only use a complete finite window; never fill unknown cells. Keep
+            // the narrow estimate at borders or missing outer samples, and keep
+            // ALL original 3x3 discontinuity/hazard channels above unchanged.
+            const auto gradient=estimateSupportedTerrainGradient(resolution,
+                [&](int di,int dj) { return ground(i+di,j+dj); },
+                i>=2 && j>=2 && i<size(0)-2 && j<size(1)-2);
             const float dzdx = gradient.x;
             const float dzdy = gradient.y;
             slope_x(i, j) = dzdx;

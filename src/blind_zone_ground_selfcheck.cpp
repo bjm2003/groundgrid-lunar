@@ -127,6 +127,41 @@ int main() {
     }
     const auto invalid=groundgrid::estimateTerrainGradient(0,[](int,int){return 0.0;});
     check(!std::isfinite(invalid.x),"invalid resolution rejected");
+    for(double grade : {-.8,0.0,.8}) {
+        const auto g=groundgrid::estimateSupportedTerrainGradient(.15,
+            [&](int i,int j){return 3+grade*.15*i-.4*.15*j;},true);
+        check(near(g.x,grade,1e-6) && near(g.y,-.4,1e-6),
+              "wide plane retains exact steep slope in either direction");
+    }
+    for(double sign : {-1.0,1.0}) {
+        const auto g=groundgrid::estimateSupportedTerrainGradient(.15,
+            [&](int i,int){return i>=0 ? sign*.5 : 0.0;},true);
+        check(std::abs(g.x)>.9,"wide fit keeps positive and negative half-metre steps steep");
+    }
+    const auto fallback=groundgrid::estimateSupportedTerrainGradient(.15,[](int i,int j) {
+        return std::abs(i)==2 || std::abs(j)==2 ? NAN : .15*i;
+    },true);
+    check(near(fallback.x,1,1e-6),"missing outer ring falls back without fabricating heights");
+    const auto inner_missing=groundgrid::estimateSupportedTerrainGradient(.15,[](int i,int j) {
+        return i==0 && j==0 ? NAN : .15*i;
+    },true);
+    check(!std::isfinite(inner_missing.x),"wide support does not bridge an unknown inner cell");
+    bool accessed_outer=false;
+    groundgrid::estimateSupportedTerrainGradient(.15,[&](int i,int j) {
+        if(std::abs(i)>1 || std::abs(j)>1) accessed_outer=true;
+        return .15*i;
+    },false);
+    check(!accessed_outer,"map border never reads unavailable outer cells");
+    const std::array<double,25> wide_patch{{
+        -.00475306,-.00179887,-.01514905,-.00753199,-.02985446,
+        .03234244,.02838844,.03067188,.01349804,.03578265,
+        .08888233,.06240825,.05576667,.06089792,.03991091,
+        .10552239,.10329417,.10927762,.11642379,.07999519,
+        .16129328,.13185880,.12520359,.11704297,.12656976}};
+    const auto wide=groundgrid::estimateSupportedTerrainGradient(.15,
+        [&](int i,int j){return wide_patch[(i+2)*5+j+2];},true);
+    check(near(wide.x,.24212551,1e-6) && near(wide.y,-.03807823,1e-6),
+          "recorded a995462 stopping patch reduces single-cell sampling bias");
     std::printf("blind_zone_ground_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }
