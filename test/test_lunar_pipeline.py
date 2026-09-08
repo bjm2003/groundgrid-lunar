@@ -33,7 +33,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from std_msgs.msg import Float32MultiArray, String
 from groundgrid.msg import LunarTrajectory
-from groundgrid.trial_metrics import completion_summary, mission_completed
+from groundgrid.trial_metrics import completion_summary, mission_completed, require_tour_completion
 from groundgrid.trial_observation import TrialObservation, fields_of
 
 # The body, from state_lattice_planner/footprint_{length,width}. Clearance is measured
@@ -834,6 +834,7 @@ class LunarPipelineTest(unittest.TestCase):
 
     def _assert(self, report, tour, every):
         rates, metrics = report["rates"], report["metrics"]
+        require_tour_completion(tour)
         self.assertEqual(report["counts"]["unacknowledged_goals"], 0,
                          "missing goal-scoped planner telemetry; no legacy-status fallback")
         # Never allowed anywhere: driving the body through a ground-truth hazard.

@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from groundgrid.trial_observation import TrialObservation, fields_of  # noqa: E402
-from groundgrid.trial_metrics import mission_completed  # noqa: E402
+from groundgrid.trial_metrics import mission_completed, require_tour_completion  # noqa: E402
 
 
 def planner(stamp=1400, goal=14, seq=1, status="goal_received", events=0, successes=0, aborts=0):
@@ -162,6 +162,7 @@ class PipelineCallbackTest(unittest.TestCase):
         namespace = {"unittest": unittest, "math": math, "json": json,
                      "TrialObservation": TrialObservation, "fields_of": fields_of,
                      "mission_completed": mission_completed,
+                     "require_tour_completion": require_tour_completion,
                      "STRICT_SCENARIOS": ("mixed", "flat"), "UNREACHABLE_GOALS": {(3.0, 0.0)},
                      "rospy": NS(Time=NS(now=lambda: 100.0))}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
@@ -244,6 +245,16 @@ class PipelineCallbackTest(unittest.TestCase):
                             "near_obstacle_recovery": 1.0}}
         with self.assertRaisesRegex(AssertionError, "solvable hard goals must complete"):
             self.adapter._assert(report, tour, tour + [hard])
+
+    def test_slope_all_abort_cannot_pass_empty_recovery_denominator(self):
+        self.adapter.scenario = "slope"
+        tour = [{"end_reason": "aborted", "planner_goal_reached": False,
+                 "follower_goal_reached": False, "planned": i == 0}
+                for i in range(4)]
+        report = {"counts": {"recovery_events": 4, "recovery_aborts": 4},
+                  "rates": {"near_obstacle_recovery": float("nan")}, "metrics": {}}
+        with self.assertRaisesRegex(AssertionError, "no tour mission completed"):
+            self.adapter._assert(report, tour, tour)
 
 
 if __name__ == "__main__":

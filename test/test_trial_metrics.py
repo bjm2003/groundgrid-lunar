@@ -9,10 +9,27 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from groundgrid.trial_metrics import completion_summary, mission_completed  # noqa: E402
+from groundgrid.trial_metrics import (completion_summary, mission_completed,
+                                     require_tour_completion)  # noqa: E402
 
 
 class TrialMetricsTest(unittest.TestCase):
+    def test_zero_completion_never_passes_navigation_guard(self):
+        for reason in ("aborted", "timeout"):
+            tour = [{"planned": True, "reached": True, "end_reason": reason,
+                     "planner_goal_reached": False, "follower_goal_reached": False}
+                    for _ in range(4)]
+            with self.assertRaisesRegex(AssertionError, "no tour mission completed"):
+                require_tour_completion(tour)
+        with self.assertRaises(AssertionError):
+            require_tour_completion([])
+
+    def test_nonzero_guard_does_not_certify_acceptance_or_requested_arrival(self):
+        tour = [{"planner_goal_reached": True, "follower_goal_reached": True,
+                 "end_reason": "completed", "reached": False}] + [{}] * 3
+        require_tour_completion(tour)
+        self.assertEqual(completion_summary(tour, tour)["rates"]["completion_tour"], 0.25)
+
     def test_both_completion_signals_are_required(self):
         for planner, follower in itertools.product((False, True), repeat=2):
             with self.subTest(planner=planner, follower=follower):

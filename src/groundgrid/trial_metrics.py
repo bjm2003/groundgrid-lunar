@@ -23,3 +23,14 @@ def completion_summary(every, tour):
         "rates": {"completion_rate": completed / len(every) if every else float("nan"),
                   "completion_tour": tour_completed / len(tour) if tour else float("nan")},
     }
+
+
+def require_tour_completion(tour):
+    """Reject a vacuous navigation pass; this is NOT the 99% acceptance gate.
+
+    Use goal-correlated completion signals, not paths, recovery confirmations or
+    entry into the requested radius. Marginal scenarios must not pass with no work
+    completed merely because their conditional recovery denominator is empty.
+    """
+    if not any(mission_completed(t) for t in tour):
+        raise AssertionError("no tour mission completed; zero completion is not a navigation pass")
