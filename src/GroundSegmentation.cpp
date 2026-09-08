@@ -24,6 +24,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <groundgrid/GroundSegmentation.h>
+#include <groundgrid/TerrainGradient.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 #include <algorithm>
@@ -694,8 +695,6 @@ void GroundSegmentation::compute_slope_map(grid_map::GridMap &map) const
     step_height.setConstant(std::numeric_limits<float>::quiet_NaN());
     travers.setConstant(std::numeric_limits<float>::quiet_NaN());
 
-    const float inv_2res = 1.0f / (2.0f * resolution);
-
     for(int i = 1; i < size(0)-1; ++i){
         for(int j = 1; j < size(1)-1; ++j){
             const float center = ground(i, j);
@@ -737,11 +736,13 @@ void GroundSegmentation::compute_slope_map(grid_map::GridMap &map) const
             slope_maxdiff(i, j) = max_val - center;          // always >= 0
             slope_dir(i, j)     = DIR_CODE[max_di+1][max_dj+1];
 
-            // Standard gradient-based slope: central differences -> angle.
-            // This gives a smooth, physically-meaningful slope raster while
-            // the max-diff value above stays true to the paper.
-            const float dzdx = (ground(i+1, j) - ground(i-1, j)) * inv_2res;
-            const float dzdy = (ground(i, j+1) - ground(i, j-1)) * inv_2res;
+            // A plane fit uses all nine existing samples instead of amplifying
+            // one cell's sampling offset. Step/roughness/max-diff and obstacle
+            // layers above remain computed from the unmodified heights.
+            const auto gradient = estimateTerrainGradient(resolution,
+                [&](int di,int dj) { return ground(i+di,j+dj); });
+            const float dzdx = gradient.x;
+            const float dzdy = gradient.y;
             slope_x(i, j) = dzdx;
             slope_y(i, j) = dzdy;
 

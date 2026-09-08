@@ -1,4 +1,5 @@
 #include "groundgrid/BlindZoneGround.h"
+#include "groundgrid/TerrainGradient.h"
 
 #include <cmath>
 #include <cstdio>
@@ -96,6 +97,36 @@ int main() {
         [&](int i) -> double& { return corrected[i]; });
     check(corrected[4]==1.6 && corrected[0]==saved[0],
           "elevated historical evidence is preserved rather than flattened");
+    for(double grade : {0.0, .2, -.2, 1.0, -1.0}) {
+        const auto g=groundgrid::estimateTerrainGradient(.15,
+            [&](int i,int j){return 12.0+grade*.15*i+.3*.15*j;});
+        check(near(g.x,grade,1e-6) && near(g.y,.3,1e-6),
+              "plane gradient exact, including steep and reversed slopes");
+    }
+    for(double sign : {-1.0,1.0}) {
+        const auto g=groundgrid::estimateTerrainGradient(.15,
+            [&](int i,int){return i>=0 ? sign*.5 : 0.0;});
+        check(std::abs(g.x)>1.0 && near(g.y,0),
+              "positive and negative half-metre steps remain steep");
+    }
+    const std::array<double,9> patch{{
+        -.4477697014808655,-.4177834987640381,-.4198524057865143,
+        -.4948926866054535,-.45798459649086,-.45544639229774475,
+        -.506034255027771,-.5063286423683167,-.4795982837677002}};
+    const auto patch_before=patch;
+    const auto fitted=groundgrid::estimateTerrainGradient(.15000000596046448,
+        [&](int i,int j){return patch[(i+1)*3+j+1];});
+    check(near(fitted.x,-.22950619,1e-6) && near(fitted.y,.10422173,1e-6),
+          "recorded f18ce9b slope patch uses all nine samples");
+    check(patch==patch_before,"gradient estimation leaves height and hazard evidence untouched");
+    for(int missing=0;missing<9;++missing) {
+        const auto g=groundgrid::estimateTerrainGradient(.15,[&](int i,int j) {
+            return (i+1)*3+j+1==missing ? std::numeric_limits<double>::quiet_NaN() : 1.0;
+        });
+        check(!std::isfinite(g.x) && !std::isfinite(g.y),"unknown sample is not a safe plane");
+    }
+    const auto invalid=groundgrid::estimateTerrainGradient(0,[](int,int){return 0.0;});
+    check(!std::isfinite(invalid.x),"invalid resolution rejected");
     std::printf("blind_zone_ground_selfcheck: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 }
